@@ -8,14 +8,41 @@ The eProbes packages and environments can be managed using conda (https://docs.c
 under developing
 
 ```
-conda installation code here
+conda installation code inserted here
 ```
 
 ## Build ngsLCA from development version by cloning the github repo
-eProbes dependencies describe here 
+eProbes dependencies describe inserted here 
 
 ```
 git clone --recursive https://github.com/YCWangLab/eProbes
 cd eProbes
 make
+```
+
+# Data preparation
+
+how to prepare the input data for the package 
+
+## Step1
+brief description
+
+```
+example code here
+```
+
+
+## Step2
+brief description
+
+```
+example code here
+```
+
+
+## Step3
+brief description
+
+```
+example code here
 ```
