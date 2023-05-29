@@ -46,3 +46,14 @@ brief description
 ```
 example code here
 ```
+
+# Tutorial for running eProbes
+This tutorial will walk you though all the steps of the eProbes package
+
+## Test dataset
+make a small (<10 mb) example test dataset here
+
+## Function_1
+## Function_2
+## Function_3
+## ...
