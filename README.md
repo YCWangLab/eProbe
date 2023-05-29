@@ -11,7 +11,7 @@ under developing
 conda installation code inserted here
 ```
 
-## Build ngsLCA from development version by cloning the github repo
+## Build eProbes from development version by cloning the github repo
 eProbes dependencies describe inserted here 
 
 ```
