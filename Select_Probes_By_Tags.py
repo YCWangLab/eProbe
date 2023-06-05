@@ -3,9 +3,9 @@ import pandas as pd
 import argparse
 import multiprocessing
 
-usage = """python Select_Probes_By_Tags.py -l labels.txt -t desire_Tm -g desire_GC -w weights -c chr_len.txt -s win_size -b bed.txt -n column_num -f feature -m mode -r threads -o output_prefix"""
+usage = """python Select_Probes_By_Tags.py -l filtered_tags.txt -t desire_Tm -g desire_GC -w weights -c chr_len.txt -s win_size -b bed.txt -n column_num -f feature -m mode -r threads -o output_prefix"""
 parser = argparse.ArgumentParser(description=usage)
-parser.add_argument("-l", "--filtered_labels", dest="filtered_labels", action="store", nargs='?',
+parser.add_argument("-l", "--filtered_tags", dest="filtered_tags", action="store", nargs='?',
                     help="Filtered labels file", metavar="FILE")
 parser.add_argument("-t", "--desire_Tm", dest="desire_Tm", action="store", nargs='?',
                     help="Desire melting temperature", metavar="FILE")
@@ -33,7 +33,7 @@ args = parser.parse_args()
 
 # labels to be considered in this step: Tm(main) GC hairpin dimer dust
 # parameters
-filtered_labels = args.filtered_labels
+filtered_labels = args.filtered_tags
 output = args.output
 # desire Tm
 desire_Tm = float(args.desire_Tm)
