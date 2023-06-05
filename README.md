@@ -81,7 +81,7 @@ python Get_Accessible_SNPs.py -f ref_genome.fasta -v MM80.vcf.gz -d 100 -b genom
 ```
 
 ## Step2
-Draw distributions of GC content and melting temperature (Tm) with a batch of SNPs and probe length. The means and standard deviation of GC and Tm are useful in determing the length of probes and in selection step.
+Draw distributions of GC content and melting temperature (Tm) with a batch of SNPs and given probe length. The means and standard deviations of GC and Tm are useful in determing the length of probes and in selection step.
 
 ```
 python Assess_Probes_By_GC_Tm.py -s Accessible_SNPs_df.txt -g ref_genome.fasta -k 71,121,10 -m Tm_NN > GC_Tm_report.txt
@@ -121,7 +121,7 @@ Filter_Probes_By_Tags.py -m Merged_Tags.txt -t 68,78 -g 40,60 -a 0,30 -u 0,2 -d 
 ```
 
 ## Step6
-Select optimal probe from each window according to weights for each tags and keep SNPs in desired regions (identifying based on feature, such as exon/gene/mRNA). When enabling the ```both```mode and there are SNPs within a window that match feature, the program will prioritize selecting those SNPs.  
+Select optimal probe from each window according to weights for each tags and keep SNPs in desired regions (identifying based on feature and BED file, such as exon/gene/mRNA). When enabling the ```both```mode and there are SNPs within a window that match feature, the program will prioritize selecting those SNPs.  
 ``` 
 python Select_Probes_By_Tags.py -l Filtered_Tags.txt -t 75(desire_Tm) -g 50(desire_GC) -w 0.8,0.2,0,0,0(weights) -c Chr_length.txt -s 10000(win_size) -b bed.txt -n 8 -f exon -m both -r 24 -o P81
 ```
@@ -131,7 +131,7 @@ Generate VCF for evaluation performance of probes
 ```
 # SNPs covered by probes
 python Probes_to_VCF.py -v MM80.vcf.gz -o Evaluation.vcf -f P81_merged_SNPs.txt
-# Set random missing to VCF
+# Simulate random missing to VCF
 python Assess_By_Missing.py -v Evaluation.vcf -r 0.2,0.4,0.6 -g ./.:0,0,0 -o M246.simulate.vcf
 ```
 
