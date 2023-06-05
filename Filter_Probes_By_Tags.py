@@ -1,9 +1,9 @@
 import pandas as pd
 import argparse
 
-usage = """python Filter_Probes_By_Tags.py -p pre_probes.fasta -g GCTm.txt -a hairpin.txt -d dimer.txt -u dust.txt -t 0 -o filtered_tags.txt"""
+usage = """python Filter_Probes_By_Tags.py -m Merged_Tags.txt -t 68,78 -g 40,60 -a 0,30 -u 0,2 -d 0.85 -i 0,4050,4051 -o Filtered_Tags.txt"""
 parser = argparse.ArgumentParser(description=usage)
-parser.add_argument("-m", "--merged_labels", dest="merged_labels", action="store", nargs='?',
+parser.add_argument("-m", "--merged_tags", dest="merged_tags", action="store", nargs='?',
                     help="Merged labels file (.txt)", metavar="FILE")
 parser.add_argument("-o", "--out", dest="output", action="store", nargs='?',
                     help="SNPs dataframe with filtered labels file (.txt)", metavar="FILE")
@@ -21,7 +21,7 @@ parser.add_argument("-i", "--keep_taxid", dest="keep_taxid", action="store", nar
                     help="Taxid to be kept (0,4050,4051; 0 means failing to be classified by Kraken2)", metavar="FILE")
 args = parser.parse_args()
 # parameters
-merged_labels = args.merged_labels
+merged_labels = args.merged_tags
 output_file = args.output
 # keep Tm
 keep_Tm = list(map(float, args.keep_Tm.split(",")))
