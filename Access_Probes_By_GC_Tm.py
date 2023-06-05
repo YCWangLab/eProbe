@@ -10,7 +10,7 @@ from Bio import SeqIO
 from Bio.SeqUtils import GC
 from Bio.SeqUtils import MeltingTemp as Tm
 
-usage = """python Assess_Probes_By_GC_TM.py -s SNPs_df.txt -g genome.fasta -k 71,121,10 -m Tm_NN"""
+usage = """python Assess_Probes_By_GC_Tm.py -s SNPs_df.txt -g genome.fasta -k 71,121,10 -m Tm_NN"""
 
 parser = argparse.ArgumentParser(description=usage)
 
