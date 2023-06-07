@@ -74,6 +74,14 @@ def get_flanks_with_df(snp_df_, flank_len, fa_dict):
         probes_dict[chr][header] = seq
     return probes_dict
 
+# function: drawing
+def plot_overlapping_densities(data1, data2, output):
+    sns.kdeplot(data1, color='#8A2BE2', label='GC Content',fill=True)
+    sns.kdeplot(data2, color='#4169E1', label='Melting Temperature',fill=True)
+    plt.xlim(0,100)
+    plt.legend()
+    plt.savefig(output, dpi=800)
+    plt.close()
 
 # reading SNPs dataframe
 SNPs_df = pd.read_csv(SNPs_df_file, delimiter='\t', header=0)
@@ -98,11 +106,7 @@ for flank in flank_lens:
     GC_std = np.std(GC_list)
     Tm_mean = np.mean(Tm_list)
     Tm_std = np.std(Tm_list)
-    sns.distplot(GC_list, color="green")
-    sns.distplot(Tm_list)
-    plt.title("Distribution of GC (green) and Tm (Blue)")
-    plt.savefig('Distribution_of_GC_and_Tm_for_K%s.pdf' % str(flank * 2 + 1), dpi=800)
-    plt.close()
+    plot_overlapping_densities(GC_list, Tm_list, "Distribution_of_GC_and_Tm_for_K%s.pdf" % str(flank * 2 + 1))
     print("K = %s" % str(flank * 2 + 1))
     print("GC mean: %s" % str(GC_mean))
     print("GC std: %s" % str(GC_std))
