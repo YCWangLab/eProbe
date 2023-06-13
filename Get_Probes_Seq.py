@@ -54,7 +54,7 @@ def get_flanks_with_df(snp_df_, left, right, fa_dict):
         else:
             ref_end = len(fa_dict[chr])
         # make header
-        header = chr + ":" + str(ref_start) + "-" + str(ref_end) + "_" + str(row["pos"]) + "_" + row["type"]
+        header = chr + ":" + str(ref_start) + "-" + str(ref_end) + "_" + str(row.pos) + "_" + row.type
         # extract sequence
         seq = fa_dict[chr][ref_start:(ref_end + 1)]
         probes_dict[chr][header] = seq
