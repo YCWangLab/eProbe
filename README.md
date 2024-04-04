@@ -1,5 +1,5 @@
-# eProbes
-This is the official repository for eProbes, a comprehensive python toolkit for designing target genome capture probe set for (ancient) environmental DNA.
+# eProbes: a one-stop target genome capture baits design toolkit for ancient environmental DNA
+This is the official repository for eProbes, which is a comprehensive python toolkit for designing target genome capture probe set for (ancient) environmental DNA.
 
 # Installation
 The eProbes packages and environments can be managed using conda (https://docs.conda.io/en/latest/) .
