@@ -2,7 +2,7 @@
 This is the official repository for eProbes, which is a comprehensive python toolkit for designing target genome capture probe set for (ancient) environmental DNA.
 
 # Installation
-The eProbes packages and environments can be managed using conda (https://docs.conda.io/en/latest/) .
+The eProbes packages and environments can be managed using conda (upcoming) .
 
 ## Installation using conda
 under developing
@@ -17,7 +17,7 @@ eProbes dependencies describe inserted here
 ```
 git clone --recursive https://github.com/YCWangLab/eProbes
 cd eProbes
-make
+python setup.py install
 ```
 ## Dependency
 ```
@@ -68,7 +68,7 @@ We recommand users to conduct population genetic analyses with the VCF, such as 
 
 # Tutorial for running eProbes
 
-Next, probe generation will be based on the VCF file, mainly involving candidate probe acquisition, calculation of various metrics (so-called tag in the following steps) for candidate probes, filtering, selection, and assessment.
+The main functionalities of eProbe are divided into eProbe_SNP_preprocessor, eProbe_SNPs_filter, eProbe_SNP_subsampler, eProbe_SNP_subsampler, eProbe_SNP_evaluator, eProbe_SNP_generator, and eProbe_Seq_generator. 
 
 ## Test dataset
 upcoming
