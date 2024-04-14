@@ -1,14 +1,15 @@
 # eProbes: a one-stop target genome capture baits design toolkit for ancient environmental DNA
-This is the official repository for eProbes, which is a comprehensive python toolkit for designing target genome capture probe set for (ancient) environmental DNA.
+
+This is the official repository for eProbes, which is a comprehensive python toolkit for designing target genome capture probe set for (ancient) environmental DNA. The core concept of this toolkit involves selecting an optimal probe set based on sequences containing informative SNPs and considering factors such as sequence accessibility across the species and the environment, analytical reliability, and expected performance in capture experiments.
 
 # Installation
-The eProbes packages and environments can be managed using conda (upcoming) .
+The eProbes packages and environments can be managed using conda (https://docs.conda.io/en/latest/) .
 
 ## Installation using conda
 under developing
 
 ```
-conda installation code inserted here
+upcoming
 ```
 
 ## Build eProbes from development version by cloning the github repo
@@ -21,9 +22,12 @@ python setup.py install
 ```
 ## Dependency
 ```
-Python v3.6
+Python >= v3.6
+PyVCF>=0.6.8
+Pysam>=0.11.2.2
 Biopython >= v1.79
-PyVCF v0.6.0 (https://github.com/jamescasbon/PyVCF/)
+pandas>=1.1.5
+numpy>=1.19.5
 ```
 
 # Data preparation
@@ -68,75 +72,55 @@ We recommand users to conduct population genetic analyses with the VCF, such as 
 
 # Tutorial for running eProbes
 
-The main functionalities of eProbe are divided into eProbe_SNP_preprocessor, eProbe_SNPs_filter, eProbe_SNP_subsampler, eProbe_SNP_subsampler, eProbe_SNP_evaluator, eProbe_SNP_generator, and eProbe_Seq_generator. 
+Next, probe generation will be based on the VCF file, mainly involving preprocess, filtering, subsampling, and evaluation.
 
-## Test dataset
-upcoming
-
-## Step1
-Retrieve location of all SNPs and filter out SNPs around InDels and SVs (if they are called in the same VCF), since probes targeted these SNPs might not be accessed from some population. Users can also input a BED format file to indicate SNPs in which genome regions need to be kept. The initial SNPs dataframe has  chromosome (chr), positon (pos), and type (transition or transversion) as the first three columns.
+## Step1: eProbe_SNP_preprocessor
+The eProbe_SNP_preprocessor module retrieves qualified SNPs from the VCF file (gz compressed and indexed). By default, eProbe exclude all SNPs near structural variants (InDels or SVs). Users can input a BED file to either retain or exclude SNPs in these regions, such as repetitive regions. Then, based on user-defined criteria, SNPs clustered together are filtered out, as these segments can increase  template bias of probes designed on them, reducing specificity when capturing non-template target sequences.
 
 ```
-python Get_Accessible_SNPs.py -f ref_genome.fasta -v MM80.vcf.gz -d 100 -b genome_blocks.bed -o Accessible_SNPs_df.txt
+python eProbe_SNP_preprocessor.py -v vcf.gz -r ref_genome.fa -t threads 
 ```
 
-## Step2
-Draw distributions of GC content and melting temperature (Tm) with a batch of SNPs and given probe length. The means and standard deviations of GC and Tm are useful in determing the length of probes and in selection step.
+## Step2: eProbe_SNP_filter
+The eProbe_SNP_filter module performs default filtering processes, including Background filtering, Accessibility filtering, Taxonomic filtering, and Biophysical filtering.
+
+Background filtering: Utilizes a kmer-based algorithm to remove probes that overlap with sequences in user-input databases. Users can specify dominant species in environmental samples, such as microbes or dominant plants, to reduce DNA from these sources overly occupying probes.
+
+Accessibility filtering: Filters probes based on their accessibility within the intra-specific level.
+
+Taxonomic filtering: Retains probes that can still be successfully assigned to the target species within allowable mismatch ranges, ensuring that sequences enriched in subsequent analyses can be reliably assigned to the target species.
+
+Biophysical filtering: Filters probes based on GC content, melting temperature, complexity, and the likelihood of forming secondary structures.
 
 ```
-python Assess_Probes_By_GC_Tm.py -s Accessible_SNPs_df.txt -g ref_genome.fasta -k 71,121,10 -m Tm_NN > GC_Tm_report.txt
-```
-## Step3
-Extract sequences of candidate probes.
-```
-python Get_Probes_Seq.py -s Accessible_SNPs_df.txt -g ref_genome.fasta -l 81 -o P81_pre_probes.fasta
-```
-## Step4
-Attach tags for each probe.
-```
-# GC and Tm
-python Get_Tag_GC_Tm.py -p P81_pre_probes.fasta -m "Tm_NN" -t 24 -o P81_Tag_GC_Tm.txt
-# Hairpin structure
-python Get_Tag_Hairpin.py -p P81_pre_probes.fasta -s 24 -t 24 -o P81_Tag_Hairpin.txt
-# Dimer structure
-python Get_Tag_Dimer.py -p P81_pre_probes.fasta -s 24 -t 24 -o P81_Tag_Dimer.txt
-# Complexity
-python Get_Tag_DUST.py -p P81_pre_probes.fasta -s 24 -t 24 -o P81_Tag_DUST.txt
-```
-Before obtaining the taxid, users need to run Kraken2 (https://github.com/DerrickWood/kraken2), a fast sequence classification tool based on k-mers, and use the output of Kraken2 as input. Considering that the majority of environmental DNA is often contaminated by microbial interference, it is suggested to maximize the diversity of microbial genomes when constructing the database.
-
-Of course, this process might be time-consuming. Therefore, if users are unwilling to perform this step, they can generate a pseudo taxid file where the first and third columns are both 0, and the second column contains the IDs of all pre-probes.
-``` 
-# Running Kraken2
-kraken2 --db your_database --output P81_output --classified-out P81_classified.fasta --threads 6 --report P81_report P81_pre_probes.fasta
-# Taxid
-python Get_Tag_Taxid.py -k P81_output -o P81_Tag_Taxid.txt
-# Merged all tag files
-python Merge_Tags.py -p P81_pre_probes.fasta -g P81_Tag_GC_Tm.txt -a P81_Tag_Hairpin.txt -d P81_Tag_Dimer.txt -u P81_Tag_DUST.txt -t P81_Tag_Taxid.txt -o P81_Merged_Tags.txt
-```
-## Step5 
-Filter pre-probes based on given thresholds.
-``` 
-Filter_Probes_By_Tags.py -m Merged_Tags.txt -t 68,78 -g 40,60 -a 0,30 -u 0,2 -d 0.85 -i 0,4050,4051 -o Filtered_Tags.txt
+python eProbe_SNP_filter.py -f SNPs_df.tsv(from step1) -r ref_genome.fa -t threads 
+--BG_db Kraken2_databases --AC_db Bowtie2_databases --TX_db Bowtie2_databases --TX_taxa taxon_id  --TX_names_dmp names.dmp --TX_names_dmp nodes.dmp
 ```
 
-## Step6
-Select optimal probe from each window according to weights for each tags and keep SNPs in desired regions (identifying based on feature and BED file, such as exon/gene/mRNA). When enabling the ```both```mode and there are SNPs within a window that match feature, the program will prioritize selecting those SNPs.  
-``` 
-python Select_Probes_By_Tags.py -l Filtered_Tags.txt -t 75(desire_Tm) -g 50(desire_GC) -w 0.8,0.2,0,0,0(weights) -c Chr_length.txt -s 10000(win_size) -b bed.txt -n 8 -f exon -m both -r 24 -o P81
+## Step3: eProbe_SNP_subsampler
+eProbe_SNP_subsampler allows for uniform sampling of qualified SNPs from the genome based on user-defined window sizes. By default, the program randomly samples within the window. Users can set weights for different biophysical tags to select the optimal SNPs within the window, or input a BED file to prioritize SNPs within the BED regions. Users can also specify a certain number of SNPs based on practical application needs.
+```
+python eProbe_SNP_subsampler.py -f SNPs_df.tsv(from step2) -r ref_genome.fa -t threads -o output
 ```
 
-## Step7
-Generate VCF for evaluation performance of probes
+## Step4: eProbe_SNP_evaluator
+eProbe_SNP_evaluator evaluates the final probe set in three main aspects:
+Evaluate_by_tags: Generates distribution plots of different biophysical metrics after filtering.
+Evaluate_by_distance: Computes and compares pairwise distances calculated based on original data and probe-covered SNPs. It visualizes distance matrices as heatmaps and hierarchical clustering, and computes matrix correlation and Manhattan distance.
+Evaluate_by_missing: Simulates various degrees of missing data by randomly adding missing values to individuals. It assesses the probe set's tolerance to missing data on genetic typing.
 ```
-# SNPs covered by probes
-python Probes_to_VCF.py -v MM80.vcf.gz -o Evaluation.vcf -f P81_merged_SNPs.txt
-# Simulate random missing to VCF
-python Assess_By_Missing.py -v Evaluation.vcf -r 0.2,0.4,0.6 -g ./.:0,0,0 -o M246.simulate.vcf
+python eProbe_SNP_evaluator.py -f SNPs_df.tsv(from step3) -r ref_genome.fa -v vcf.gz -t threads -o output
 ```
 
-## Step8
-Generate probes
+
+## Step5: eProbe_SNP_generator
+eProbe_SNP_generator takes as input the SNPs_df.tsv provided by the user and generates probes accordingly. Users can specify the length of the probes, the positions of SNPs on the probes, whether to replace SNPs with bases other than REF and ALT, and whether to retain only transversions (tv) SNPs.
 ```
-python Get_Probes_Seq.py -s P81_merged_SNPs.txt(your_final_SNPs_df.txt) -g ref_genome.fasta -l 81 -o P81_probes.fasta
+python eProbe_Seq_generator.py -f SNPs_df.tsv(from step3) -r ref_genome.fa --probe_length 81 --replace on --type tv -t threads -o output
+```
+
+## Step6: eProbe_Seq_generator
+eProbe also allows users to input sequences of interest for probe generation. Users can input either a gene fasta file or a genome fasta file along with the positions where probes are needed (BED). Additionally, users can input a vcf file, and eProbe_Seq_generator can phase the regions within the BED file and obtain sequences of different alleles for probe design.
+```
+python eProbe_Seq_generator -f seq.fa --probe_length 81 --step 30
 ```
