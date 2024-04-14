@@ -1,0 +1,14 @@
+Metadata-Version: 1.1
+Name: eProbe
+Version: 0.0.1
+Summary: A package for probe design
+Home-page: https://github.com/YCWangLab/eProbes
+Author: Zi-Hao Huang
+Author-email: zh384@cam.ac.uk
+License: GNU General Public License version 3
+Description-Content-Type: UNKNOWN
+Description: A one-stop target genome capture baits design toolkit for ancient environmental DNA
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
