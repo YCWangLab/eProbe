@@ -1,0 +1,14 @@
+Metadata-Version: 2.1
+Name: eProbe
+Version: 0.0.1
+Summary: A package for probe design
+Home-page: https://github.com/YCWangLab/eProbe
+Author: Zi-Hao Huang
+Author-email: zh384@cam.ac.uk
+License: Creative Commons Attribution-NonCommercial 4.0
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: CC BY-NC 4.0
+Classifier: Operating System :: OS Independent
+License-File: LICENSE-CC-BY-NC-4.0.md
+
+A one-stop capture probe design toolkit for genetic diversity reconstructions from ancient environmental DNA
