@@ -201,3 +201,5 @@ This command line generate FUNCGEN panel taking a BED file and corresponding ref
 <div style="text-align: center;">
     <img src="./figures/haplotyping.jpg" width="600">
 </div>
+
+#### You are very wellcome to leave an issue if you have any question!
