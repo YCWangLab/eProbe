@@ -73,5 +73,5 @@ if os.path.exists(f'{OUTPUT_BASE}.processing_probe.fasta'):
 else:
     os.renames(f'{OUTPUT_BASE}.filtered_probe.fasta', f'{OUTPUT_BASE}.probe.fasta')
 
-check_file_exists(f'{OUTPUT_BASE}.probe.fasta', success=f'Accessing estimated pairwise distance completed.',
-                  fail=f'Accessing estimated pairwise distance failed.')
+check_file_exists(f'{OUTPUT_BASE}.probe.fasta', success=f'Generating probes completed.',
+                  fail=f'Generating probes failed.')
