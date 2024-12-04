@@ -1,8 +1,13 @@
+<div style="text-align: center;">
+    <img src="./figures/logo.png" width="300">
+</div>
+
 # *eProbe*: a one-stop capture probe design toolkit for genetic diversity reconstructions from ancient environmental DNA
 This is the official repository for ***eProbe***, which is a python toolkit offering an efficient, flexible, and comprehensive end-to-end workflow for the generation, filtering, selection, and assessment of capture baits tailored for **ancient environmental DNA**, adaptable to any genomic landscape, from genome-wide informative loci to specific functional genes of interest. The core concept of this workflow involves 
 1. Retrieve sequences that carry genetically informative variants.
 2. Filtering for sequences that can be efficiently recovered from mixed environmental samples, meet suitable biophysical/biochemical criteria, and are reliable for subsequent analysis.
 3. Evaluating the predicted performance of the sequences.
+
 <div style="text-align: center;">
     <img src="./figures/workflow.jpg" width="600">
 </div>
