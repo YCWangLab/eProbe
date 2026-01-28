@@ -8,14 +8,18 @@ Uses pysam for efficient indexed access to compressed VCF files.
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, List, Tuple
 import warnings
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pysam
 import pandas as pd
 
 from eprobe.core.result import Result, Ok, Err
 from eprobe.core.models import SNP, SNPDataFrame
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -235,31 +239,122 @@ class VCFReader:
         return list(self._vcf.header.contigs)
 
 
+def _extract_snps_for_chromosome(
+    vcf_path: Path,
+    chrom: str,
+    bed_path: Optional[Path],
+    force_biallelic: bool,
+) -> Tuple[str, List[SNP], int]:
+    """
+    Extract SNPs from a single chromosome (for multiprocessing).
+    
+    Args:
+        vcf_path: Path to VCF file
+        chrom: Chromosome name
+        bed_path: Optional BED file to filter regions
+        force_biallelic: Force biallelic mode
+        
+    Returns:
+        Tuple of (chromosome, snp_list, non_biallelic_count)
+    """
+    logger.info(f"→ Processing chromosome {chrom}...")
+    
+    reader = VCFReader(vcf_path)
+    open_result = reader.open()
+    if open_result.is_err():
+        logger.error(f"Failed to open VCF for {chrom}: {open_result.unwrap_err()}")
+        return (chrom, [], 0)
+    
+    snps = []
+    non_biallelic = 0
+    
+    try:
+        for snp in reader.fetch_snps(chrom=chrom, bed_path=bed_path, force_biallelic=force_biallelic):
+            snps.append(snp)
+        
+        # Count non-biallelic variants if not forcing
+        if not force_biallelic:
+            for record in reader._vcf.fetch(chrom):
+                if not reader.is_biallelic_snp(record):
+                    non_biallelic += 1
+        
+        reader.close()
+        logger.info(f"✓ Chromosome {chrom}: {len(snps)} SNPs extracted")
+        
+        return (chrom, snps, non_biallelic)
+        
+    except Exception as e:
+        logger.error(f"Error processing {chrom}: {e}")
+        reader.close()
+        return (chrom, [], 0)
+
+
 def extract_snps_from_vcf(
     vcf_path: Path,
     bed_path: Optional[Path] = None,
     force_biallelic: bool = False,
+    threads: int = 1,
 ) -> Result[list[SNP], str]:
     """
-    Extract biallelic SNPs from VCF file.
+    Extract biallelic SNPs from VCF file (with multiprocessing).
     
     Args:
         vcf_path: Path to VCF file (.vcf.gz with .tbi index)
         bed_path: Optional BED file to filter regions
         force_biallelic: If True, take first alt allele when multiple exist
+        threads: Number of parallel processes (default: 1)
         
     Returns:
         Result containing list of SNPs
     """
-    reader = VCFReader(vcf_path)
-    open_result = reader.open()
-    if open_result.is_err():
-        return Err(open_result.unwrap_err())
-    
+    # Get chromosome list from VCF header
     try:
-        snps = list(reader.fetch_snps(bed_path=bed_path, force_biallelic=force_biallelic))
+        reader = VCFReader(vcf_path)
+        open_result = reader.open()
+        if open_result.is_err():
+            return Err(open_result.unwrap_err())
+        
+        chromosomes = reader.chromosomes
         reader.close()
-        return Ok(snps)
+        
+        logger.info(f"Found {len(chromosomes)} chromosomes in VCF")
+        logger.info(f"Using {threads} threads for parallel extraction")
+        
     except Exception as e:
-        reader.close()
-        return Err(f"SNP extraction failed: {e}")
+        return Err(f"Failed to read VCF header: {e}")
+    
+    all_snps = []
+    total_non_biallelic = 0
+    
+    if threads == 1:
+        # Serial processing
+        for chrom in chromosomes:
+            chrom, snps, non_biallelic = _extract_snps_for_chromosome(
+                vcf_path, chrom, bed_path, force_biallelic
+            )
+            all_snps.extend(snps)
+            total_non_biallelic += non_biallelic
+    else:
+        # Parallel processing by chromosome
+        with ProcessPoolExecutor(max_workers=threads) as executor:
+            futures = {}
+            for chrom in chromosomes:
+                future = executor.submit(
+                    _extract_snps_for_chromosome,
+                    vcf_path, chrom, bed_path, force_biallelic
+                )
+                futures[future] = chrom
+            
+            for future in as_completed(futures):
+                chrom_name = futures[future]
+                try:
+                    chrom, snps, non_biallelic = future.result()
+                    all_snps.extend(snps)
+                    total_non_biallelic += non_biallelic
+                except Exception as e:
+                    logger.error(f"Failed to process {chrom_name}: {e}")
+    
+    if total_non_biallelic > 0 and not force_biallelic:
+        logger.warning(f"Skipped {total_non_biallelic} non-biallelic variants")
+    
+    return Ok(all_snps)

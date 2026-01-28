@@ -308,9 +308,9 @@ def run_extract(
     if not fai_path.exists():
         return Err(f"Reference index not found: {fai_path}. Run 'samtools faidx {reference_path}'")
     
-    # Step 1: Extract raw SNPs from VCF
+    # Step 1: Extract raw SNPs from VCF (with multiprocessing)
     logger.info("Extracting SNPs from VCF...")
-    vcf_result = extract_snps_from_vcf(vcf_path, bed_path, force_biallelic=force_biallelic)
+    vcf_result = extract_snps_from_vcf(vcf_path, bed_path, force_biallelic=force_biallelic, threads=threads)
     if vcf_result.is_err():
         return Err(f"VCF extraction failed: {vcf_result.unwrap_err()}")
     
