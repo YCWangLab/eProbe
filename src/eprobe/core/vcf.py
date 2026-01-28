@@ -147,7 +147,6 @@ class VCFReader:
             pos=record.pos,
             ref=record.ref,
             alt=alt_allele,
-            snp_id=record.id if record.id else None,
         )
     
     def fetch_snps(

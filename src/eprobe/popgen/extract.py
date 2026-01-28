@@ -130,7 +130,7 @@ def extract_snps_with_flanks_for_chrom(
     chrom_snps: List[SNP],
     reference_path: Path,
     flank: int,
-) -> List[SNP]:
+) -> List[Dict[str, Any]]:
     """
     Extract flanking sequences for SNPs on one chromosome.
     
@@ -144,7 +144,7 @@ def extract_snps_with_flanks_for_chrom(
         flank: Flanking region length
         
     Returns:
-        List of SNPs with flanking sequences
+        List of SNP dicts with flanking sequences
     """
     snps_with_flanks = []
     
@@ -183,17 +183,17 @@ def extract_snps_with_flanks_for_chrom(
                 )
                 continue
             
-            # Create updated SNP with flanks
-            updated_snp = SNP(
-                chrom=snp.chrom,
-                pos=snp.pos,
-                ref=snp.ref,
-                alt=snp.alt,
-                snp_id=snp.snp_id,
-                left_flank=left_flank_seq.upper(),
-                right_flank=right_flank_seq.upper(),
-            )
-            snps_with_flanks.append(updated_snp)
+            # Create SNP dict with flanks
+            snp_dict = {
+                'chrom': snp.chrom,
+                'pos': snp.pos,
+                'ref': snp.ref,
+                'alt': snp.alt,
+                'snp_id': snp.id,
+                'left_flank': left_flank_seq.upper(),
+                'right_flank': right_flank_seq.upper(),
+            }
+            snps_with_flanks.append(snp_dict)
         
         ref_fasta.close()
         
@@ -209,7 +209,7 @@ def extract_snps_with_flanks_parallel(
     reference_path: Path,
     flank: int,
     threads: int = 1,
-) -> Result[List[SNP], str]:
+) -> Result[List[Dict[str, Any]], str]:
     """
     Add flanking sequences using multiprocessing by chromosome.
     
@@ -220,7 +220,7 @@ def extract_snps_with_flanks_parallel(
         threads: Number of parallel processes
         
     Returns:
-        Result containing SNPs with flanking sequences
+        Result containing list of SNP dicts with flanking sequences
     """
     # Group SNPs by chromosome
     chrom_snps_dict: Dict[str, List[SNP]] = defaultdict(list)
@@ -331,36 +331,36 @@ def run_extract(
     snps_with_flanks = flank_result.unwrap()
     logger.info(f"{len(snps_with_flanks)} SNPs have complete flanking sequences")
     
-    # Step 3: Apply cluster filter
+    # Step 3: Apply cluster filter (on original SNPs from VCF)
     cluster_config = ClusterConfig(
         flank=cluster_flank,
         max_snp=max_cluster_snp,
         enabled=cluster_mode,
     )
     
-    filter_result = apply_cluster_filter(snps_with_flanks, cluster_config)
-    if filter_result.is_err():
-        return Err(f"Cluster filtering failed: {filter_result.unwrap_err()}")
-    
-    final_snps = filter_result.unwrap()
+    if cluster_mode:
+        logger.info(f"Applying cluster filter (flank={cluster_flank}, max_snp={max_cluster_snp})")
+        # Create map from position to index in snps_with_flanks
+        pos_to_idx = {(d['chrom'], d['pos']): i for i, d in enumerate(snps_with_flanks)}
+        
+        # Use raw SNPs for clustering
+        keep_indices = detect_clusters(raw_snps, cluster_flank, max_cluster_snp)
+        
+        # Filter snps_with_flanks based on kept raw SNPs
+        kept_snps_set = {(raw_snps[i].chrom, raw_snps[i].pos) for i in keep_indices}
+        final_snps = [d for d in snps_with_flanks if (d['chrom'], d['pos']) in kept_snps_set]
+        
+        removed = len(snps_with_flanks) - len(final_snps)
+        logger.info(f"Cluster filter: removed {removed} SNPs, {len(final_snps)} remaining")
+    else:
+        final_snps = snps_with_flanks
     
     # Step 4: Save output (batch write)
     output_path = Path(str(output_prefix) + ".snps.tsv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Direct DataFrame construction (more efficient)
-    df = pd.DataFrame([
-        {
-            'chrom': snp.chrom,
-            'pos': snp.pos,
-            'ref': snp.ref,
-            'alt': snp.alt,
-            'snp_id': snp.snp_id or f"{snp.chrom}:{snp.pos}",
-            'left_flank': snp.left_flank,
-            'right_flank': snp.right_flank,
-        }
-        for snp in final_snps
-    ])
+    # Direct DataFrame construction (already dicts)
+    df = pd.DataFrame(final_snps)
     
     try:
         df.to_csv(output_path, sep='\t', index=False)
