@@ -97,40 +97,117 @@ class VCFReader:
         
         return True
     
+    @staticmethod
+    def _can_force_biallelic(record: pysam.VariantRecord) -> bool:
+        """
+        Quick check if variant can be forced to biallelic.
+        
+        Checks:
+        1. REF is single base
+        2. At least one ALT exists
+        3. First ALT is single base
+        
+        Args:
+            record: pysam VariantRecord
+            
+        Returns:
+            True if can be forced to biallelic
+        """
+        # Check ref is single base
+        if len(record.ref) != 1:
+            return False
+        
+        # Check has at least one alt
+        if not record.alts or len(record.alts) == 0:
+            return False
+        
+        # Check first alt is single base and valid
+        first_alt = record.alts[0]
+        if first_alt in {"A", "C", "G", "T"}:
+            return True
+        
+        return False
+    
+    @staticmethod
+    def _record_to_snp(record: pysam.VariantRecord, force_first_alt: bool = False) -> SNP:
+        """
+        Convert pysam VariantRecord to SNP object.
+        
+        Args:
+            record: pysam VariantRecord
+            force_first_alt: If True, use first alt even if multiple exist
+            
+        Returns:
+            SNP object
+        """
+        alt_allele = record.alts[0]
+        
+        return SNP.from_vcf_record(
+            chrom=record.chrom,
+            pos=record.pos,
+            ref=record.ref,
+            alt=alt_allele,
+            snp_id=record.id if record.id else None,
+        )
+    
     def fetch_snps(
         self,
         chrom: Optional[str] = None,
         start: Optional[int] = None,
         end: Optional[int] = None,
+        bed_path: Optional[Path] = None,
+        force_biallelic: bool = False,
     ) -> Iterator[SNP]:
         """
-        Fetch SNPs from VCF file.
+        Fetch biallelic SNPs from VCF.
         
         Args:
-            chrom: Chromosome to fetch from (None for all)
-            start: Start position (1-based, optional)
-            end: End position (1-based, optional)
+            chrom: Chromosome to fetch (None = all)
+            start: Start position (0-based)
+            end: End position
+            bed_path: BED file to restrict regions
+            force_biallelic: Force biallelic by taking first alt
             
         Yields:
-            SNP objects for each biallelic SNP
+            SNP objects for biallelic variants
         """
         if self._vcf is None:
-            raise RuntimeError("VCF file not opened. Call open() first.")
+            raise RuntimeError("VCF not opened")
         
-        # Determine fetch region
-        if chrom is not None:
-            records = self._vcf.fetch(chrom, start, end)
+        # Read BED regions if provided
+        regions = []
+        if bed_path is not None:
+            with open(bed_path) as f:
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    parts = line.strip().split()
+                    if len(parts) >= 3:
+                        regions.append((parts[0], int(parts[1]), int(parts[2])))
+        
+        # Fetch variants
+        if regions:
+            # Fetch from specified regions
+            for region_chrom, region_start, region_end in regions:
+                for record in self._vcf.fetch(region_chrom, region_start, region_end):
+                    if self.is_biallelic_snp(record):
+                        yield self._record_to_snp(record)
+                    elif force_biallelic and self._can_force_biallelic(record):
+                        yield self._record_to_snp(record, force_first_alt=True)
+        elif chrom is not None:
+            # Fetch from specified chromosome/region
+            for record in self._vcf.fetch(chrom, start, end):
+                if self.is_biallelic_snp(record):
+                    yield self._record_to_snp(record)
+                elif force_biallelic and self._can_force_biallelic(record):
+                    yield self._record_to_snp(record, force_first_alt=True)
         else:
-            records = self._vcf.fetch()
-        
-        for record in records:
-            if self.is_biallelic_snp(record):
-                yield SNP.from_vcf_record(
-                    chrom=record.chrom,
-                    pos=record.pos,
-                    ref=record.ref,
-                    alt=record.alts[0],
-                )
+            # Fetch all
+            for record in self._vcf:
+                if self.is_biallelic_snp(record):
+                    yield self._record_to_snp(record)
+                elif force_biallelic and self._can_force_biallelic(record):
+                    yield self._record_to_snp(record, force_first_alt=True)
     
     def extract_snps_by_chromosome(
         self,
@@ -160,17 +237,33 @@ class VCFReader:
 
 
 def extract_snps_from_vcf(
-    vcf_path: Path | str,
-    chromosomes: Optional[list[str]] = None,
-) -> Result[SNPDataFrame, str]:
+    vcf_path: Path,
+    bed_path: Optional[Path] = None,
+    force_biallelic: bool = False,
+) -> Result[list[SNP], str]:
     """
-    Extract all biallelic SNPs from VCF file.
+    Extract biallelic SNPs from VCF file.
     
     Args:
-        vcf_path: Path to VCF file (vcf.gz)
-        chromosomes: Optional list of chromosomes to extract from
+        vcf_path: Path to VCF file (.vcf.gz with .tbi index)
+        bed_path: Optional BED file to filter regions
+        force_biallelic: If True, take first alt allele when multiple exist
         
     Returns:
+        Result containing list of SNPs
+    """
+    reader = VCFReader(vcf_path)
+    open_result = reader.open()
+    if open_result.is_err():
+        return Err(open_result.unwrap_err())
+    
+    try:
+        snps = list(reader.fetch_snps(bed_path=bed_path, force_biallelic=force_biallelic))
+        reader.close()
+        return Ok(snps)
+    except Exception as e:
+        reader.close()
+        return Err(f"SNP extraction failed: {e}")
         Ok(SNPDataFrame) on success, Err(message) on failure
         
     Note:

@@ -106,6 +106,11 @@ def popgen(ctx: click.Context) -> None:
     default=True,
     help="Enable/disable cluster filtering (default: enabled).",
 )
+@click.option(
+    "--force_biallelic",
+    is_flag=True,
+    help="Force biallelic by selecting first alt allele if multiple exist.",
+)
 @click.pass_context
 def extract(
     ctx: click.Context,
@@ -118,6 +123,7 @@ def extract(
     min_cluster_snp: int,
     keep_bed: Optional[Path],
     remove_bed: Optional[Path],
+    force_biallelic: bool,
     cluster_filter: bool,
 ) -> None:
     """
@@ -152,10 +158,9 @@ def extract(
         threads=threads,
         cluster_flank=cluster_flank,
         max_cluster_snp=max_cluster_snp,
-        min_cluster_snp=min_cluster_snp,
-        keep_bed=keep_bed,
-        remove_bed=remove_bed,
-        enable_cluster_filter=cluster_filter,
+        cluster_mode=cluster_filter,
+        bed_path=keep_bed if keep_bed else remove_bed,
+        force_biallelic=force_biallelic,
         verbose=verbose,
     )
     
@@ -164,12 +169,12 @@ def extract(
         raise SystemExit(1)
     
     stats = result.unwrap()
-    echo_success(f"Extracted {stats['total_snps']} SNPs")
+    echo_success(f"Extracted {stats['final_snp_count']} SNPs")
     
     if cluster_filter:
-        echo_info(f"  Filtered {stats.get('cluster_filtered', 0)} SNPs in clusters")
+        echo_info(f"  Filtered {stats.get('cluster_removed', 0)} SNPs in clusters")
     
-    echo_info(f"Output: {output}.snps.tsv")
+    echo_info(f"Output: {stats['output_file']}")
 
 
 @popgen.command()
