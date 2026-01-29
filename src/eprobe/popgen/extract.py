@@ -183,15 +183,13 @@ def extract_snps_with_flanks_for_chrom(
                 )
                 continue
             
-            # Create SNP dict with flanks
+            # Create SNP dict (only core fields)
             snp_dict = {
-                'chrom': snp.chrom,
+                'chr': snp.chrom,
                 'pos': snp.pos,
                 'ref': snp.ref,
                 'alt': snp.alt,
-                'snp_id': snp.id,
-                'left_flank': left_flank_seq.upper(),
-                'right_flank': right_flank_seq.upper(),
+                'type': snp.mutation_type,
             }
             snps_with_flanks.append(snp_dict)
         
@@ -349,7 +347,7 @@ def run_extract(
         
         # Filter snps_with_flanks based on kept raw SNPs
         kept_snps_set = {(raw_snps[i].chrom, raw_snps[i].pos) for i in keep_indices}
-        final_snps = [d for d in snps_with_flanks if (d['chrom'], d['pos']) in kept_snps_set]
+        final_snps = [d for d in snps_with_flanks if (d['chr'], d['pos']) in kept_snps_set]
         
         removed = len(snps_with_flanks) - len(final_snps)
         logger.info(f"Cluster filter: removed {removed} SNPs, {len(final_snps)} remaining")
