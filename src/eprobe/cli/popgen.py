@@ -424,6 +424,7 @@ def filter(
         output_prefix=output,
         filters=filters,
         threads=threads,
+        probe_length=length,
         bg_db=bg_db,
         ac_db=ac_db,
         tx_db=tx_db,

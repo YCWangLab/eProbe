@@ -889,6 +889,7 @@ def run_filter(
     max_complexity: float = 2.0,
     max_hairpin: Optional[float] = None,
     max_dimer: Optional[float] = None,
+    probe_length: int = 100,
     threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
@@ -921,6 +922,7 @@ def run_filter(
         max_complexity: Maximum DUST complexity score
         max_hairpin: Maximum hairpin score (optional)
         max_dimer: Maximum dimer score (optional)
+        probe_length: Length of probe sequences (for flanking calculation)
         threads: Number of threads
         verbose: Enable verbose logging
         
@@ -953,7 +955,7 @@ def run_filter(
     ref_dict = ref_result.unwrap()
     
     # Add flanking sequences to each SNP
-    flank_size = (length - 1) // 2
+    flank_size = (probe_length - 1) // 2
     for snp in snps:
         if snp.chrom not in ref_dict:
             # Set empty flanks for unknown chromosomes
