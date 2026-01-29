@@ -146,7 +146,7 @@ def extract(
       {output}.chr_sizes.tsv  - Chromosome sizes
       {output}.extract.log    - Processing log
     """
-    from eprobe.popgen.extract import run_extract
+    from eprobe.popgen.extract_v2 import run_extract
     
     verbose = ctx.obj.get("verbose", False)
     
@@ -199,7 +199,7 @@ def extract(
     # Step 2: Report BED filtering (if applied)
     if stats.get('bed_applied'):
         bed_mode = stats.get('bed_mode')
-        total_vcf = stats.get('total_snps_in_vcf')
+        total_vcf = stats.get('total_in_vcf')
         kept = stats.get('bed_kept')
         removed = stats.get('bed_removed')
         
@@ -214,7 +214,7 @@ def extract(
             echo_info(f"  ├─ Removed (in BED regions): {removed:,}")
             echo_info(f"  └─ Kept (outside BED): {kept:,}")
     else:
-        echo_success(f"→ Step 2: Extracted {stats['raw_snp_count']:,} SNPs from VCF")
+        echo_success(f"→ Step 2: Extracted {stats['total_in_vcf']:,} SNPs from VCF")
     
     # Step 3: Report cluster filtering
     if cluster_filter:
