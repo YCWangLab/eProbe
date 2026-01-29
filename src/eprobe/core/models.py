@@ -236,6 +236,20 @@ class SNPDataFrame:
         """Return sorted SNPDataFrame by chromosome and position."""
         sorted_df = self._df.sort_values(["chr", "pos"]).reset_index(drop=True)
         return SNPDataFrame(sorted_df)
+    
+    def to_snps(self) -> list[SNP]:
+        """Convert to list of SNP objects."""
+        snps = []
+        for _, row in self._df.iterrows():
+            snp = SNP(
+                chrom=row["chr"],
+                pos=int(row["pos"]),
+                ref=row["ref"],
+                alt=row["alt"],
+                mutation_type=row["type"]
+            )
+            snps.append(snp)
+        return snps
 
 
 @dataclass(frozen=True, slots=True)
