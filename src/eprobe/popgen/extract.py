@@ -405,6 +405,5 @@ def run_extract(
         "bed_kept": len(raw_snps) if bed_applied else None,
         "bed_removed": (total_snps_in_vcf - len(raw_snps)) if bed_applied and total_snps_in_vcf else None,
     }
-    }
     
     return Ok(stats)
