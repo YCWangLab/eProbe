@@ -22,10 +22,73 @@ from eprobe.core.models import SNP
 logger = logging.getLogger(__name__)
 
 
+def invert_bed_regions(bed_path: Path, fai_path: Path) -> List[Tuple[str, int, int]]:
+    """
+    Generate inverted BED regions (complement of input BED).
+    
+    Uses reference .fai file to get chromosome lengths, then returns
+    all regions NOT covered by the input BED.
+    
+    Args:
+        bed_path: Input BED file
+        fai_path: Reference genome .fai index file
+        
+    Returns:
+        List of (chrom, start, end) tuples for inverted regions
+    """
+    # Read chromosome lengths from .fai
+    chrom_lengths = {}
+    with open(fai_path) as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                chrom_lengths[parts[0]] = int(parts[1])
+    
+    # Read and sort BED regions by chromosome and start
+    bed_regions = {}
+    with open(bed_path) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                chrom, start, end = parts[0], int(parts[1]), int(parts[2])
+                if chrom not in bed_regions:
+                    bed_regions[chrom] = []
+                bed_regions[chrom].append((start, end))
+    
+    # Sort regions within each chromosome
+    for chrom in bed_regions:
+        bed_regions[chrom].sort()
+    
+    # Generate inverted regions
+    inverted = []
+    for chrom, length in chrom_lengths.items():
+        if chrom not in bed_regions:
+            # No BED regions on this chromosome, keep entire chromosome
+            inverted.append((chrom, 0, length))
+            continue
+        
+        regions = bed_regions[chrom]
+        current_pos = 0
+        
+        for start, end in regions:
+            # Add gap before this region
+            if current_pos < start:
+                inverted.append((chrom, current_pos, start))
+            current_pos = max(current_pos, end)
+        
+        # Add remaining region after last BED entry
+        if current_pos < length:
+            inverted.append((chrom, current_pos, length))
+    
+    return inverted
+
+
 def _extract_snps_for_chromosome(
     vcf_path: Path,
     chrom: str,
-    bed_path: Optional[Path],
+    bed_regions: Optional[List[Tuple[str, int, int]]],
 ) -> Tuple[str, List[SNP], int, int]:
     """
     Extract SNPs from a single chromosome using cyvcf2 (for multiprocessing).
@@ -35,7 +98,7 @@ def _extract_snps_for_chromosome(
     Args:
         vcf_path: Path to VCF file
         chrom: Chromosome name
-        bed_path: Optional BED file to filter regions
+        bed_regions: Optional list of (chrom, start, end) tuples to extract from
         
     Returns:
         Tuple of (chromosome, snp_list, multi_allelic_count, indel_count)
@@ -53,24 +116,13 @@ def _extract_snps_for_chromosome(
     try:
         vcf = VCF(str(vcf_path))
         
-        # Read BED regions if provided
-        regions = []
-        if bed_path:
-            with open(bed_path) as f:
-                for line in f:
-                    if line.startswith("#"):
-                        continue
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        regions.append((parts[0], int(parts[1]), int(parts[2])))
-        
         # Fetch variants
-        if regions:
-            # Filter by BED regions
+        if bed_regions:
+            # Filter by BED regions using indexed VCF access
             # Suppress cyvcf2 warnings for empty intervals
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="no intervals found")
-                for region_chrom, region_start, region_end in regions:
+                for region_chrom, region_start, region_end in bed_regions:
                     if region_chrom != chrom:
                         continue
                     for variant in vcf(f"{region_chrom}:{region_start}-{region_end}"):
@@ -162,6 +214,8 @@ def _extract_snps_for_chromosome(
 def extract_snps_from_vcf(
     vcf_path: Path,
     bed_path: Optional[Path] = None,
+    bed_mode: str = "keep",
+    fai_path: Optional[Path] = None,
     threads: int = 1,
 ) -> Result[list[SNP], str]:
     """
@@ -170,9 +224,14 @@ def extract_snps_from_vcf(
     Always extracts first alt allele (alt[0]) for multi-allelic sites.
     Skips indels (variants where REF or ALT length != 1).
     
+    For remove mode: generates inverted BED regions from .fai file,
+    then uses indexed VCF access (same speed as keep mode).
+    
     Args:
         vcf_path: Path to VCF file (.vcf.gz with .tbi index)
         bed_path: Optional BED file to filter regions
+        bed_mode: 'keep' to keep BED regions, 'remove' to exclude them
+        fai_path: Reference .fai file (required for remove mode)
         threads: Number of parallel processes (default: 1)
         
     Returns:
@@ -190,6 +249,31 @@ def extract_snps_from_vcf(
     except Exception as e:
         return Err(f"Failed to read VCF header: {e}")
     
+    # Process BED regions based on mode
+    bed_regions = None
+    if bed_path:
+        if bed_mode == "remove":
+            # Generate inverted BED for remove mode
+            if fai_path is None:
+                return Err("remove mode requires fai_path parameter")
+            if not fai_path.exists():
+                return Err(f"Reference index not found: {fai_path}")
+            
+            logger.info(f"Generating inverted BED regions from {bed_path}")
+            bed_regions = invert_bed_regions(bed_path, fai_path)
+            logger.info(f"Generated {len(bed_regions)} inverted regions")
+        else:
+            # Read BED regions for keep mode
+            bed_regions = []
+            with open(bed_path) as f:
+                for line in f:
+                    if line.startswith('#'):
+                        continue
+                    parts = line.strip().split()
+                    if len(parts) >= 3:
+                        bed_regions.append((parts[0], int(parts[1]), int(parts[2])))
+            logger.info(f"Loaded {len(bed_regions)} BED regions (keep mode)")
+    
     all_snps = []
     total_multi_allelic = 0
     total_indels = 0
@@ -198,7 +282,7 @@ def extract_snps_from_vcf(
         # Serial processing
         for chrom in chromosomes:
             chrom_name, snps, multi_allelic, indels = _extract_snps_for_chromosome(
-                vcf_path, chrom, bed_path
+                vcf_path, chrom, bed_regions
             )
             all_snps.extend(snps)
             total_multi_allelic += multi_allelic
@@ -210,7 +294,7 @@ def extract_snps_from_vcf(
             for chrom in chromosomes:
                 future = executor.submit(
                     _extract_snps_for_chromosome,
-                    vcf_path, chrom, bed_path
+                    vcf_path, chrom, bed_regions
                 )
                 futures[future] = chrom
             

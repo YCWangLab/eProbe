@@ -266,6 +266,7 @@ def run_extract(
     cluster_flank: int = 60,
     max_cluster_snp: int = 3,
     bed_path: Optional[Path] = None,
+    bed_mode: str = "keep",
     threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
@@ -289,7 +290,8 @@ def run_extract(
         cluster_mode: Enable cluster filtering
         cluster_flank: Flanking distance for cluster detection
         max_cluster_snp: Maximum SNPs allowed in cluster window
-        bed_path: Optional BED file to restrict regions
+        bed_path: Optional BED file to restrict/exclude regions
+        bed_mode: 'keep' to keep BED regions, 'remove' to exclude them
         threads: Number of parallel processes (recommended: num chromosomes)
         verbose: Enable verbose logging
         
@@ -309,7 +311,9 @@ def run_extract(
     
     # Step 1: Extract raw SNPs from VCF (with multiprocessing)
     logger.info("Extracting SNPs from VCF...")
-    vcf_result = extract_snps_from_vcf(vcf_path, bed_path, threads=threads)
+    vcf_result = extract_snps_from_vcf(
+        vcf_path, bed_path, bed_mode, fai_path=fai_path, threads=threads
+    )
     if vcf_result.is_err():
         return Err(f"VCF extraction failed: {vcf_result.unwrap_err()}")
     
