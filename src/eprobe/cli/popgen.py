@@ -150,6 +150,24 @@ def extract(
     
     verbose = ctx.obj.get("verbose", False)
     
+    # Report BED filtering step
+    if keep_bed and remove_bed:
+        echo_error("Cannot use both --keep_bed and --remove_bed simultaneously")
+        raise SystemExit(1)
+    
+    bed_filter_type = None
+    bed_path_used = None
+    if keep_bed:
+        echo_info(f"→ Step 1: Filtering VCF with --keep_bed: {keep_bed}")
+        bed_filter_type = "keep"
+        bed_path_used = keep_bed
+    elif remove_bed:
+        echo_info(f"→ Step 1: Filtering VCF with --remove_bed: {remove_bed}")
+        bed_filter_type = "remove"
+        bed_path_used = remove_bed
+    else:
+        echo_info(f"→ Step 1: Extracting SNPs from entire VCF")
+    
     echo_info(f"Extracting SNPs from {vcf}")
     
     result = run_extract(
@@ -160,7 +178,7 @@ def extract(
         cluster_flank=cluster_flank,
         max_cluster_snp=max_cluster_snp,
         cluster_mode=cluster_filter,
-        bed_path=keep_bed if keep_bed else remove_bed,
+        bed_path=bed_path_used,
         verbose=verbose,
     )
     
@@ -169,10 +187,18 @@ def extract(
         raise SystemExit(1)
     
     stats = result.unwrap()
-    echo_success(f"Extracted {stats['final_snp_count']} SNPs")
     
+    # Step 2: Report SNP extraction
+    echo_success(f"→ Step 2: Extracted {stats['raw_snp_count']} SNPs")
+    
+    # Step 3: Report cluster filtering
     if cluster_filter:
-        echo_info(f"  Filtered {stats.get('cluster_removed', 0)} SNPs in clusters")
+        filtered_count = stats.get('cluster_removed', 0)
+        final_count = stats['final_snp_count']
+        echo_success(f"→ Step 3: Filtered {filtered_count} SNPs in clusters")
+        echo_info(f"  └─ Final: {final_count} SNPs")
+    else:
+        echo_info(f"  └─ Cluster filtering disabled")
     
     echo_info(f"Output: {stats['output_file']}")
 

@@ -226,7 +226,9 @@ def extract_snps_from_vcf(
     
     # Summary statistics
     if total_multi_allelic > 0:
-        logger.warning(f"⚠ Found {total_multi_allelic} multi-allelic sites (extracted first alt allele)")
+        logger.info(f"⚠ Found {total_multi_allelic} multi-allelic sites (extracted first alt)")
+    if total_indels > 0:
+        logger.debug(f"Skipped {total_indels} indels")
     if total_indels > 0:
         logger.info(f"Skipped {total_indels} indels (only SNPs extracted)")
     
