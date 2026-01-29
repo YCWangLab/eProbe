@@ -345,6 +345,11 @@ def extract(
     default=50.0,
     help="Maximum dimer score (default: 50.0).",
 )
+@click.option(
+    "--no-biophysical",
+    is_flag=True,
+    help="Skip biophysical filtering (GC, Tm, complexity, hairpin, dimer).",
+)
 @click.pass_context
 def filter(
     ctx: click.Context,
@@ -368,6 +373,7 @@ def filter(
     complexity: float,
     hairpin: float,
     dimer: float,
+    no_biophysical: bool,
 ) -> None:
     """
     Apply multi-stage filtering to SNPs.
@@ -405,8 +411,9 @@ def filter(
         filters.append("ac")
     if tx_db:
         filters.append("tx")
-    # Always apply biophysical filter
-    filters.append("biophysical")
+    # Add biophysical filter unless explicitly disabled
+    if not no_biophysical:
+        filters.append("biophysical")
     
     echo_info(f"Filtering SNPs from {input}")
     echo_info(f"Active filters: {', '.join(filters)}")
