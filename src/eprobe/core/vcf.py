@@ -27,12 +27,15 @@ def _count_snps_for_chrom(vcf_path: Path, chrom: str) -> int:
     count = 0
     try:
         vcf = VCF(str(vcf_path))
-        for variant in vcf(chrom):
-            # Check if biallelic SNP
-            if len(variant.REF) == 1 and variant.ALT and len(variant.ALT) > 0:
-                first_alt = variant.ALT[0]
-                if len(first_alt) == 1 and first_alt in "ACGT":
-                    count += 1
+        # Suppress warnings for empty chromosomes
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="no intervals found")
+            for variant in vcf(chrom):
+                # Check if biallelic SNP
+                if len(variant.REF) == 1 and variant.ALT and len(variant.ALT) > 0:
+                    first_alt = variant.ALT[0]
+                    if len(first_alt) == 1 and first_alt in "ACGT":
+                        count += 1
         vcf.close()
     except Exception:
         pass
