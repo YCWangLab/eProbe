@@ -182,7 +182,7 @@ def filter_background_noise(
             
             # Write probe sequences
             sequences = {
-                snp.id: snp.left_flank + snp.ref + snp.right_flank
+                snp.id: probe_sequences[snp.id]
                 for snp in snps
             }
             
@@ -321,7 +321,7 @@ def filter_accessibility(
         
         # Write probe sequences
         sequences = {
-            snp.id: snp.left_flank + snp.ref + snp.right_flank
+            snp.id: probe_sequences[snp.id]
             for snp in snps
         }
         
@@ -356,17 +356,22 @@ def filter_accessibility(
 
 def calculate_probe_stats(
     snp: SNP,
+    probe_sequence: str = None,
 ) -> Dict[str, float]:
     """
     Calculate biophysical statistics for a SNP probe sequence.
     
     Args:
-        snp: SNP with flanking sequences
+        snp: SNP object
+        probe_sequence: Complete probe sequence (if None, uses snp.ref as fallback)
         
     Returns:
         Dictionary of calculated statistics
     """
-    probe_seq = snp.left_flank + snp.ref + snp.right_flank
+    if probe_sequence is None:
+        probe_seq = snp.ref  # Fallback for compatibility
+    else:
+        probe_seq = probe_sequence
     
     return {
         "gc": calculate_gc(probe_seq),
@@ -795,7 +800,7 @@ def filter_taxonomy(
             # Fallback: create temporary FASTA
             working_fasta = tmpdir_path / "probes.fa"
             sequences = {
-                snp.id: snp.left_flank + snp.ref + snp.right_flank
+                snp.id: probe_sequences[snp.id]
                 for snp in snps
             }
             
@@ -954,13 +959,14 @@ def run_filter(
     
     ref_dict = ref_result.unwrap()
     
-    # Add flanking sequences to each SNP
+    # Create probe sequences dictionary (SNP ID -> probe sequence)
     flank_size = (probe_length - 1) // 2
+    probe_sequences = {}
+    
     for snp in snps:
         if snp.chrom not in ref_dict:
-            # Set empty flanks for unknown chromosomes
-            snp.left_flank = ""
-            snp.right_flank = ""
+            # Set empty probe for unknown chromosomes
+            probe_sequences[snp.id] = snp.ref
             continue
         
         chrom_seq = ref_dict[snp.chrom]
@@ -971,8 +977,11 @@ def run_filter(
         left_end = snp.pos - 1  # Position before SNP (0-based)
         right_start = snp.pos  # Position after SNP (0-based)
         
-        snp.left_flank = chrom_seq[start_pos:left_end] if left_end > start_pos else ""
-        snp.right_flank = chrom_seq[right_start:end_pos] if end_pos > right_start else ""
+        left_flank = chrom_seq[start_pos:left_end] if left_end > start_pos else ""
+        right_flank = chrom_seq[right_start:end_pos] if end_pos > right_start else ""
+        
+        # Build complete probe sequence
+        probe_sequences[snp.id] = left_flank + snp.ref + right_flank
 
     stats = {
         "initial_count": initial_count,
@@ -981,13 +990,6 @@ def run_filter(
     
     # Normalize filter names
     filters_normalized = [f.lower() for f in filters]
-    
-    # Pre-compute probe sequences (optimization: compute once, use multiple times)
-    logger.info("Pre-computing probe sequences")
-    probe_sequences = {
-        snp.id: snp.left_flank + snp.ref + snp.right_flank
-        for snp in snps
-    }
     
     # Write shared FASTA file for external filters (BG/AC/TX)
     # Only create if any external filter is enabled
@@ -1007,13 +1009,13 @@ def run_filter(
         logger.info(f"Shared FASTA created: {fasta_path} ({len(probe_sequences)} sequences)")
     
     # Helper function to update shared FASTA after each filter
-    def update_shared_fasta(current_snps: List[SNP], path: Path) -> Result[None, str]:
+    def update_shared_fasta(current_snps: List[SNP], path: Path, sequences: Dict[str, str]) -> Result[None, str]:
         """Update shared FASTA file with current SNPs only."""
         if path is None:
             return Ok(None)
         
         updated_sequences = {
-            snp.id: snp.left_flank + snp.ref + snp.right_flank
+            snp.id: sequences[snp.id]
             for snp in current_snps
         }
         
@@ -1042,7 +1044,7 @@ def run_filter(
                 snps = result.unwrap()
             
             # Update shared FASTA with remaining SNPs for subsequent filters
-            update_result = update_shared_fasta(snps, fasta_path)
+            update_result = update_shared_fasta(snps, fasta_path, probe_sequences)
             if update_result.is_err():
                 return Err(update_result.unwrap_err())
             
@@ -1066,7 +1068,7 @@ def run_filter(
                 snps = result.unwrap()
             
             # Update shared FASTA with remaining SNPs for subsequent filters
-            update_result = update_shared_fasta(snps, fasta_path)
+            update_result = update_shared_fasta(snps, fasta_path, probe_sequences)
             if update_result.is_err():
                 return Err(update_result.unwrap_err())
             
