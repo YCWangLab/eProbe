@@ -247,12 +247,45 @@ def extract(
 @click.option(
     "--tx_db",
     type=str,
-    help="Bowtie2 database for taxonomic filtering.",
+    help="Bowtie2 database(s) for taxonomic filtering (comma-separated).",
 )
 @click.option(
     "--tx_taxid",
+    type=str,
+    help="Target taxon ID(s) for taxonomic filtering (comma-separated, e.g., '4530,4531').",
+)
+@click.option(
+    "--tx_names",
+    type=click.Path(exists=True, path_type=Path),
+    help="NCBI taxonomy names.dmp file (required for taxonomic filter).",
+)
+@click.option(
+    "--tx_nodes",
+    type=click.Path(exists=True, path_type=Path),
+    help="NCBI taxonomy nodes.dmp file (required for taxonomic filter).",
+)
+@click.option(
+    "--tx_acc2tax",
+    type=click.Path(exists=True, path_type=Path),
+    help="Accession to taxid mapping file (required for taxonomic filter).",
+)
+@click.option(
+    "--tx_minedit",
     type=int,
-    help="Target taxon ID for taxonomic filtering.",
+    default=0,
+    help="Minimum edit distance for ngsLCA (default: 0).",
+)
+@click.option(
+    "--tx_maxedit",
+    type=int,
+    default=2,
+    help="Maximum edit distance for ngsLCA (default: 2).",
+)
+@click.option(
+    "--tx_keep_hits",
+    type=int,
+    default=100,
+    help="Number of alignments to report per sequence (default: 100).",
 )
 @click.option(
     "--gc",
@@ -295,7 +328,13 @@ def filter(
     bg_db: Optional[str],
     ac_db: Optional[str],
     tx_db: Optional[str],
-    tx_taxid: Optional[int],
+    tx_taxid: Optional[str],
+    tx_names: Optional[Path],
+    tx_nodes: Optional[Path],
+    tx_acc2tax: Optional[Path],
+    tx_minedit: int,
+    tx_maxedit: int,
+    tx_keep_hits: int,
     gc: str,
     tm: str,
     complexity: float,
@@ -325,18 +364,41 @@ def filter(
     gc_min, gc_max = map(float, gc.split(","))
     tm_min, tm_max = map(float, tm.split(","))
     
+    # Parse taxonomy IDs
+    tx_ids = None
+    if tx_taxid:
+        tx_ids = [int(t.strip()) for t in tx_taxid.split(",")]
+    
+    # Determine which filters to apply
+    filters = []
+    if bg_db:
+        filters.append("bg")
+    if ac_db:
+        filters.append("ac")
+    if tx_db:
+        filters.append("tx")
+    # Always apply biophysical filter
+    filters.append("biophysical")
+    
     echo_info(f"Filtering SNPs from {input}")
+    echo_info(f"Active filters: {', '.join(filters)}")
     
     result = run_filter(
         input_path=input,
         reference_path=reference,
         output_prefix=output,
+        filters=filters,
         threads=threads,
-        probe_length=length,
-        bg_databases=bg_db.split(",") if bg_db else None,
-        ac_databases=ac_db.split(",") if ac_db else None,
-        tx_database=tx_db,
-        tx_taxid=tx_taxid,
+        bg_db=bg_db,
+        ac_db=ac_db,
+        tx_db=tx_db,
+        tx_ids=tx_ids,
+        names_dmp=str(tx_names) if tx_names else None,
+        nodes_dmp=str(tx_nodes) if tx_nodes else None,
+        acc2tax=str(tx_acc2tax) if tx_acc2tax else None,
+        tx_min_edit=tx_minedit,
+        tx_max_edit=tx_maxedit,
+        tx_keep_hits=tx_keep_hits,
         gc_range=(gc_min, gc_max),
         tm_range=(tm_min, tm_max),
         max_complexity=complexity,
@@ -350,7 +412,42 @@ def filter(
         raise SystemExit(1)
     
     stats = result.unwrap()
-    echo_success(f"Retained {stats['passed']} of {stats['total']} SNPs ({stats['pass_rate']:.1f}%)")
+    initial = stats['initial_count']
+    final = stats['final_count']
+    removed = stats['total_removed']
+    pass_rate = (final / initial * 100) if initial > 0 else 0
+    
+    # Report with 3-step structure
+    echo_success(f"\n→ Filtering Summary:")
+    echo_info(f"  Input: {initial} SNPs")
+    
+    # Step 1: External filters
+    external_filters = [f for f in ['BG', 'AC', 'TX'] if f in stats['filters_applied']]
+    if external_filters:
+        echo_success(f"\n  Step 1: External Filtering ({', '.join(external_filters)})")
+        if 'bg_remaining' in stats:
+            echo_info(f"    ├─ Background filter: {stats['bg_remaining']} SNPs remaining")
+        if 'ac_remaining' in stats:
+            echo_info(f"    ├─ Accessibility filter: {stats['ac_remaining']} SNPs remaining")
+        if 'tx_remaining' in stats:
+            echo_info(f"    └─ Taxonomic filter: {stats['tx_remaining']} SNPs remaining")
+    
+    # Step 2: Biophysical filter
+    if 'biophysical' in stats['filters_applied'] and 'biophysical_details' in stats:
+        bio_details = stats['biophysical_details']
+        echo_success(f"\n  Step 2: Biophysical Filtering")
+        echo_info(f"    ├─ GC content failed: {bio_details.get('gc_failed', 0)}")
+        echo_info(f"    ├─ Tm failed: {bio_details.get('tm_failed', 0)}")
+        echo_info(f"    ├─ Complexity failed: {bio_details.get('complexity_failed', 0)}")
+        if bio_details.get('hairpin_failed', 0) > 0:
+            echo_info(f"    ├─ Hairpin failed: {bio_details['hairpin_failed']}")
+        echo_info(f"    └─ Passed: {stats.get('biophysical_remaining', final)} SNPs")
+    
+    # Step 3: Output
+    echo_success(f"\n  Step 3: Output Saved")
+    echo_info(f"    ├─ Final SNPs: {final} ({pass_rate:.1f}% of input)")
+    echo_info(f"    ├─ Total removed: {removed}")
+    echo_info(f"    └─ File: {stats['output_file']}")
 
 
 @popgen.command()

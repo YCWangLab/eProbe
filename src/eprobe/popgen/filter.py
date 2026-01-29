@@ -136,6 +136,7 @@ def parse_kraken_output(output_path: Path) -> Result[Set[str], str]:
 def filter_background_noise(
     snps: List[SNP],
     db_path: Path,
+    fasta_path: Optional[Path] = None,
     threads: int = 1,
 ) -> Result[List[SNP], str]:
     """
@@ -147,6 +148,7 @@ def filter_background_noise(
     Args:
         snps: Input SNP list
         db_path: Kraken2 database path
+        fasta_path: Optional pre-computed FASTA file (optimization)
         threads: Number of threads
         
     Returns:
@@ -157,32 +159,48 @@ def filter_background_noise(
     
     logger.info(f"Running background noise filter (Kraken2) on {len(snps)} SNPs")
     
-    # Create temporary FASTA for Kraken2
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fasta_path = Path(tmpdir) / "probes.fa"
-        output_path = Path(tmpdir) / "kraken.out"
+    # Use shared FASTA or create temporary one
+    if fasta_path is not None:
+        # Use shared FASTA (optimization)
+        output_path = fasta_path.parent / "kraken.out"
         
-        # Write probe sequences
-        sequences = {
-            snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
-            for snp in snps
-        }
-        
-        write_result = write_fasta(sequences, fasta_path)
-        if write_result.is_err():
-            return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
-        
-        # Run Kraken2
         kraken_result = run_kraken2(fasta_path, db_path, output_path, threads)
         if kraken_result.is_err():
             return Err(kraken_result.unwrap_err())
         
-        # Parse results
         classified_result = parse_kraken_output(output_path)
         if classified_result.is_err():
             return Err(classified_result.unwrap_err())
         
         classified_ids = classified_result.unwrap()
+        output_path.unlink()  # Clean up
+    else:
+        # Fallback: create temporary FASTA
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_fasta_path = Path(tmpdir) / "probes.fa"
+            output_path = Path(tmpdir) / "kraken.out"
+            
+            # Write probe sequences
+            sequences = {
+                snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+                for snp in snps
+            }
+            
+            write_result = write_fasta(sequences, temp_fasta_path)
+            if write_result.is_err():
+                return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
+            
+            # Run Kraken2
+            kraken_result = run_kraken2(temp_fasta_path, db_path, output_path, threads)
+            if kraken_result.is_err():
+                return Err(kraken_result.unwrap_err())
+            
+            # Parse results
+            classified_result = parse_kraken_output(output_path)
+            if classified_result.is_err():
+                return Err(classified_result.unwrap_err())
+            
+            classified_ids = classified_result.unwrap()
     
     # Filter out classified SNPs
     filtered_snps = [snp for snp in snps if snp.snp_id not in classified_ids]
@@ -358,19 +376,37 @@ def calculate_probe_stats(
     }
 
 
+def _calculate_batch_stats(snps: List[SNP]) -> List[Dict[str, float]]:
+    """
+    Calculate biophysical stats for a batch of SNPs (for parallel processing).
+    
+    This function is designed to be called by ProcessPoolExecutor.
+    
+    Args:
+        snps: List of SNPs to process
+        
+    Returns:
+        List of statistics dictionaries
+    """
+    return [calculate_probe_stats(snp) for snp in snps]
+
+
 def filter_biophysical(
     snps: List[SNP],
     thresholds: BiophysicalThresholds,
+    threads: int = 1,
 ) -> Result[Tuple[List[SNP], Dict[str, Any]], str]:
     """
-    Filter SNPs based on biophysical properties.
+    Filter SNPs based on biophysical properties (parallelized).
     
     Calculates GC content, melting temperature, sequence complexity,
     and optionally hairpin/dimer scores. Filters based on thresholds.
+    Uses multiprocessing for faster computation on large datasets.
     
     Args:
         snps: Input SNP list
         thresholds: Biophysical threshold configuration
+        threads: Number of parallel workers (default: 1)
         
     Returns:
         Result containing (filtered SNPs, statistics dict)
@@ -378,12 +414,11 @@ def filter_biophysical(
     if not snps:
         return Ok(([], {}))
     
-    logger.info(f"Running biophysical filter on {len(snps)} SNPs")
+    logger.info(f"Running biophysical filter on {len(snps)} SNPs (threads={threads})")
     logger.info(f"Thresholds: GC={thresholds.gc_min}-{thresholds.gc_max}%, "
                 f"Tm={thresholds.tm_min}-{thresholds.tm_max}°C, "
                 f"Complexity≤{thresholds.complexity_max}")
     
-    passed_snps = []
     filter_stats = {
         "gc_failed": 0,
         "tm_failed": 0,
@@ -392,9 +427,37 @@ def filter_biophysical(
         "dimer_failed": 0,
     }
     
-    for snp in snps:
-        stats = calculate_probe_stats(snp)
+    # Parallel computation of biophysical properties
+    if threads > 1:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
         
+        # Split into batches to reduce process creation overhead
+        batch_size = max(100, len(snps) // (threads * 4))
+        batches = [snps[i:i + batch_size] for i in range(0, len(snps), batch_size)]
+        
+        logger.info(f"Processing {len(batches)} batches with {threads} workers")
+        
+        all_stats = []
+        with ProcessPoolExecutor(max_workers=threads) as executor:
+            futures = {
+                executor.submit(_calculate_batch_stats, batch): batch
+                for batch in batches
+            }
+            
+            for future in as_completed(futures):
+                try:
+                    batch_stats = future.result()
+                    all_stats.extend(batch_stats)
+                except Exception as e:
+                    logger.error(f"Batch processing failed: {e}")
+                    return Err(f"Biophysical calculation failed: {e}")
+    else:
+        # Serial computation
+        all_stats = [calculate_probe_stats(snp) for snp in snps]
+    
+    # Filter based on thresholds
+    passed_snps = []
+    for snp, stats in zip(snps, all_stats):
         # GC check
         if not (thresholds.gc_min <= stats["gc"] <= thresholds.gc_max):
             filter_stats["gc_failed"] += 1
@@ -430,6 +493,379 @@ def filter_biophysical(
 
 
 # =============================================================================
+# Taxonomic Filter (ngsLCA)
+# =============================================================================
+
+def run_taxonomic_mapping(
+    fasta_path: Path,
+    index_path: Path,
+    output_prefix: Path,
+    keep_hits: int = 100,
+    threads: int = 1,
+) -> Result[Path, str]:
+    """
+    Run Bowtie2 alignment for taxonomic assignment.
+    
+    Args:
+        fasta_path: Input FASTA file
+        index_path: Bowtie2 index prefix
+        output_prefix: Output file prefix
+        keep_hits: Number of hits to report (for ngsLCA, default: 100)
+        threads: Number of threads
+        
+    Returns:
+        Result containing path to output SAM file
+    """
+    db_name = Path(index_path).stem
+    sam_path = Path(str(output_prefix) + f".{db_name}.sam")
+    
+    cmd = [
+        "bowtie2",
+        "-f",
+        "-k", str(keep_hits),
+        "--threads", str(threads),
+        "-x", str(index_path),
+        "-U", str(fasta_path),
+        "--no-unal",
+        "-S", str(sam_path),
+    ]
+    
+    logger.debug(f"Running Bowtie2 for taxonomy: {' '.join(cmd)}")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return Ok(sam_path)
+    except subprocess.CalledProcessError as e:
+        return Err(f"Bowtie2 mapping failed: {e.stderr}")
+    except FileNotFoundError:
+        return Err("Bowtie2 not found. Please install Bowtie2 and ensure it's in PATH.")
+
+
+def process_sam_to_bam(
+    sam_path: Path,
+    threads: int = 1,
+) -> Result[Path, str]:
+    """
+    Convert SAM to sorted BAM file.
+    
+    Args:
+        sam_path: Input SAM file
+        threads: Number of threads
+        
+    Returns:
+        Result containing path to output BAM file
+    """
+    bam_path = sam_path.with_suffix(".bam")
+    
+    # Check if SAM has alignments
+    check_cmd = f"samtools view {sam_path} | head -n 1"
+    result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True)
+    
+    if not result.stdout.strip():
+        logger.warning(f"No alignments found in {sam_path}")
+        return Err("No alignments found")
+    
+    # Convert to BAM
+    cmd = [
+        "samtools", "view",
+        "-@", str(threads),
+        "-b",
+        "-o", str(bam_path),
+        str(sam_path),
+    ]
+    
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        sam_path.unlink()  # Remove SAM file
+        return Ok(bam_path)
+    except subprocess.CalledProcessError as e:
+        return Err(f"SAM to BAM conversion failed: {e.stderr}")
+    except FileNotFoundError:
+        return Err("samtools not found. Please install samtools and ensure it's in PATH.")
+
+
+def merge_and_sort_bams(
+    bam_files: List[Path],
+    output_path: Path,
+    threads: int = 1,
+) -> Result[Path, str]:
+    """
+    Merge multiple BAM files and sort by name (required for ngsLCA).
+    
+    Args:
+        bam_files: List of BAM files to merge
+        output_path: Output sorted BAM path
+        threads: Number of threads
+        
+    Returns:
+        Result containing path to sorted BAM file
+    """
+    if len(bam_files) == 0:
+        return Err("No BAM files to merge")
+    
+    if len(bam_files) == 1:
+        # Single file, just sort
+        sorted_bam = output_path
+        sort_cmd = [
+            "samtools", "sort",
+            "-n",  # Sort by read name (required for ngsLCA)
+            "-@", str(threads),
+            "-O", "bam",
+            "-o", str(sorted_bam),
+            str(bam_files[0]),
+        ]
+    else:
+        # Multiple files, merge then sort
+        merged_bam = output_path.with_suffix(".merged.bam")
+        merge_cmd = [
+            "samtools", "merge",
+            "-n",  # Assume input sorted by name
+            "-@", str(threads),
+            "-o", str(merged_bam),
+        ] + [str(f) for f in bam_files]
+        
+        try:
+            subprocess.run(merge_cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            return Err(f"BAM merge failed: {e.stderr}")
+        
+        sorted_bam = output_path
+        sort_cmd = [
+            "samtools", "sort",
+            "-n",
+            "-@", str(threads),
+            "-O", "bam",
+            "-o", str(sorted_bam),
+            str(merged_bam),
+        ]
+        merged_bam.unlink()  # Clean up merged file
+    
+    try:
+        subprocess.run(sort_cmd, capture_output=True, text=True, check=True)
+        return Ok(sorted_bam)
+    except subprocess.CalledProcessError as e:
+        return Err(f"BAM sort failed: {e.stderr}")
+
+
+def run_ngslca(
+    bam_path: Path,
+    names_dmp: Path,
+    nodes_dmp: Path,
+    acc2tax: Path,
+    min_edit: int = 0,
+    max_edit: int = 2,
+    output_prefix: Path = None,
+) -> Result[Path, str]:
+    """
+    Run ngsLCA taxonomic classification.
+    
+    Args:
+        bam_path: Input sorted BAM file
+        names_dmp: NCBI taxonomy names.dmp file
+        nodes_dmp: NCBI taxonomy nodes.dmp file
+        acc2tax: Accession to taxid mapping file
+        min_edit: Minimum edit distance (default: 0)
+        max_edit: Maximum edit distance (default: 2)
+        output_prefix: Output prefix (default: bam_path.stem)
+        
+    Returns:
+        Result containing path to .lca output file
+    """
+    if output_prefix is None:
+        output_prefix = bam_path.parent / bam_path.stem
+    
+    lca_output = Path(str(output_prefix) + f".min{min_edit}max{max_edit}.lca")
+    
+    cmd = [
+        "ngsLCA",
+        "-names", str(names_dmp),
+        "-nodes", str(nodes_dmp),
+        "-acc2tax", str(acc2tax),
+        "-editdistmin", str(min_edit),
+        "-editdistmax", str(max_edit),
+        "-bam", str(bam_path),
+        "-outnames", str(output_prefix) + f".min{min_edit}max{max_edit}",
+    ]
+    
+    logger.debug(f"Running ngsLCA: {' '.join(cmd)}")
+    
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return Ok(lca_output)
+    except subprocess.CalledProcessError as e:
+        return Err(f"ngsLCA failed: {e.stderr}")
+    except FileNotFoundError:
+        return Err("ngsLCA not found. Please install ngsLCA and ensure it's in PATH.")
+
+
+def parse_lca_results(
+    lca_path: Path,
+    target_taxids: List[int],
+) -> Result[Set[str], str]:
+    """
+    Parse ngsLCA output to extract sequences assigned to target taxa.
+    
+    Args:
+        lca_path: Path to .lca file
+        target_taxids: List of target taxonomy IDs
+        
+    Returns:
+        Result containing set of sequence IDs assigned to target taxa
+    """
+    import re
+    
+    assigned_ids: Set[str] = set()
+    
+    try:
+        with open(lca_path) as f:
+            for line in f:
+                # Check if line contains any target taxid
+                for taxid in target_taxids:
+                    if re.search(rf'\s+{taxid}:', line):
+                        # Extract sequence ID (before last 3 colons)
+                        parts = line.split('\t')[0].split(':')
+                        seq_id = ':'.join(parts[:-3])
+                        assigned_ids.add(seq_id.strip())
+                        break
+        
+        return Ok(assigned_ids)
+    except Exception as e:
+        return Err(f"Failed to parse LCA results: {e}")
+
+
+def filter_taxonomy(
+    snps: List[SNP],
+    index_paths: List[Path],
+    names_dmp: Path,
+    nodes_dmp: Path,
+    acc2tax: Path,
+    target_taxids: List[int],
+    fasta_path: Optional[Path] = None,
+    min_edit: int = 0,
+    max_edit: int = 2,
+    keep_hits: int = 100,
+    threads: int = 1,
+) -> Result[List[SNP], str]:
+    """
+    Filter SNPs based on taxonomic assignment using ngsLCA.
+    
+    Workflow:
+    1. Map probe sequences to reference database(s) with Bowtie2
+    2. Convert SAM to BAM and merge if multiple databases
+    3. Run ngsLCA for taxonomic classification
+    4. Extract SNPs assigned to target taxa
+    
+    Args:
+        snps: Input SNP list
+        index_paths: List of Bowtie2 index paths
+        names_dmp: NCBI taxonomy names.dmp file
+        nodes_dmp: NCBI taxonomy nodes.dmp file
+        acc2tax: Accession to taxid mapping file
+        target_taxids: List of target taxonomy IDs to keep
+        fasta_path: Optional pre-computed FASTA file (optimization)
+        min_edit: Minimum edit distance for ngsLCA (default: 0)
+        max_edit: Maximum edit distance for ngsLCA (default: 2)
+        keep_hits: Number of alignments to report per sequence (default: 100)
+        threads: Number of threads
+        
+    Returns:
+        Result containing filtered SNP list
+    """
+    if not snps:
+        return Ok([])
+    
+    logger.info(f"Running taxonomic filter (ngsLCA) on {len(snps)} SNPs")
+    logger.info(f"Target taxonomy IDs: {target_taxids}")
+    logger.info(f"Using {len(index_paths)} database(s)")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        
+        # Use shared FASTA or create temporary one
+        if fasta_path is not None:
+            # Use shared FASTA (optimization)
+            working_fasta = fasta_path
+            logger.debug(f"Using shared FASTA: {fasta_path}")
+        else:
+            # Fallback: create temporary FASTA
+            working_fasta = tmpdir_path / "probes.fa"
+            sequences = {
+                snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+                for snp in snps
+            }
+            
+            write_result = write_fasta(sequences, working_fasta)
+            if write_result.is_err():
+                return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
+        
+        # Map to all databases
+        bam_files = []
+        for idx, index_path in enumerate(index_paths, 1):
+            logger.info(f"Mapping to database {idx}/{len(index_paths)}: {index_path.name}")
+            output_prefix = tmpdir_path / f"mapping_{idx}"
+            
+            sam_result = run_taxonomic_mapping(
+                working_fasta, index_path, output_prefix, keep_hits, threads
+            )
+            if sam_result.is_err():
+                logger.warning(f"Mapping to {index_path} failed: {sam_result.unwrap_err()}")
+                continue
+            
+            # Convert to BAM
+            bam_result = process_sam_to_bam(sam_result.unwrap(), threads)
+            if bam_result.is_err():
+                logger.warning(f"SAM to BAM conversion failed: {bam_result.unwrap_err()}")
+                continue
+            
+            bam_files.append(bam_result.unwrap())
+        
+        if not bam_files:
+            return Err("No successful alignments from any database")
+        
+        # Merge and sort BAMs
+        logger.info(f"Merging and sorting {len(bam_files)} BAM file(s)")
+        sorted_bam_path = tmpdir_path / "merged.sorted.bam"
+        merge_result = merge_and_sort_bams(bam_files, sorted_bam_path, threads)
+        if merge_result.is_err():
+            return Err(merge_result.unwrap_err())
+        
+        sorted_bam = merge_result.unwrap()
+        
+        # Run ngsLCA
+        logger.info(f"Running ngsLCA (min_edit={min_edit}, max_edit={max_edit})")
+        lca_result = run_ngslca(
+            sorted_bam, names_dmp, nodes_dmp, acc2tax,
+            min_edit, max_edit, tmpdir_path / "taxonomy"
+        )
+        if lca_result.is_err():
+            return Err(lca_result.unwrap_err())
+        
+        lca_path = lca_result.unwrap()
+        
+        # Parse LCA results
+        logger.info("Parsing taxonomic assignments")
+        parse_result = parse_lca_results(lca_path, target_taxids)
+        if parse_result.is_err():
+            return Err(parse_result.unwrap_err())
+        
+        assigned_ids = parse_result.unwrap()
+    
+    # Filter SNPs based on assignments
+    filtered_snps = [snp for snp in snps if snp.snp_id in assigned_ids]
+    removed = len(snps) - len(filtered_snps)
+    
+    logger.info(f"Taxonomy filter: {len(assigned_ids)} sequences assigned to target taxa")
+    logger.info(f"Taxonomy filter: removed {removed} SNPs, {len(filtered_snps)} remaining")
+    
+    return Ok(filtered_snps)
+
+
+# =============================================================================
 # Main Filter Pipeline
 # =============================================================================
 
@@ -438,10 +874,16 @@ def run_filter(
     reference_path: Path,
     output_prefix: Path,
     filters: List[str],
-    bg_db: Optional[Path] = None,
-    ac_db: Optional[Path] = None,
-    tx_db: Optional[Path] = None,
+    bg_db: Optional[str] = None,
+    ac_db: Optional[str] = None,
+    tx_db: Optional[str] = None,
     tx_ids: Optional[List[int]] = None,
+    names_dmp: Optional[str] = None,
+    nodes_dmp: Optional[str] = None,
+    acc2tax: Optional[str] = None,
+    tx_min_edit: int = 0,
+    tx_max_edit: int = 2,
+    tx_keep_hits: int = 100,
     gc_range: Tuple[float, float] = (35.0, 65.0),
     tm_range: Tuple[float, float] = (55.0, 75.0),
     max_complexity: float = 2.0,
@@ -464,10 +906,16 @@ def run_filter(
         reference_path: Reference genome FASTA
         output_prefix: Output file prefix
         filters: List of filter names to apply
-        bg_db: Kraken2 database for background filter
-        ac_db: Bowtie2 index for accessibility filter
-        tx_db: Taxonomy database path
-        tx_ids: Taxonomy IDs to filter against
+        bg_db: Kraken2 database(s) for background filter (comma-separated)
+        ac_db: Bowtie2 index/indices for accessibility filter (comma-separated)
+        tx_db: Bowtie2 index/indices for taxonomic filter (comma-separated)
+        tx_ids: Taxonomy IDs to keep (target taxa)
+        names_dmp: NCBI taxonomy names.dmp file path
+        nodes_dmp: NCBI taxonomy nodes.dmp file path
+        acc2tax: Accession to taxid mapping file path
+        tx_min_edit: Minimum edit distance for ngsLCA (default: 0)
+        tx_max_edit: Maximum edit distance for ngsLCA (default: 2)
+        tx_keep_hits: Number of alignments to report (default: 100)
         gc_range: (min, max) GC content range
         tm_range: (min, max) melting temperature range
         max_complexity: Maximum DUST complexity score
@@ -502,35 +950,132 @@ def run_filter(
     # Normalize filter names
     filters_normalized = [f.lower() for f in filters]
     
-    # Apply Background filter
-    if "bg" in filters_normalized:
-        if bg_db is None:
-            return Err("BG filter requires --bg_db")
-        
-        result = filter_background_noise(snps, bg_db, threads)
-        if result.is_err():
-            return Err(result.unwrap_err())
-        
-        snps = result.unwrap()
-        stats["filters_applied"].append("BG")
-        stats["bg_remaining"] = len(snps)
+    # Pre-compute probe sequences (optimization: compute once, use multiple times)
+    logger.info("Pre-computing probe sequences")
+    probe_sequences = {
+        snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+        for snp in snps
+    }
     
-    # Apply Accessibility filter
-    if "ac" in filters_normalized:
-        if ac_db is None:
-            return Err("AC filter requires --ac_db")
-        
-        result = filter_accessibility(snps, ac_db, threads)
-        if result.is_err():
-            return Err(result.unwrap_err())
-        
-        snps = result.unwrap()
-        stats["filters_applied"].append("AC")
-        stats["ac_remaining"] = len(snps)
+    # Write shared FASTA file for external filters (BG/AC/TX)
+    # Only create if any external filter is enabled
+    needs_fasta = any(f in filters_normalized for f in ["bg", "ac", "tx"])
+    fasta_path = None
     
-    # Apply Taxonomy filter (simplified - would need implementation)
+    if needs_fasta:
+        logger.info("Writing probe sequences to temporary FASTA (shared by external filters)")
+        import tempfile
+        temp_fasta = tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False)
+        fasta_path = Path(temp_fasta.name)
+        
+        write_result = write_fasta(probe_sequences, fasta_path)
+        if write_result.is_err():
+            return Err(f"Failed to write shared FASTA: {write_result.unwrap_err()}")
+        
+        logger.info(f"Shared FASTA created: {fasta_path} ({len(probe_sequences)} sequences)")
+    
+    # Helper function to update shared FASTA after each filter
+    def update_shared_fasta(current_snps: List[SNP], path: Path) -> Result[None, str]:
+        """Update shared FASTA file with current SNPs only."""
+        if path is None:
+            return Ok(None)
+        
+        updated_sequences = {
+            snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+            for snp in current_snps
+        }
+        
+        write_result = write_fasta(updated_sequences, path)
+        if write_result.is_err():
+            return Err(f"Failed to update shared FASTA: {write_result.unwrap_err()}")
+        
+        logger.debug(f"Updated shared FASTA: {len(updated_sequences)} sequences")
+        return Ok(None)
+    
+    try:
+        # Apply Background filter (support multiple databases)
+        if "bg" in filters_normalized:
+            if bg_db is None:
+                return Err("BG filter requires --bg_db")
+            
+            # Parse comma-separated databases
+            bg_databases = [Path(db.strip()) for db in bg_db.split(",")]
+            logger.info(f"Running background filter with {len(bg_databases)} database(s)")
+            
+            for idx, db_path in enumerate(bg_databases, 1):
+                logger.info(f"Background filter {idx}/{len(bg_databases)}: {db_path.name}")
+                result = filter_background_noise(snps, db_path, fasta_path, threads)
+                if result.is_err():
+                    return Err(result.unwrap_err())
+                snps = result.unwrap()
+            
+            # Update shared FASTA with remaining SNPs for subsequent filters
+            update_result = update_shared_fasta(snps, fasta_path)
+            if update_result.is_err():
+                return Err(update_result.unwrap_err())
+            
+            stats["filters_applied"].append("BG")
+            stats["bg_remaining"] = len(snps)
+        
+        # Apply Accessibility filter (support multiple databases)
+        if "ac" in filters_normalized:
+            if ac_db is None:
+                return Err("AC filter requires --ac_db")
+            
+            # Parse comma-separated databases
+            ac_databases = [Path(db.strip()) for db in ac_db.split(",")]
+            logger.info(f"Running accessibility filter with {len(ac_databases)} database(s)")
+            
+            for idx, db_path in enumerate(ac_databases, 1):
+                logger.info(f"Accessibility filter {idx}/{len(ac_databases)}: {db_path.name}")
+                result = filter_accessibility(snps, db_path, threads)
+                if result.is_err():
+                    return Err(result.unwrap_err())
+                snps = result.unwrap()
+            
+            # Update shared FASTA with remaining SNPs for subsequent filters
+            update_result = update_shared_fasta(snps, fasta_path)
+            if update_result.is_err():
+                return Err(update_result.unwrap_err())
+            
+            stats["filters_applied"].append("AC")
+            stats["ac_remaining"] = len(snps)
+    
+    # Apply Taxonomy filter
     if "tx" in filters_normalized:
-        logger.warning("Taxonomy filter not yet implemented")
+        if tx_db is None:
+            return Err("TX filter requires --tx_db")
+        if tx_ids is None or len(tx_ids) == 0:
+            return Err("TX filter requires --tx_ids (target taxonomy IDs)")
+        
+        # Parse database paths
+        index_paths = [Path(db.strip()) for db in tx_db.split(",")]
+        
+        # Check for required NCBI taxonomy files
+        if names_dmp is None:
+            return Err("TX filter requires --tx_names (NCBI names.dmp)")
+        if nodes_dmp is None:
+            return Err("TX filter requires --tx_nodes (NCBI nodes.dmp)")
+        if acc2tax is None:
+            return Err("TX filter requires --tx_acc2tax (accession to taxid mapping)")
+        
+        result = filter_taxonomy(
+            snps=snps,
+            index_paths=index_paths,
+            names_dmp=Path(names_dmp),
+            nodes_dmp=Path(nodes_dmp),
+            acc2tax=Path(acc2tax),
+            target_taxids=tx_ids,
+            fasta_path=fasta_path,
+            min_edit=tx_min_edit if tx_min_edit is not None else 0,
+            max_edit=tx_max_edit if tx_max_edit is not None else 2,
+            keep_hits=tx_keep_hits if tx_keep_hits is not None else 100,
+            threads=threads,
+        )
+        if result.is_err():
+            return Err(result.unwrap_err())
+        
+        snps = result.unwrap()
         stats["filters_applied"].append("TX")
         stats["tx_remaining"] = len(snps)
     
@@ -546,7 +1091,7 @@ def run_filter(
             dimer_max=max_dimer,
         )
         
-        result = filter_biophysical(snps, thresholds)
+        result = filter_biophysical(snps, thresholds, threads)
         if result.is_err():
             return Err(result.unwrap_err())
         
@@ -554,24 +1099,30 @@ def run_filter(
         stats["filters_applied"].append("biophysical")
         stats["biophysical_remaining"] = len(snps)
         stats["biophysical_details"] = biophys_stats
+        
+        # Save output
+        output_path = Path(str(output_prefix) + ".filtered.tsv")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        filtered_df = SNPDataFrame.from_snps(snps)
+        save_result = filtered_df.to_tsv(output_path)
+        if save_result.is_err():
+            return Err(f"Failed to save output: {save_result.unwrap_err()}")
+        
+        final_count = len(snps)
+        removed = initial_count - final_count
+        
+        stats["final_count"] = final_count
+        stats["total_removed"] = removed
+        stats["output_file"] = str(output_path)
+        
+        logger.info(f"Filtering complete: {final_count} SNPs remaining (removed {removed})")
+        logger.info(f"Output saved to {output_path}")
+        
+        return Ok(stats)
     
-    # Save output
-    output_path = Path(str(output_prefix) + ".filtered.tsv")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    filtered_df = SNPDataFrame.from_snps(snps)
-    save_result = filtered_df.to_tsv(output_path)
-    if save_result.is_err():
-        return Err(f"Failed to save output: {save_result.unwrap_err()}")
-    
-    final_count = len(snps)
-    removed = initial_count - final_count
-    
-    stats["final_count"] = final_count
-    stats["total_removed"] = removed
-    stats["output_file"] = str(output_path)
-    
-    logger.info(f"Filtering complete: {final_count} SNPs remaining (removed {removed})")
-    logger.info(f"Output saved to {output_path}")
-    
-    return Ok(stats)
+    finally:
+        # Clean up shared FASTA file
+        if fasta_path is not None and fasta_path.exists():
+            fasta_path.unlink()
+            logger.debug(f"Cleaned up temporary FASTA: {fasta_path}")
