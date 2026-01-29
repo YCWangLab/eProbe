@@ -79,6 +79,88 @@ def detect_clusters_numpy(
     return keep_mask
 
 
+def filter_by_bed_regions_numpy(
+    positions: np.ndarray,
+    bed_starts: np.ndarray,
+    bed_ends: np.ndarray,
+    mode: str = "keep"
+) -> np.ndarray:
+    """
+    Vectorized BED region filtering using NumPy.
+    
+    Algorithm: Use searchsorted to find which BED interval each SNP might overlap,
+    then check if the SNP position is actually within that interval.
+    
+    Args:
+        positions: 1D numpy array of SNP positions (must be sorted for best performance)
+        bed_starts: Sorted 1D numpy array of BED region start positions (0-based)
+        bed_ends: Sorted 1D numpy array of BED region end positions (0-based, exclusive)
+        mode: "keep" = keep SNPs inside BED regions, "remove" = keep SNPs outside BED regions
+        
+    Returns:
+        Boolean mask (True = keep this SNP)
+    """
+    if len(positions) == 0:
+        return np.array([], dtype=bool)
+    
+    if len(bed_starts) == 0:
+        # No BED regions: if mode=keep, keep nothing; if mode=remove, keep all
+        if mode == "keep":
+            return np.zeros(len(positions), dtype=bool)
+        else:
+            return np.ones(len(positions), dtype=bool)
+    
+    # For each SNP position, find the index of the first BED region whose end > position
+    # This is the candidate region that might contain the SNP
+    candidate_idx = np.searchsorted(bed_ends, positions, side='right')
+    
+    # Check if the SNP is within the candidate BED region
+    # A SNP at position p is in region i if: bed_starts[i] <= p < bed_ends[i]
+    valid_idx = candidate_idx < len(bed_starts)
+    
+    # Initialize mask
+    in_bed = np.zeros(len(positions), dtype=bool)
+    
+    # For valid indices, check if position >= bed_starts[candidate_idx]
+    in_bed[valid_idx] = positions[valid_idx] >= bed_starts[candidate_idx[valid_idx]]
+    
+    # Return based on mode
+    if mode == "keep":
+        return in_bed
+    else:  # mode == "remove"
+        return ~in_bed
+
+
+def classify_mutations_numpy(refs: np.ndarray, alts: np.ndarray) -> np.ndarray:
+    """
+    Vectorized mutation type classification (transition vs transversion).
+    
+    Args:
+        refs: 1D numpy array of reference alleles (single characters)
+        alts: 1D numpy array of alternate alleles (single characters)
+        
+    Returns:
+        1D numpy array of mutation types ('ts' or 'tv')
+    """
+    # Transition pairs: A<->G, C<->T
+    # Convert to uppercase for comparison
+    refs_upper = np.char.upper(refs.astype(str))
+    alts_upper = np.char.upper(alts.astype(str))
+    
+    # Check for transitions
+    is_transition = (
+        ((refs_upper == 'A') & (alts_upper == 'G')) |
+        ((refs_upper == 'G') & (alts_upper == 'A')) |
+        ((refs_upper == 'C') & (alts_upper == 'T')) |
+        ((refs_upper == 'T') & (alts_upper == 'C'))
+    )
+    
+    # Create result array
+    result = np.where(is_transition, 'ts', 'tv')
+    
+    return result
+
+
 def _process_chromosome(
     vcf_path: Path,
     chrom: str,
@@ -91,6 +173,7 @@ def _process_chromosome(
     Process a single chromosome: extract SNPs, apply BED filter, apply cluster filter.
     
     This function runs in a separate process.
+    Uses vectorized NumPy operations for filtering and classification.
     
     Args:
         vcf_path: Path to VCF file
@@ -105,113 +188,138 @@ def _process_chromosome(
     Returns:
         ChromosomeResult with SNPs and statistics
     """
-    snps = []
     total_in_vcf = 0
-    after_bed = 0
     multi_allelic = 0
     indels_skipped = 0
     
     try:
         vcf = VCF(str(vcf_path))
         
-        # First, count total variants in the entire chromosome for statistics
-        for variant in vcf(chrom):
-            total_in_vcf += 1
+        # ========== STEP 1: Batch read all variants into arrays ==========
+        # Pre-allocate lists for batch collection (more efficient than individual appends)
+        raw_positions = []
+        raw_refs = []
+        raw_alts = []
+        raw_alt_counts = []  # Track multi-allelic
         
-        # Reset VCF for extraction
-        vcf.close()
-        vcf = VCF(str(vcf_path))
-        
-        # Suppress cyvcf2 warnings for empty intervals
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="no intervals found")
             
-            if bed_regions is not None:
-                # BED filter mode: iterate through specified regions
-                for start, end in bed_regions:
-                    region_str = f"{chrom}:{start}-{end}"
-                    for variant in vcf(region_str):
-                        if variant.CHROM != chrom:
-                            continue
-                        
-                        # Check if biallelic SNP
-                        if len(variant.REF) != 1:
-                            indels_skipped += 1
-                            continue
-                        
-                        if not variant.ALT or len(variant.ALT) == 0:
-                            continue
-                        
-                        first_alt = variant.ALT[0]
-                        if len(first_alt) != 1 or first_alt not in "ACGT":
-                            indels_skipped += 1
-                            continue
-                        
-                        if len(variant.ALT) > 1:
-                            multi_allelic += 1
-                        
-                        # Determine mutation type
-                        transitions = {('A', 'G'), ('G', 'A'), ('C', 'T'), ('T', 'C')}
-                        mut_type = 'ts' if (variant.REF.upper(), first_alt.upper()) in transitions else 'tv'
-                        
-                        snps.append({
-                            'chr': variant.CHROM,
-                            'pos': variant.POS,
-                            'ref': variant.REF,
-                            'alt': first_alt,
-                            'type': mut_type,
-                        })
-            else:
-                # No BED filter: extract entire chromosome
-                for variant in vcf(chrom):
-                    total_in_vcf += 1
-                    
-                    if len(variant.REF) != 1:
-                        indels_skipped += 1
-                        continue
-                    
-                    if not variant.ALT or len(variant.ALT) == 0:
-                        continue
-                    
-                    first_alt = variant.ALT[0]
-                    if len(first_alt) != 1 or first_alt not in "ACGT":
-                        indels_skipped += 1
-                        continue
-                    
-                    if len(variant.ALT) > 1:
-                        multi_allelic += 1
-                    
-                    transitions = {('A', 'G'), ('G', 'A'), ('C', 'T'), ('T', 'C')}
-                    mut_type = 'ts' if (variant.REF.upper(), first_alt.upper()) in transitions else 'tv'
-                    
-                    snps.append({
-                        'chr': variant.CHROM,
-                        'pos': variant.POS,
-                        'ref': variant.REF,
-                        'alt': first_alt,
-                        'type': mut_type,
-                    })
+            for variant in vcf(chrom):
+                total_in_vcf += 1
+                
+                # Collect raw data - filtering done vectorized later
+                ref = variant.REF
+                alt_list = variant.ALT if variant.ALT else []
+                first_alt = alt_list[0] if alt_list else ''
+                
+                raw_positions.append(variant.POS)
+                raw_refs.append(ref)
+                raw_alts.append(first_alt)
+                raw_alt_counts.append(len(alt_list))
         
         vcf.close()
-        after_bed = len(snps)
         
-        # Apply cluster filter using NumPy
-        if cluster_enabled and len(snps) > 0:
-            # Extract positions as numpy array
-            positions = np.array([s['pos'] for s in snps], dtype=np.int64)
-            
-            # Sort by position (required for cluster detection)
+        if total_in_vcf == 0:
+            return ChromosomeResult(
+                chrom=chrom, snps=[], total_in_vcf=0, after_bed=0,
+                after_cluster=0, multi_allelic=0, indels_skipped=0,
+            )
+        
+        # Convert to NumPy arrays for vectorized operations
+        positions = np.array(raw_positions, dtype=np.int64)
+        refs = np.array(raw_refs, dtype=object)
+        alts = np.array(raw_alts, dtype=object)
+        alt_counts = np.array(raw_alt_counts, dtype=np.int32)
+        
+        # ========== STEP 2: Vectorized SNP filtering ==========
+        # Filter 1: REF must be single nucleotide
+        ref_lens = np.array([len(r) for r in refs], dtype=np.int32)
+        ref_valid = ref_lens == 1
+        
+        # Filter 2: ALT must be single nucleotide and valid base
+        valid_bases = {'A', 'C', 'G', 'T'}
+        alt_valid = np.array([
+            len(a) == 1 and a in valid_bases for a in alts
+        ], dtype=bool)
+        
+        # Combined filter mask
+        snp_valid = ref_valid & alt_valid
+        
+        # Count statistics
+        indels_skipped = int(np.sum(~snp_valid))
+        multi_allelic = int(np.sum(alt_counts[snp_valid] > 1))
+        
+        # Apply SNP filter
+        positions = positions[snp_valid]
+        refs = refs[snp_valid]
+        alts = alts[snp_valid]
+        
+        # ========== STEP 3: Vectorized BED filtering ==========
+        if bed_regions is not None:
+            if len(bed_regions) == 0:
+                # Empty BED regions list = no regions to keep
+                positions = np.array([], dtype=np.int64)
+                refs = np.array([], dtype=object)
+                alts = np.array([], dtype=object)
+            else:
+                # Convert BED regions to sorted NumPy arrays
+                bed_starts = np.array([start for start, end in bed_regions], dtype=np.int64)
+                bed_ends = np.array([end for start, end in bed_regions], dtype=np.int64)
+                
+                # Sort BED regions by start position (required for searchsorted)
+                sort_idx = np.argsort(bed_starts)
+                bed_starts = bed_starts[sort_idx]
+                bed_ends = bed_ends[sort_idx]
+                
+                # Use vectorized BED filtering - mode="keep" because bed_regions 
+                # are already inverted (for remove_bed) or direct (for keep_bed)
+                bed_mask = filter_by_bed_regions_numpy(positions, bed_starts, bed_ends, mode="keep")
+                
+                # Apply BED filter
+                positions = positions[bed_mask]
+                refs = refs[bed_mask]
+                alts = alts[bed_mask]
+        
+        after_bed = len(positions)
+        
+        # ========== STEP 4: Vectorized mutation type classification ==========
+        if len(positions) > 0:
+            mut_types = classify_mutations_numpy(refs, alts)
+        else:
+            mut_types = np.array([], dtype=object)
+        
+        # ========== STEP 5: Vectorized cluster filtering ==========
+        if cluster_enabled and len(positions) > 0:
+            # Sort by position for cluster detection
             sort_idx = np.argsort(positions)
             sorted_positions = positions[sort_idx]
             
             # Detect clusters
             keep_mask = detect_clusters_numpy(sorted_positions, cluster_flank, max_cluster_snp)
             
-            # Map back to original order and filter
-            keep_original_idx = sort_idx[keep_mask]
-            snps = [snps[i] for i in sorted(keep_original_idx)]
+            # Apply cluster filter (keep sorted order for output)
+            keep_indices = sort_idx[keep_mask]
+            keep_indices = np.sort(keep_indices)  # Restore original order
+            
+            positions = positions[keep_indices]
+            refs = refs[keep_indices]
+            alts = alts[keep_indices]
+            mut_types = mut_types[keep_indices]
         
-        after_cluster = len(snps)
+        after_cluster = len(positions)
+        
+        # ========== STEP 6: Build output SNP list ==========
+        snps = [
+            {
+                'chr': chrom,
+                'pos': int(pos),
+                'ref': str(ref),
+                'alt': str(alt),
+                'type': str(mt),
+            }
+            for pos, ref, alt, mt in zip(positions, refs, alts, mut_types)
+        ]
         
         return ChromosomeResult(
             chrom=chrom,
@@ -225,6 +333,8 @@ def _process_chromosome(
         
     except Exception as e:
         logger.error(f"Error processing {chrom}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return ChromosomeResult(
             chrom=chrom,
             snps=[],
