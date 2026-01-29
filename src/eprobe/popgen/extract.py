@@ -1,247 +1,428 @@
 """
-SNP extraction from VCF files.
+SNP extraction from VCF files - Optimized Version 2.
 
-Extracts biallelic SNPs from VCF files with flanking sequences from
-reference genome. Optionally applies cluster filtering to remove
-SNPs in dense regions.
+Architecture:
+- Per-chromosome parallel processing (one process per chromosome)
+- Each process: extract → BED filter → cluster filter → return results
+- NumPy vectorized cluster detection
+- No flanking sequence extraction (extracted on-demand in later steps)
+- BED statistics collected during extraction (no separate count pass)
 
-Optimizations:
-- Multiprocessing by chromosome
-- On-demand reference loading with pysam
-- O(n log n) clustering algorithm
-- Batch DataFrame write
+Performance targets:
+- 15M SNPs: < 15 minutes (vs ~1 hour in v1)
+- Memory: ~2GB for 15M SNPs
 """
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import pandas as pd
 import numpy as np
-import pysam
+import pandas as pd
+from cyvcf2 import VCF
 
-from eprobe.core.result import Result, Ok, Err, try_except
-from eprobe.core.vcf import extract_snps_from_vcf, count_snps_in_vcf
-from eprobe.core.models import SNP
+from eprobe.core.result import Result, Ok, Err
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ClusterConfig:
-    """Configuration for cluster filtering."""
-    flank: int = 60
-    max_snp: int = 3
-    enabled: bool = True
+class ChromosomeResult:
+    """Result from processing one chromosome."""
+    chrom: str
+    snps: List[Dict[str, Any]]  # List of SNP dicts
+    total_in_vcf: int  # Total SNPs in this chromosome (before BED)
+    after_bed: int  # After BED filter
+    after_cluster: int  # After cluster filter
+    multi_allelic: int
+    indels_skipped: int
 
 
-def detect_clusters(
-    snps: List[SNP],
+def detect_clusters_numpy(
+    positions: np.ndarray,
     flank: int,
     max_snp: int,
-) -> List[int]:
+) -> np.ndarray:
     """
-    Detect SNP clusters using optimized O(n log n) algorithm.
+    Detect SNP clusters using NumPy vectorization.
     
-    Uses sliding window with two pointers instead of nested loops.
+    Algorithm: For each SNP, count neighbors within ±flank using searchsorted.
+    Time complexity: O(n log n) for sorting + O(n) for counting.
     
     Args:
-        snps: List of SNPs (unsorted)
-        flank: Flanking distance for cluster detection
-        max_snp: Maximum allowed SNPs in a 2*flank window
+        positions: Sorted 1D numpy array of SNP positions
+        flank: Flanking distance for cluster window
+        max_snp: Maximum SNPs allowed in window (inclusive)
         
     Returns:
-        List of indices of SNPs to keep (non-clustered)
+        Boolean mask of SNPs to keep (True = keep, False = filter)
     """
-    if not snps:
-        return []
+    if len(positions) == 0:
+        return np.array([], dtype=bool)
     
-    # Group by chromosome
-    chrom_snps: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
-    for idx, snp in enumerate(snps):
-        chrom_snps[snp.chrom].append((snp.pos, idx))
+    n = len(positions)
     
-    keep_indices: List[int] = []
+    # Use searchsorted to find window boundaries efficiently
+    # For each position p, find count of SNPs in [p-flank, p+flank]
+    left_bounds = np.searchsorted(positions, positions - flank, side='left')
+    right_bounds = np.searchsorted(positions, positions + flank, side='right')
     
-    for chrom, pos_idx_list in chrom_snps.items():
-        # Sort by position: O(n log n)
-        pos_idx_list.sort()
-        
-        positions = [pos for pos, _ in pos_idx_list]
-        indices = [idx for _, idx in pos_idx_list]
-        
-        # Sliding window: O(n)
-        left = 0
-        for right in range(len(positions)):
-            pos = positions[right]
-            
-            # Move left pointer forward
-            while left < right and positions[left] < pos - flank:
-                left += 1
-            
-            # Count SNPs in window [pos-flank, pos+flank]
-            window_count = 0
-            for i in range(left, len(positions)):
-                if positions[i] > pos + flank:
-                    break
-                window_count += 1
-            
-            if window_count <= max_snp:
-                keep_indices.append(indices[right])
-            else:
-                logger.debug(f"Filtered cluster SNP: {chrom}:{pos} (cluster size: {window_count})")
+    # Count SNPs in each window
+    window_counts = right_bounds - left_bounds
     
-    return sorted(keep_indices)
+    # Keep SNPs where window count <= max_snp
+    keep_mask = window_counts <= max_snp
+    
+    return keep_mask
 
 
-def apply_cluster_filter(
-    snps: List[SNP],
-    config: ClusterConfig,
-) -> Result[List[SNP], str]:
-    """
-    Apply cluster filtering to remove SNPs in dense regions.
-    
-    Args:
-        snps: Input list of SNPs
-        config: Cluster filtering configuration
-        
-    Returns:
-        Result containing filtered SNP list
-    """
-    if not config.enabled:
-        return Ok(snps)
-    
-    logger.info(f"Applying cluster filter (flank={config.flank}, max_snp={config.max_snp})")
-    
-    keep_indices = detect_clusters(snps, config.flank, config.max_snp)
-    filtered_snps = [snps[i] for i in keep_indices]
-    
-    removed = len(snps) - len(filtered_snps)
-    logger.info(f"Cluster filter: removed {removed} SNPs, {len(filtered_snps)} remaining")
-    
-    return Ok(filtered_snps)
-
-
-def extract_snps_with_flanks_for_chrom(
+def _process_chromosome(
+    vcf_path: Path,
     chrom: str,
-    chrom_snps: List[SNP],
-    reference_path: Path,
-    flank: int,
-) -> List[Dict[str, Any]]:
+    bed_regions: Optional[List[Tuple[int, int]]],  # Only regions for this chrom
+    cluster_flank: int,
+    max_cluster_snp: int,
+    cluster_enabled: bool,
+) -> ChromosomeResult:
     """
-    Extract flanking sequences for SNPs on one chromosome.
+    Process a single chromosome: extract SNPs, apply BED filter, apply cluster filter.
     
-    Uses pysam.FastaFile for on-demand loading (memory efficient).
-    Designed for multiprocessing - processes one chromosome at a time.
+    This function runs in a separate process.
     
     Args:
+        vcf_path: Path to VCF file
         chrom: Chromosome name
-        chrom_snps: SNPs on this chromosome
-        reference_path: Path to indexed reference FASTA
-        flank: Flanking region length
+        bed_regions: List of (start, end) tuples for this chromosome only
+                    None = no BED filter
+                    Empty list = no regions to extract (all filtered)
+        cluster_flank: Flanking distance for cluster detection
+        max_cluster_snp: Maximum SNPs in cluster window
+        cluster_enabled: Whether to apply cluster filtering
         
     Returns:
-        List of SNP dicts with flanking sequences
+        ChromosomeResult with SNPs and statistics
     """
-    snps_with_flanks = []
+    snps = []
+    total_in_vcf = 0
+    after_bed = 0
+    multi_allelic = 0
+    indels_skipped = 0
     
     try:
-        ref_fasta = pysam.FastaFile(str(reference_path))
+        vcf = VCF(str(vcf_path))
         
-        # Get chromosome length
-        if chrom not in ref_fasta.references:
-            logger.warning(f"Chromosome {chrom} not in reference")
-            return []
+        # First, count total variants in the entire chromosome for statistics
+        for variant in vcf(chrom):
+            total_in_vcf += 1
         
-        chrom_len = ref_fasta.get_reference_length(chrom)
+        # Reset VCF for extraction
+        vcf.close()
+        vcf = VCF(str(vcf_path))
         
-        for snp in chrom_snps:
-            # Calculate flanking region (0-based for pysam)
-            start = max(0, snp.pos - 1 - flank)
-            end = min(chrom_len, snp.pos + flank)
+        # Suppress cyvcf2 warnings for empty intervals
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="no intervals found")
             
-            # Check if we have enough flanking sequence
-            actual_left_flank = snp.pos - 1 - start
-            actual_right_flank = end - snp.pos
-            
-            if actual_left_flank < flank or actual_right_flank < flank:
-                continue
-            
-            # Fetch sequences on-demand (very memory efficient)
-            left_flank_seq = ref_fasta.fetch(chrom, start, snp.pos - 1)
-            right_flank_seq = ref_fasta.fetch(chrom, snp.pos, end)
-            
-            # Validate reference allele
-            ref_at_pos = ref_fasta.fetch(chrom, snp.pos - 1, snp.pos)
-            if ref_at_pos.upper() != snp.ref.upper():
-                logger.warning(
-                    f"Reference mismatch at {chrom}:{snp.pos}: "
-                    f"VCF={snp.ref}, Ref={ref_at_pos}"
-                )
-                continue
-            
-            # Create SNP dict (only core fields)
-            snp_dict = {
-                'chr': snp.chrom,
-                'pos': snp.pos,
-                'ref': snp.ref,
-                'alt': snp.alt,
-                'type': snp.mutation_type,
-            }
-            snps_with_flanks.append(snp_dict)
+            if bed_regions is not None:
+                # BED filter mode: iterate through specified regions
+                for start, end in bed_regions:
+                    region_str = f"{chrom}:{start}-{end}"
+                    for variant in vcf(region_str):
+                        if variant.CHROM != chrom:
+                            continue
+                        
+                        # Check if biallelic SNP
+                        if len(variant.REF) != 1:
+                            indels_skipped += 1
+                            continue
+                        
+                        if not variant.ALT or len(variant.ALT) == 0:
+                            continue
+                        
+                        first_alt = variant.ALT[0]
+                        if len(first_alt) != 1 or first_alt not in "ACGT":
+                            indels_skipped += 1
+                            continue
+                        
+                        if len(variant.ALT) > 1:
+                            multi_allelic += 1
+                        
+                        # Determine mutation type
+                        transitions = {('A', 'G'), ('G', 'A'), ('C', 'T'), ('T', 'C')}
+                        mut_type = 'ts' if (variant.REF.upper(), first_alt.upper()) in transitions else 'tv'
+                        
+                        snps.append({
+                            'chr': variant.CHROM,
+                            'pos': variant.POS,
+                            'ref': variant.REF,
+                            'alt': first_alt,
+                            'type': mut_type,
+                        })
+            else:
+                # No BED filter: extract entire chromosome
+                for variant in vcf(chrom):
+                    total_in_vcf += 1
+                    
+                    if len(variant.REF) != 1:
+                        indels_skipped += 1
+                        continue
+                    
+                    if not variant.ALT or len(variant.ALT) == 0:
+                        continue
+                    
+                    first_alt = variant.ALT[0]
+                    if len(first_alt) != 1 or first_alt not in "ACGT":
+                        indels_skipped += 1
+                        continue
+                    
+                    if len(variant.ALT) > 1:
+                        multi_allelic += 1
+                    
+                    transitions = {('A', 'G'), ('G', 'A'), ('C', 'T'), ('T', 'C')}
+                    mut_type = 'ts' if (variant.REF.upper(), first_alt.upper()) in transitions else 'tv'
+                    
+                    snps.append({
+                        'chr': variant.CHROM,
+                        'pos': variant.POS,
+                        'ref': variant.REF,
+                        'alt': first_alt,
+                        'type': mut_type,
+                    })
         
-        ref_fasta.close()
+        vcf.close()
+        after_bed = len(snps)
+        
+        # Apply cluster filter using NumPy
+        if cluster_enabled and len(snps) > 0:
+            # Extract positions as numpy array
+            positions = np.array([s['pos'] for s in snps], dtype=np.int64)
+            
+            # Sort by position (required for cluster detection)
+            sort_idx = np.argsort(positions)
+            sorted_positions = positions[sort_idx]
+            
+            # Detect clusters
+            keep_mask = detect_clusters_numpy(sorted_positions, cluster_flank, max_cluster_snp)
+            
+            # Map back to original order and filter
+            keep_original_idx = sort_idx[keep_mask]
+            snps = [snps[i] for i in sorted(keep_original_idx)]
+        
+        after_cluster = len(snps)
+        
+        return ChromosomeResult(
+            chrom=chrom,
+            snps=snps,
+            total_in_vcf=total_in_vcf,
+            after_bed=after_bed,
+            after_cluster=after_cluster,
+            multi_allelic=multi_allelic,
+            indels_skipped=indels_skipped,
+        )
         
     except Exception as e:
-        logger.error(f"Error processing chromosome {chrom}: {e}")
-        return []
-    
-    return snps_with_flanks
+        logger.error(f"Error processing {chrom}: {e}")
+        return ChromosomeResult(
+            chrom=chrom,
+            snps=[],
+            total_in_vcf=0,
+            after_bed=0,
+            after_cluster=0,
+            multi_allelic=0,
+            indels_skipped=0,
+        )
 
 
-def extract_snps_with_flanks_parallel(
-    snps: List[SNP],
-    reference_path: Path,
-    flank: int,
-    threads: int = 1,
-) -> Result[List[Dict[str, Any]], str]:
+def invert_bed_regions(bed_path: Path, fai_path: Path) -> Dict[str, List[Tuple[int, int]]]:
     """
-    Add flanking sequences using multiprocessing by chromosome.
+    Generate inverted BED regions grouped by chromosome.
+    
+    Returns a dict where keys are chromosome names and values are
+    lists of (start, end) tuples representing regions OUTSIDE the input BED.
     
     Args:
-        snps: List of SNPs
-        reference_path: Path to indexed reference FASTA (.fai required)
-        flank: Flanking region length
-        threads: Number of parallel processes
+        bed_path: Input BED file
+        fai_path: Reference .fai index file
         
     Returns:
-        Result containing list of SNP dicts with flanking sequences
+        Dict mapping chromosome -> list of (start, end) regions
     """
-    # Group SNPs by chromosome
-    chrom_snps_dict: Dict[str, List[SNP]] = defaultdict(list)
-    for snp in snps:
-        chrom_snps_dict[snp.chrom].append(snp)
+    # Read chromosome lengths from .fai
+    chrom_lengths = {}
+    with open(fai_path) as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                chrom_lengths[parts[0]] = int(parts[1])
     
-    logger.info(f"Processing {len(chrom_snps_dict)} chromosomes with {threads} threads")
+    # Read and group BED regions by chromosome
+    bed_regions: Dict[str, List[Tuple[int, int]]] = {}
+    with open(bed_path) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                chrom, start, end = parts[0], int(parts[1]), int(parts[2])
+                if chrom not in bed_regions:
+                    bed_regions[chrom] = []
+                bed_regions[chrom].append((start, end))
     
-    all_snps_with_flanks = []
+    # Sort regions within each chromosome
+    for chrom in bed_regions:
+        bed_regions[chrom].sort()
+    
+    # Generate inverted regions by chromosome
+    inverted: Dict[str, List[Tuple[int, int]]] = {}
+    for chrom, length in chrom_lengths.items():
+        inverted[chrom] = []
+        
+        if chrom not in bed_regions:
+            # No BED regions on this chromosome, keep entire chromosome
+            inverted[chrom].append((0, length))
+            continue
+        
+        regions = bed_regions[chrom]
+        current_pos = 0
+        
+        for start, end in regions:
+            if current_pos < start:
+                inverted[chrom].append((current_pos, start))
+            current_pos = max(current_pos, end)
+        
+        if current_pos < length:
+            inverted[chrom].append((current_pos, length))
+    
+    return inverted
+
+
+def read_bed_regions(bed_path: Path) -> Dict[str, List[Tuple[int, int]]]:
+    """
+    Read BED regions grouped by chromosome.
+    
+    Args:
+        bed_path: Input BED file
+        
+    Returns:
+        Dict mapping chromosome -> list of (start, end) regions
+    """
+    bed_regions: Dict[str, List[Tuple[int, int]]] = {}
+    with open(bed_path) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                chrom, start, end = parts[0], int(parts[1]), int(parts[2])
+                if chrom not in bed_regions:
+                    bed_regions[chrom] = []
+                bed_regions[chrom].append((start, end))
+    
+    # Sort regions within each chromosome
+    for chrom in bed_regions:
+        bed_regions[chrom].sort()
+    
+    return bed_regions
+
+
+def run_extract(
+    vcf_path: Path,
+    reference_path: Path,
+    output_prefix: Path,
+    cluster_flank: int = 60,
+    max_cluster_snp: int = 3,
+    cluster_mode: bool = True,
+    bed_path: Optional[Path] = None,
+    bed_mode: str = "keep",
+    threads: int = 1,
+    verbose: bool = False,
+) -> Result[Dict[str, Any], str]:
+    """
+    Extract SNPs from VCF file - Optimized Version 2.
+    
+    Single-pass extraction with per-chromosome parallelization.
+    Each chromosome process handles: extract → BED filter → cluster filter.
+    
+    Args:
+        vcf_path: Input VCF file (.vcf.gz with .tbi index)
+        reference_path: Reference genome FASTA (for .fai file)
+        output_prefix: Output file prefix
+        cluster_flank: Flanking distance for cluster detection
+        max_cluster_snp: Maximum SNPs allowed in cluster window
+        cluster_mode: Enable cluster filtering
+        bed_path: Optional BED file
+        bed_mode: 'keep' to keep BED regions, 'remove' to exclude them
+        threads: Number of parallel processes
+        verbose: Enable verbose logging
+        
+    Returns:
+        Result containing extraction statistics
+    """
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    
+    logger.info(f"Starting SNP extraction from {vcf_path}")
+    logger.info(f"Using {threads} threads")
+    
+    # Check indices exist
+    fai_path = Path(str(reference_path) + ".fai")
+    if not fai_path.exists():
+        return Err(f"Reference index not found: {fai_path}")
+    
+    vcf_index = Path(str(vcf_path) + ".tbi")
+    if not vcf_index.exists():
+        return Err(f"VCF index not found: {vcf_index}")
+    
+    # Get chromosome list from VCF
+    try:
+        vcf = VCF(str(vcf_path))
+        chromosomes = vcf.seqnames
+        vcf.close()
+        logger.info(f"Found {len(chromosomes)} chromosomes in VCF")
+    except Exception as e:
+        return Err(f"Failed to read VCF: {e}")
+    
+    # Prepare BED regions by chromosome
+    bed_regions_by_chrom: Optional[Dict[str, List[Tuple[int, int]]]] = None
+    bed_applied = bed_path is not None
+    
+    if bed_path:
+        if bed_mode == "remove":
+            logger.info(f"Generating inverted BED regions (remove mode)...")
+            bed_regions_by_chrom = invert_bed_regions(bed_path, fai_path)
+            total_regions = sum(len(v) for v in bed_regions_by_chrom.values())
+            logger.info(f"Generated {total_regions} inverted regions across {len(bed_regions_by_chrom)} chromosomes")
+        else:
+            logger.info(f"Loading BED regions (keep mode)...")
+            bed_regions_by_chrom = read_bed_regions(bed_path)
+            total_regions = sum(len(v) for v in bed_regions_by_chrom.values())
+            logger.info(f"Loaded {total_regions} regions across {len(bed_regions_by_chrom)} chromosomes")
+    
+    # Process chromosomes in parallel
+    all_results: List[ChromosomeResult] = []
     
     if threads == 1:
-        # Serial processing
-        for chrom, chrom_snps in chrom_snps_dict.items():
-            result = extract_snps_with_flanks_for_chrom(chrom, chrom_snps, reference_path, flank)
-            all_snps_with_flanks.extend(result)
+        for chrom in chromosomes:
+            chrom_bed = bed_regions_by_chrom.get(chrom, []) if bed_regions_by_chrom else None
+            result = _process_chromosome(
+                vcf_path, chrom, chrom_bed,
+                cluster_flank, max_cluster_snp, cluster_mode
+            )
+            all_results.append(result)
+            if result.after_cluster > 0:
+                logger.info(f"✓ {chrom}: {result.after_cluster} SNPs (BED: {result.after_bed}, cluster removed: {result.after_bed - result.after_cluster})")
     else:
-        # Parallel processing by chromosome
         with ProcessPoolExecutor(max_workers=threads) as executor:
             futures = {}
-            for chrom, chrom_snps in chrom_snps_dict.items():
+            for chrom in chromosomes:
+                chrom_bed = bed_regions_by_chrom.get(chrom, []) if bed_regions_by_chrom else None
                 future = executor.submit(
-                    extract_snps_with_flanks_for_chrom,
-                    chrom, chrom_snps, reference_path, flank
+                    _process_chromosome,
+                    vcf_path, chrom, chrom_bed,
+                    cluster_flank, max_cluster_snp, cluster_mode
                 )
                 futures[future] = chrom
             
@@ -249,161 +430,59 @@ def extract_snps_with_flanks_parallel(
                 chrom = futures[future]
                 try:
                     result = future.result()
-                    all_snps_with_flanks.extend(result)
-                    logger.info(f"Completed chromosome {chrom}: {len(result)} SNPs")
+                    all_results.append(result)
+                    if result.after_cluster > 0:
+                        logger.info(f"✓ {chrom}: {result.after_cluster} SNPs")
                 except Exception as e:
-                    logger.error(f"Failed processing chromosome {chrom}: {e}")
+                    logger.error(f"Failed to process {chrom}: {e}")
     
-    return Ok(all_snps_with_flanks)
-
-
-def run_extract(
-    vcf_path: Path,
-    reference_path: Path,
-    output_prefix: Path,
-    flank: int = 60,
-    cluster_mode: bool = True,
-    cluster_flank: int = 60,
-    max_cluster_snp: int = 3,
-    bed_path: Optional[Path] = None,
-    bed_mode: str = "keep",
-    threads: int = 1,
-    verbose: bool = False,
-) -> Result[Dict[str, Any], str]:
-    """
-    Extract SNPs from VCF file with flanking sequences (optimized).
+    # Aggregate results
+    all_snps = []
+    total_in_vcf = 0
+    total_after_bed = 0
+    total_after_cluster = 0
+    total_multi_allelic = 0
+    total_indels = 0
     
-    Note: For multi-allelic sites, always extracts first alt allele (alt[0]).
+    for result in all_results:
+        all_snps.extend(result.snps)
+        total_in_vcf += result.total_in_vcf
+        total_after_bed += result.after_bed
+        total_after_cluster += result.after_cluster
+        total_multi_allelic += result.multi_allelic
+        total_indels += result.indels_skipped
     
-    Optimizations:
-    - Multiprocessing by chromosome (both VCF and reference)
-    - cyvcf2 for fast VCF parsing (2-3× faster than pysam)
-    - On-demand reference loading with pysam (low memory)
-    - O(n log n) clustering algorithm
-    - Batch append and DataFrame write
+    # Sort by chromosome and position
+    all_snps.sort(key=lambda x: (x['chr'], x['pos']))
     
-    Args:
-        vcf_path: Input VCF file path (.vcf.gz with .tbi index)
-        reference_path: Reference genome FASTA path (requires .fai index)
-        output_prefix: Output file prefix
-        flank: Flanking region length
-        cluster_mode: Enable cluster filtering
-        cluster_flank: Flanking distance for cluster detection
-        max_cluster_snp: Maximum SNPs allowed in cluster window
-        bed_path: Optional BED file to restrict/exclude regions
-        bed_mode: 'keep' to keep BED regions, 'remove' to exclude them
-        threads: Number of parallel processes (recommended: num chromosomes)
-        verbose: Enable verbose logging
-        
-    Returns:
-        Result containing extraction statistics
-    """
-    if verbose:
-        logger.setLevel(logging.DEBUG)
-    
-    logger.info(f"Starting SNP extraction from {vcf_path}")
-    logger.info(f"Using {threads} threads")
-    
-    # Check reference index exists
-    fai_path = Path(str(reference_path) + ".fai")
-    if not fai_path.exists():
-        return Err(f"Reference index not found: {fai_path}. Run 'samtools faidx {reference_path}'")
-    
-    # Check VCF index exists
-    vcf_index = Path(str(vcf_path) + ".tbi")
-    if not vcf_index.exists():
-        return Err(f"VCF index not found: {vcf_index}. Run 'tabix -p vcf {vcf_path}'")
-    
-    # Step 1a: Fast count total SNPs in VCF (for BED filter statistics)
-    total_snps_in_vcf = None
-    if bed_path:
-        logger.info("Counting total SNPs in VCF (fast scan)...")
-        count_result = count_snps_in_vcf(vcf_path, threads=threads)
-        if count_result.is_ok():
-            total_snps_in_vcf = count_result.unwrap()
-            logger.info(f"Total SNPs in VCF: {total_snps_in_vcf:,}")
-        else:
-            logger.warning(f"Failed to count SNPs: {count_result.unwrap_err()}")
-    
-    # Step 1b: Extract raw SNPs from VCF (with BED filtering if specified)
-    logger.info("Extracting SNPs from VCF...")
-    vcf_result = extract_snps_from_vcf(
-        vcf_path, bed_path, bed_mode, fai_path=fai_path, threads=threads
-    )
-    if vcf_result.is_err():
-        return Err(f"VCF extraction failed: {vcf_result.unwrap_err()}")
-    
-    vcf_data = vcf_result.unwrap()
-    raw_snps = vcf_data['snps']
-    bed_applied = vcf_data['bed_applied']
-    bed_mode_applied = vcf_data['bed_mode']
-    
-    logger.info(f"Extracted {len(raw_snps)} SNPs from VCF")
-    
-    if not raw_snps:
-        return Err("No SNPs extracted from VCF file")
-    
-    # Step 2: Add flanking sequences (using multiprocessing)
-    logger.info(f"Extracting flanking sequences (flank={flank}, threads={threads})...")
-    flank_result = extract_snps_with_flanks_parallel(
-        raw_snps, reference_path, flank, threads
-    )
-    if flank_result.is_err():
-        return Err(f"Flanking extraction failed: {flank_result.unwrap_err()}")
-    
-    snps_with_flanks = flank_result.unwrap()
-    logger.info(f"{len(snps_with_flanks)} SNPs have complete flanking sequences")
-    
-    # Step 3: Apply cluster filter (on original SNPs from VCF)
-    cluster_config = ClusterConfig(
-        flank=cluster_flank,
-        max_snp=max_cluster_snp,
-        enabled=cluster_mode,
-    )
-    
-    if cluster_mode:
-        logger.info(f"Applying cluster filter (flank={cluster_flank}, max_snp={max_cluster_snp})")
-        # Create map from position to index in snps_with_flanks
-        pos_to_idx = {(d['chrom'], d['pos']): i for i, d in enumerate(snps_with_flanks)}
-        
-        # Use raw SNPs for clustering
-        keep_indices = detect_clusters(raw_snps, cluster_flank, max_cluster_snp)
-        
-        # Filter snps_with_flanks based on kept raw SNPs
-        kept_snps_set = {(raw_snps[i].chrom, raw_snps[i].pos) for i in keep_indices}
-        final_snps = [d for d in snps_with_flanks if (d['chr'], d['pos']) in kept_snps_set]
-        
-        removed = len(snps_with_flanks) - len(final_snps)
-        logger.info(f"Cluster filter: removed {removed} SNPs, {len(final_snps)} remaining")
-    else:
-        final_snps = snps_with_flanks
-    
-    # Step 4: Save output (batch write)
+    # Save output
     output_path = Path(str(output_prefix) + ".snps.tsv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Direct DataFrame construction (already dicts)
-    df = pd.DataFrame(final_snps)
-    
+    df = pd.DataFrame(all_snps)
     try:
         df.to_csv(output_path, sep='\t', index=False)
-        logger.info(f"Saved {len(final_snps)} SNPs to {output_path}")
+        logger.info(f"Saved {len(all_snps)} SNPs to {output_path}")
     except Exception as e:
         return Err(f"Failed to save output: {e}")
     
-    # Return statistics
+    # Build statistics
     stats = {
-        "raw_snp_count": len(raw_snps),
-        "flanked_snp_count": len(snps_with_flanks),
-        "final_snp_count": len(final_snps),
-        "cluster_removed": len(snps_with_flanks) - len(final_snps) if cluster_mode else 0,
+        "total_in_vcf": total_in_vcf,
+        "after_bed": total_after_bed,
+        "after_cluster": total_after_cluster,
+        "final_snp_count": len(all_snps),
+        "multi_allelic": total_multi_allelic,
+        "indels_skipped": total_indels,
         "output_file": str(output_path),
         # BED filter statistics
         "bed_applied": bed_applied,
-        "bed_mode": bed_mode_applied,
-        "total_snps_in_vcf": total_snps_in_vcf,
-        "bed_kept": len(raw_snps) if bed_applied else None,
-        "bed_removed": (total_snps_in_vcf - len(raw_snps)) if bed_applied and total_snps_in_vcf else None,
+        "bed_mode": bed_mode if bed_applied else None,
+        "bed_kept": total_after_bed if bed_applied else None,
+        "bed_removed": (total_in_vcf - total_after_bed) if bed_applied else None,
+        # Cluster filter statistics
+        "cluster_enabled": cluster_mode,
+        "cluster_removed": total_after_bed - total_after_cluster if cluster_mode else 0,
     }
     
     return Ok(stats)

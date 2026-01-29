@@ -146,7 +146,7 @@ def extract(
       {output}.chr_sizes.tsv  - Chromosome sizes
       {output}.extract.log    - Processing log
     """
-    from eprobe.popgen.extract_v2 import run_extract
+    from eprobe.popgen.extract import run_extract
     
     verbose = ctx.obj.get("verbose", False)
     
