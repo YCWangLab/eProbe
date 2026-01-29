@@ -1040,9 +1040,9 @@ def run_filter(
             
             stats["filters_applied"].append("AC")
             stats["ac_remaining"] = len(snps)
-    
-    # Apply Taxonomy filter
-    if "tx" in filters_normalized:
+        
+        # Apply Taxonomy filter
+        if "tx" in filters_normalized:
         if tx_db is None:
             return Err("TX filter requires --tx_db")
         if tx_ids is None or len(tx_ids) == 0:
@@ -1078,9 +1078,9 @@ def run_filter(
         snps = result.unwrap()
         stats["filters_applied"].append("TX")
         stats["tx_remaining"] = len(snps)
-    
-    # Apply Biophysical filter
-    if "biophysical" in filters_normalized:
+        
+        # Apply Biophysical filter
+        if "biophysical" in filters_normalized:
         thresholds = BiophysicalThresholds(
             gc_min=gc_range[0],
             gc_max=gc_range[1],
