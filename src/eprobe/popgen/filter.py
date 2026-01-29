@@ -1043,45 +1043,45 @@ def run_filter(
         
         # Apply Taxonomy filter
         if "tx" in filters_normalized:
-        if tx_db is None:
-            return Err("TX filter requires --tx_db")
-        if tx_ids is None or len(tx_ids) == 0:
-            return Err("TX filter requires --tx_ids (target taxonomy IDs)")
-        
-        # Parse database paths
-        index_paths = [Path(db.strip()) for db in tx_db.split(",")]
-        
-        # Check for required NCBI taxonomy files
-        if names_dmp is None:
-            return Err("TX filter requires --tx_names (NCBI names.dmp)")
-        if nodes_dmp is None:
-            return Err("TX filter requires --tx_nodes (NCBI nodes.dmp)")
-        if acc2tax is None:
-            return Err("TX filter requires --tx_acc2tax (accession to taxid mapping)")
-        
-        result = filter_taxonomy(
-            snps=snps,
-            index_paths=index_paths,
-            names_dmp=Path(names_dmp),
-            nodes_dmp=Path(nodes_dmp),
-            acc2tax=Path(acc2tax),
-            target_taxids=tx_ids,
-            fasta_path=fasta_path,
-            min_edit=tx_min_edit if tx_min_edit is not None else 0,
-            max_edit=tx_max_edit if tx_max_edit is not None else 2,
-            keep_hits=tx_keep_hits if tx_keep_hits is not None else 100,
-            threads=threads,
-        )
-        if result.is_err():
-            return Err(result.unwrap_err())
-        
-        snps = result.unwrap()
-        stats["filters_applied"].append("TX")
-        stats["tx_remaining"] = len(snps)
+            if tx_db is None:
+                return Err("TX filter requires --tx_db")
+            if tx_ids is None or len(tx_ids) == 0:
+                return Err("TX filter requires --tx_ids (target taxonomy IDs)")
+            
+            # Parse database paths
+            index_paths = [Path(db.strip()) for db in tx_db.split(",")]
+            
+            # Check for required NCBI taxonomy files
+            if names_dmp is None:
+                return Err("TX filter requires --tx_names (NCBI names.dmp)")
+            if nodes_dmp is None:
+                return Err("TX filter requires --tx_nodes (NCBI nodes.dmp)")
+            if acc2tax is None:
+                return Err("TX filter requires --tx_acc2tax (accession to taxid mapping)")
+            
+            result = filter_taxonomy(
+                snps=snps,
+                index_paths=index_paths,
+                names_dmp=Path(names_dmp),
+                nodes_dmp=Path(nodes_dmp),
+                acc2tax=Path(acc2tax),
+                target_taxids=tx_ids,
+                fasta_path=fasta_path,
+                min_edit=tx_min_edit if tx_min_edit is not None else 0,
+                max_edit=tx_max_edit if tx_max_edit is not None else 2,
+                keep_hits=tx_keep_hits if tx_keep_hits is not None else 100,
+                threads=threads,
+            )
+            if result.is_err():
+                return Err(result.unwrap_err())
+            
+            snps = result.unwrap()
+            stats["filters_applied"].append("TX")
+            stats["tx_remaining"] = len(snps)
         
         # Apply Biophysical filter
         if "biophysical" in filters_normalized:
-        thresholds = BiophysicalThresholds(
+            thresholds = BiophysicalThresholds(
             gc_min=gc_range[0],
             gc_max=gc_range[1],
             tm_min=tm_range[0],
@@ -1091,14 +1091,14 @@ def run_filter(
             dimer_max=max_dimer,
         )
         
-        result = filter_biophysical(snps, thresholds, threads)
-        if result.is_err():
-            return Err(result.unwrap_err())
-        
-        snps, biophys_stats = result.unwrap()
-        stats["filters_applied"].append("biophysical")
-        stats["biophysical_remaining"] = len(snps)
-        stats["biophysical_details"] = biophys_stats
+            result = filter_biophysical(snps, thresholds, threads)
+            if result.is_err():
+                return Err(result.unwrap_err())
+            
+            snps, biophys_stats = result.unwrap()
+            stats["filters_applied"].append("biophysical")
+            stats["biophysical_remaining"] = len(snps)
+            stats["biophysical_details"] = biophys_stats
         
         # Save output
         output_path = Path(str(output_prefix) + ".filtered.tsv")
