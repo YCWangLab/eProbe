@@ -106,11 +106,6 @@ def popgen(ctx: click.Context) -> None:
     default=True,
     help="Enable/disable cluster filtering (default: enabled).",
 )
-@click.option(
-    "--force_biallelic",
-    is_flag=True,
-    help="Force biallelic by selecting first alt allele if multiple exist.",
-)
 @click.pass_context
 def extract(
     ctx: click.Context,
@@ -123,15 +118,21 @@ def extract(
     min_cluster_snp: int,
     keep_bed: Optional[Path],
     remove_bed: Optional[Path],
-    force_biallelic: bool,
     cluster_filter: bool,
 ) -> None:
     """
     Extract SNPs from VCF file.
     
-    Reads a compressed, indexed VCF file and extracts biallelic SNPs.
+    Reads a compressed, indexed VCF file and extracts SNPs.
+    For multi-allelic sites, always extracts the first alt allele (alt[0]).
     Optionally filters out SNP clusters (regions with too many SNPs close together)
     as these indicate hypervariable regions that may cause probe design issues.
+    
+    \b
+    Multi-allelic handling:
+      - Multi-allelic sites: extracts first alt allele only
+      - Example: REF=A, ALT=G,T → extracts A/G SNP
+      - Indels (REF or ALT length > 1) are automatically skipped
     
     \b
     Why filter SNP clusters?
@@ -160,7 +161,6 @@ def extract(
         max_cluster_snp=max_cluster_snp,
         cluster_mode=cluster_filter,
         bed_path=keep_bed if keep_bed else remove_bed,
-        force_biallelic=force_biallelic,
         verbose=verbose,
     )
     

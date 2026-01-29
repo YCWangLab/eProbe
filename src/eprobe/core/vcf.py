@@ -2,184 +2,59 @@
 VCF file operations.
 
 Provides functions for reading and processing VCF files to extract SNPs.
-Uses pysam for efficient indexed access to compressed VCF files.
+Uses cyvcf2 for fast indexed access to compressed VCF files.
+
+Note: Always extracts first alt allele (alt[0]) for multi-allelic sites.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional, List, Tuple
-import warnings
+from typing import List, Tuple, Optional
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import pysam
-import pandas as pd
+from cyvcf2 import VCF
 
 from eprobe.core.result import Result, Ok, Err
-from eprobe.core.models import SNP, SNPDataFrame
+from eprobe.core.models import SNP
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class VCFReader:
+def _extract_snps_for_chromosome(
+    vcf_path: Path,
+    chrom: str,
+    bed_path: Optional[Path],
+) -> Tuple[str, List[SNP], int, int]:
     """
-    Reader for VCF files with SNP extraction capabilities.
+    Extract SNPs from a single chromosome using cyvcf2 (for multiprocessing).
     
-    Handles compressed (vcf.gz) and indexed VCF files using pysam.
-    Extracts only biallelic SNPs by default.
+    Always extracts first alt allele (alt[0]) regardless of ploidy.
+    
+    Args:
+        vcf_path: Path to VCF file
+        chrom: Chromosome name
+        bed_path: Optional BED file to filter regions
+        
+    Returns:
+        Tuple of (chromosome, snp_list, multi_allelic_count, indel_count)
     """
+    logger.info(f"→ Processing chromosome {chrom}...")
     
-    path: Path
-    _vcf: Optional[pysam.VariantFile] = None
+    snps = []
+    multi_allelic = 0
+    indels = 0
     
-    def __post_init__(self) -> None:
-        """Convert path to Path object."""
-        self.path = Path(self.path)
+    # Batch append optimization
+    batch = []
+    batch_size = 10000
     
-    def open(self) -> Result[None, str]:
-        """
-        Open VCF file for reading.
-        
-        Returns:
-            Ok(None) on success, Err(message) on failure
-        """
-        try:
-            if not self.path.exists():
-                return Err(f"VCF file not found: {self.path}")
-            
-            # Check for index file
-            index_path = Path(f"{self.path}.tbi")
-            if not index_path.exists():
-                return Err(f"VCF index not found: {index_path}. Run 'tabix -p vcf {self.path}'")
-            
-            self._vcf = pysam.VariantFile(str(self.path))
-            return Ok(None)
-        
-        except Exception as e:
-            return Err(f"Failed to open VCF: {e}")
-    
-    def close(self) -> None:
-        """Close VCF file."""
-        if self._vcf is not None:
-            self._vcf.close()
-            self._vcf = None
-    
-    def __enter__(self) -> VCFReader:
-        result = self.open()
-        if result.is_err():
-            raise IOError(result.unwrap_err())
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
-    
-    @staticmethod
-    def is_biallelic_snp(record: pysam.VariantRecord) -> bool:
-        """
-        Check if variant record is a biallelic SNP.
-        
-        Args:
-            record: pysam VariantRecord
-            
-        Returns:
-            True if biallelic SNP (single-base ref and alt)
-        """
-        # Check reference is single base
-        if len(record.ref) != 1:
-            return False
-        
-        # Check exactly one alternative allele
-        if len(record.alts) != 1:
-            return False
-        
-        # Check alternative is single base
-        alt = record.alts[0]
-        if alt not in {"A", "C", "G", "T"}:
-            return False
-        
-        return True
-    
-    @staticmethod
-    def _can_force_biallelic(record: pysam.VariantRecord) -> bool:
-        """
-        Quick check if variant can be forced to biallelic.
-        
-        Checks:
-        1. REF is single base
-        2. At least one ALT exists
-        3. First ALT is single base
-        
-        Args:
-            record: pysam VariantRecord
-            
-        Returns:
-            True if can be forced to biallelic
-        """
-        # Check ref is single base
-        if len(record.ref) != 1:
-            return False
-        
-        # Check has at least one alt
-        if not record.alts or len(record.alts) == 0:
-            return False
-        
-        # Check first alt is single base and valid
-        first_alt = record.alts[0]
-        if first_alt in {"A", "C", "G", "T"}:
-            return True
-        
-        return False
-    
-    @staticmethod
-    def _record_to_snp(record: pysam.VariantRecord, force_first_alt: bool = False) -> SNP:
-        """
-        Convert pysam VariantRecord to SNP object.
-        
-        Args:
-            record: pysam VariantRecord
-            force_first_alt: If True, use first alt even if multiple exist
-            
-        Returns:
-            SNP object
-        """
-        alt_allele = record.alts[0]
-        
-        return SNP.from_vcf_record(
-            chrom=record.chrom,
-            pos=record.pos,
-            ref=record.ref,
-            alt=alt_allele,
-        )
-    
-    def fetch_snps(
-        self,
-        chrom: Optional[str] = None,
-        start: Optional[int] = None,
-        end: Optional[int] = None,
-        bed_path: Optional[Path] = None,
-        force_biallelic: bool = False,
-    ) -> Iterator[SNP]:
-        """
-        Fetch biallelic SNPs from VCF.
-        
-        Args:
-            chrom: Chromosome to fetch (None = all)
-            start: Start position (0-based)
-            end: End position
-            bed_path: BED file to restrict regions
-            force_biallelic: Force biallelic by taking first alt
-            
-        Yields:
-            SNP objects for biallelic variants
-        """
-        if self._vcf is None:
-            raise RuntimeError("VCF not opened")
+    try:
+        vcf = VCF(str(vcf_path))
         
         # Read BED regions if provided
         regions = []
-        if bed_path is not None:
+        if bed_path:
             with open(bed_path) as f:
                 for line in f:
                     if line.startswith("#"):
@@ -190,118 +65,110 @@ class VCFReader:
         
         # Fetch variants
         if regions:
-            # Fetch from specified regions
+            # Filter by BED regions
             for region_chrom, region_start, region_end in regions:
-                for record in self._vcf.fetch(region_chrom, region_start, region_end):
-                    if self.is_biallelic_snp(record):
-                        yield self._record_to_snp(record)
-                    elif force_biallelic and self._can_force_biallelic(record):
-                        yield self._record_to_snp(record, force_first_alt=True)
-        elif chrom is not None:
-            # Fetch from specified chromosome/region
-            for record in self._vcf.fetch(chrom, start, end):
-                if self.is_biallelic_snp(record):
-                    yield self._record_to_snp(record)
-                elif force_biallelic and self._can_force_biallelic(record):
-                    yield self._record_to_snp(record, force_first_alt=True)
+                if region_chrom != chrom:
+                    continue
+                for variant in vcf(f"{region_chrom}:{region_start}-{region_end}"):
+                    if variant.CHROM != chrom:
+                        continue
+                    
+                    # Check if SNP (single base ref and alt)
+                    if len(variant.REF) != 1:
+                        indels += 1
+                        continue
+                    
+                    if not variant.ALT or len(variant.ALT) == 0:
+                        continue
+                    
+                    first_alt = variant.ALT[0]
+                    if len(first_alt) != 1 or first_alt not in "ACGT":
+                        indels += 1
+                        continue
+                    
+                    # Count multi-allelic
+                    if len(variant.ALT) > 1:
+                        multi_allelic += 1
+                    
+                    # Create SNP (always use first alt)
+                    snp = SNP.from_vcf_record(
+                        chrom=variant.CHROM,
+                        pos=variant.POS,
+                        ref=variant.REF,
+                        alt=first_alt,
+                    )
+                    batch.append(snp)
+                    
+                    # Batch extend
+                    if len(batch) >= batch_size:
+                        snps.extend(batch)
+                        batch.clear()
         else:
-            # Fetch all
-            for record in self._vcf:
-                if self.is_biallelic_snp(record):
-                    yield self._record_to_snp(record)
-                elif force_biallelic and self._can_force_biallelic(record):
-                    yield self._record_to_snp(record, force_first_alt=True)
-    
-    def extract_snps_by_chromosome(
-        self,
-        chrom: str,
-    ) -> Result[list[SNP], str]:
-        """
-        Extract all SNPs from a specific chromosome.
+            # Fetch entire chromosome
+            for variant in vcf(chrom):
+                # Check if SNP (single base ref and alt)
+                if len(variant.REF) != 1:
+                    indels += 1
+                    continue
+                
+                if not variant.ALT or len(variant.ALT) == 0:
+                    continue
+                
+                first_alt = variant.ALT[0]
+                if len(first_alt) != 1 or first_alt not in "ACGT":
+                    indels += 1
+                    continue
+                
+                # Count multi-allelic
+                if len(variant.ALT) > 1:
+                    multi_allelic += 1
+                
+                # Create SNP (always use first alt)
+                snp = SNP.from_vcf_record(
+                    chrom=variant.CHROM,
+                    pos=variant.POS,
+                    ref=variant.REF,
+                    alt=first_alt,
+                )
+                batch.append(snp)
+                
+                # Batch extend
+                if len(batch) >= batch_size:
+                    snps.extend(batch)
+                    batch.clear()
         
-        Args:
-            chrom: Chromosome name
-            
-        Returns:
-            Ok(list of SNPs) on success, Err(message) on failure
-        """
-        try:
-            snps = list(self.fetch_snps(chrom=chrom))
-            return Ok(snps)
-        except Exception as e:
-            return Err(f"Failed to extract SNPs from {chrom}: {e}")
-    
-    @property
-    def chromosomes(self) -> list[str]:
-        """Get list of chromosomes in VCF."""
-        if self._vcf is None:
-            raise RuntimeError("VCF file not opened")
-        return list(self._vcf.header.contigs)
-
-
-def _extract_snps_for_chromosome(
-    vcf_path: Path,
-    chrom: str,
-    bed_path: Optional[Path],
-    force_biallelic: bool,
-) -> Tuple[str, List[SNP], int]:
-    """
-    Extract SNPs from a single chromosome (for multiprocessing).
-    
-    Args:
-        vcf_path: Path to VCF file
-        chrom: Chromosome name
-        bed_path: Optional BED file to filter regions
-        force_biallelic: Force biallelic mode
+        # Flush remaining batch
+        if batch:
+            snps.extend(batch)
+            batch.clear()
         
-    Returns:
-        Tuple of (chromosome, snp_list, non_biallelic_count)
-    """
-    logger.info(f"→ Processing chromosome {chrom}...")
-    
-    reader = VCFReader(vcf_path)
-    open_result = reader.open()
-    if open_result.is_err():
-        logger.error(f"Failed to open VCF for {chrom}: {open_result.unwrap_err()}")
-        return (chrom, [], 0)
-    
-    snps = []
-    non_biallelic = 0
-    
-    try:
-        for snp in reader.fetch_snps(chrom=chrom, bed_path=bed_path, force_biallelic=force_biallelic):
-            snps.append(snp)
-        
-        # Count non-biallelic variants if not forcing
-        if not force_biallelic:
-            for record in reader._vcf.fetch(chrom):
-                if not reader.is_biallelic_snp(record):
-                    non_biallelic += 1
-        
-        reader.close()
         logger.info(f"✓ Chromosome {chrom}: {len(snps)} SNPs extracted")
+        if multi_allelic > 0:
+            logger.info(f"  └─ {multi_allelic} multi-allelic sites (extracted first alt)")
+        if indels > 0:
+            logger.debug(f"  └─ {indels} indels skipped")
         
-        return (chrom, snps, non_biallelic)
+        return (chrom, snps, multi_allelic, indels)
         
     except Exception as e:
         logger.error(f"Error processing {chrom}: {e}")
-        reader.close()
-        return (chrom, [], 0)
+        return (chrom, [], 0, 0)
 
 
 def extract_snps_from_vcf(
     vcf_path: Path,
     bed_path: Optional[Path] = None,
-    force_biallelic: bool = False,
     threads: int = 1,
 ) -> Result[list[SNP], str]:
     """
-    Extract biallelic SNPs from VCF file (with multiprocessing).
+    Extract SNPs from VCF file using cyvcf2 (with multiprocessing).
+    
+    Always extracts first alt allele (alt[0]) for multi-allelic sites.
+    Skips indels (variants where REF or ALT length != 1).
     
     Args:
         vcf_path: Path to VCF file (.vcf.gz with .tbi index)
         bed_path: Optional BED file to filter regions
-        force_biallelic: If True, take first alt allele when multiple exist
         threads: Number of parallel processes (default: 1)
         
     Returns:
@@ -309,13 +176,9 @@ def extract_snps_from_vcf(
     """
     # Get chromosome list from VCF header
     try:
-        reader = VCFReader(vcf_path)
-        open_result = reader.open()
-        if open_result.is_err():
-            return Err(open_result.unwrap_err())
-        
-        chromosomes = reader.chromosomes
-        reader.close()
+        vcf = VCF(str(vcf_path))
+        chromosomes = vcf.seqnames
+        vcf.close()
         
         logger.info(f"Found {len(chromosomes)} chromosomes in VCF")
         logger.info(f"Using {threads} threads for parallel extraction")
@@ -324,16 +187,18 @@ def extract_snps_from_vcf(
         return Err(f"Failed to read VCF header: {e}")
     
     all_snps = []
-    total_non_biallelic = 0
+    total_multi_allelic = 0
+    total_indels = 0
     
     if threads == 1:
         # Serial processing
         for chrom in chromosomes:
-            chrom, snps, non_biallelic = _extract_snps_for_chromosome(
-                vcf_path, chrom, bed_path, force_biallelic
+            chrom_name, snps, multi_allelic, indels = _extract_snps_for_chromosome(
+                vcf_path, chrom, bed_path
             )
             all_snps.extend(snps)
-            total_non_biallelic += non_biallelic
+            total_multi_allelic += multi_allelic
+            total_indels += indels
     else:
         # Parallel processing by chromosome
         with ProcessPoolExecutor(max_workers=threads) as executor:
@@ -341,20 +206,24 @@ def extract_snps_from_vcf(
             for chrom in chromosomes:
                 future = executor.submit(
                     _extract_snps_for_chromosome,
-                    vcf_path, chrom, bed_path, force_biallelic
+                    vcf_path, chrom, bed_path
                 )
                 futures[future] = chrom
             
             for future in as_completed(futures):
                 chrom_name = futures[future]
                 try:
-                    chrom, snps, non_biallelic = future.result()
+                    chrom, snps, multi_allelic, indels = future.result()
                     all_snps.extend(snps)
-                    total_non_biallelic += non_biallelic
+                    total_multi_allelic += multi_allelic
+                    total_indels += indels
                 except Exception as e:
                     logger.error(f"Failed to process {chrom_name}: {e}")
     
-    if total_non_biallelic > 0 and not force_biallelic:
-        logger.warning(f"Skipped {total_non_biallelic} non-biallelic variants")
+    # Summary statistics
+    if total_multi_allelic > 0:
+        logger.warning(f"⚠ Found {total_multi_allelic} multi-allelic sites (extracted first alt allele)")
+    if total_indels > 0:
+        logger.info(f"Skipped {total_indels} indels (only SNPs extracted)")
     
     return Ok(all_snps)

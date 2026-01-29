@@ -24,7 +24,7 @@ import numpy as np
 import pysam
 
 from eprobe.core.result import Result, Ok, Err, try_except
-from eprobe.core.vcf import extract_snps_from_vcf, VCFReader
+from eprobe.core.vcf import extract_snps_from_vcf
 from eprobe.core.models import SNP
 
 logger = logging.getLogger(__name__)
@@ -269,20 +269,22 @@ def run_extract(
     max_cluster_snp: int = 3,
     bed_path: Optional[Path] = None,
     threads: int = 1,
-    force_biallelic: bool = False,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Extract SNPs from VCF file with flanking sequences (optimized).
     
+    Note: For multi-allelic sites, always extracts first alt allele (alt[0]).
+    
     Optimizations:
-    - Multiprocessing by chromosome (if threads > 1)
+    - Multiprocessing by chromosome (both VCF and reference)
+    - cyvcf2 for fast VCF parsing (2-3× faster than pysam)
     - On-demand reference loading with pysam (low memory)
     - O(n log n) clustering algorithm
-    - Batch DataFrame write
+    - Batch append and DataFrame write
     
     Args:
-        vcf_path: Input VCF file path
+        vcf_path: Input VCF file path (.vcf.gz with .tbi index)
         reference_path: Reference genome FASTA path (requires .fai index)
         output_prefix: Output file prefix
         flank: Flanking region length
@@ -291,7 +293,6 @@ def run_extract(
         max_cluster_snp: Maximum SNPs allowed in cluster window
         bed_path: Optional BED file to restrict regions
         threads: Number of parallel processes (recommended: num chromosomes)
-        force_biallelic: Force biallelic by taking first alt if multiple
         verbose: Enable verbose logging
         
     Returns:
@@ -301,7 +302,7 @@ def run_extract(
         logger.setLevel(logging.DEBUG)
     
     logger.info(f"Starting SNP extraction from {vcf_path}")
-    logger.info(f"Threads: {threads}, Force biallelic: {force_biallelic}")
+    logger.info(f"Using {threads} threads")
     
     # Check reference index exists
     fai_path = Path(str(reference_path) + ".fai")
@@ -310,7 +311,7 @@ def run_extract(
     
     # Step 1: Extract raw SNPs from VCF (with multiprocessing)
     logger.info("Extracting SNPs from VCF...")
-    vcf_result = extract_snps_from_vcf(vcf_path, bed_path, force_biallelic=force_biallelic, threads=threads)
+    vcf_result = extract_snps_from_vcf(vcf_path, bed_path, threads=threads)
     if vcf_result.is_err():
         return Err(f"VCF extraction failed: {vcf_result.unwrap_err()}")
     
