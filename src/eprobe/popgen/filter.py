@@ -182,7 +182,7 @@ def filter_background_noise(
             
             # Write probe sequences
             sequences = {
-                snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+                snp.id: snp.left_flank + snp.ref + snp.right_flank
                 for snp in snps
             }
             
@@ -203,7 +203,7 @@ def filter_background_noise(
             classified_ids = classified_result.unwrap()
     
     # Filter out classified SNPs
-    filtered_snps = [snp for snp in snps if snp.snp_id not in classified_ids]
+    filtered_snps = [snp for snp in snps if snp.id not in classified_ids]
     removed = len(snps) - len(filtered_snps)
     
     logger.info(f"Background filter: removed {removed} SNPs ({len(classified_ids)} matched noise)")
@@ -321,7 +321,7 @@ def filter_accessibility(
         
         # Write probe sequences
         sequences = {
-            snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+            snp.id: snp.left_flank + snp.ref + snp.right_flank
             for snp in snps
         }
         
@@ -342,7 +342,7 @@ def filter_accessibility(
         multi_mapping_ids = multi_map_result.unwrap()
     
     # Filter out multi-mapping SNPs
-    filtered_snps = [snp for snp in snps if snp.snp_id not in multi_mapping_ids]
+    filtered_snps = [snp for snp in snps if snp.id not in multi_mapping_ids]
     removed = len(snps) - len(filtered_snps)
     
     logger.info(f"Accessibility filter: removed {removed} multi-mapping SNPs")
@@ -795,7 +795,7 @@ def filter_taxonomy(
             # Fallback: create temporary FASTA
             working_fasta = tmpdir_path / "probes.fa"
             sequences = {
-                snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+                snp.id: snp.left_flank + snp.ref + snp.right_flank
                 for snp in snps
             }
             
@@ -856,7 +856,7 @@ def filter_taxonomy(
         assigned_ids = parse_result.unwrap()
     
     # Filter SNPs based on assignments
-    filtered_snps = [snp for snp in snps if snp.snp_id in assigned_ids]
+    filtered_snps = [snp for snp in snps if snp.id in assigned_ids]
     removed = len(snps) - len(filtered_snps)
     
     logger.info(f"Taxonomy filter: {len(assigned_ids)} sequences assigned to target taxa")
@@ -942,6 +942,36 @@ def run_filter(
     initial_count = len(snps)
     logger.info(f"Loaded {initial_count} SNPs")
     
+    # Add flanking sequences to SNPs
+    logger.info("Adding flanking sequences from reference genome")
+    from eprobe.core.fasta import read_fasta
+    
+    ref_result = read_fasta(reference_path)
+    if ref_result.is_err():
+        return Err(f"Failed to read reference: {ref_result.unwrap_err()}")
+    
+    ref_dict = ref_result.unwrap()
+    
+    # Add flanking sequences to each SNP
+    flank_size = (length - 1) // 2
+    for snp in snps:
+        if snp.chrom not in ref_dict:
+            # Set empty flanks for unknown chromosomes
+            snp.left_flank = ""
+            snp.right_flank = ""
+            continue
+        
+        chrom_seq = ref_dict[snp.chrom]
+        start_pos = max(0, snp.pos - 1 - flank_size)  # Convert to 0-based
+        end_pos = min(len(chrom_seq), snp.pos + flank_size)
+        
+        # Extract flanking regions
+        left_end = snp.pos - 1  # Position before SNP (0-based)
+        right_start = snp.pos  # Position after SNP (0-based)
+        
+        snp.left_flank = chrom_seq[start_pos:left_end] if left_end > start_pos else ""
+        snp.right_flank = chrom_seq[right_start:end_pos] if end_pos > right_start else ""
+
     stats = {
         "initial_count": initial_count,
         "filters_applied": [],
@@ -953,7 +983,7 @@ def run_filter(
     # Pre-compute probe sequences (optimization: compute once, use multiple times)
     logger.info("Pre-computing probe sequences")
     probe_sequences = {
-        snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+        snp.id: snp.left_flank + snp.ref + snp.right_flank
         for snp in snps
     }
     
@@ -981,7 +1011,7 @@ def run_filter(
             return Ok(None)
         
         updated_sequences = {
-            snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
+            snp.id: snp.left_flank + snp.ref + snp.right_flank
             for snp in current_snps
         }
         
