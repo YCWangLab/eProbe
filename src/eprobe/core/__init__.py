@@ -7,7 +7,6 @@ Contains fundamental data structures, result types, and shared utilities.
 from eprobe.core.result import Result, Ok, Err
 from eprobe.core.models import SNP, SNPDataFrame, Probe, ProbeSet
 from eprobe.core.fasta import read_fasta, write_fasta, FastaDict
-from eprobe.core.vcf import VCFReader
 
 __all__ = [
     "Result",
@@ -20,5 +19,4 @@ __all__ = [
     "read_fasta",
     "write_fasta",
     "FastaDict",
-    "VCFReader",
 ]
