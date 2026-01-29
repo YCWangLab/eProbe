@@ -22,6 +22,55 @@ from eprobe.core.models import SNP
 logger = logging.getLogger(__name__)
 
 
+def count_snps_in_vcf(vcf_path: Path, threads: int = 1) -> Result[int, str]:
+    """
+    Fast count of total biallelic SNPs in VCF file.
+    
+    Only counts, does not extract SNP data. Much faster than full extraction.
+    
+    Args:
+        vcf_path: Path to VCF file (.vcf.gz with .tbi index)
+        threads: Number of parallel processes
+        
+    Returns:
+        Result containing total SNP count
+    """
+    try:
+        vcf = VCF(str(vcf_path))
+        chromosomes = vcf.seqnames
+        vcf.close()
+    except Exception as e:
+        return Err(f"Failed to read VCF: {e}")
+    
+    def _count_snps_for_chrom(vcf_path: Path, chrom: str) -> int:
+        """Count SNPs in one chromosome."""
+        count = 0
+        try:
+            vcf = VCF(str(vcf_path))
+            for variant in vcf(chrom):
+                # Check if biallelic SNP
+                if len(variant.REF) == 1 and variant.ALT and len(variant.ALT) > 0:
+                    first_alt = variant.ALT[0]
+                    if len(first_alt) == 1 and first_alt in "ACGT":
+                        count += 1
+            vcf.close()
+        except Exception:
+            pass
+        return count
+    
+    total = 0
+    if threads == 1:
+        for chrom in chromosomes:
+            total += _count_snps_for_chrom(vcf_path, chrom)
+    else:
+        with ProcessPoolExecutor(max_workers=threads) as executor:
+            futures = [executor.submit(_count_snps_for_chrom, vcf_path, chrom) for chrom in chromosomes]
+            for future in as_completed(futures):
+                total += future.result()
+    
+    return Ok(total)
+
+
 def invert_bed_regions(bed_path: Path, fai_path: Path) -> List[Tuple[str, int, int]]:
     """
     Generate inverted BED regions (complement of input BED).
@@ -235,7 +284,7 @@ def extract_snps_from_vcf(
         threads: Number of parallel processes (default: 1)
         
     Returns:
-        Result containing list of SNPs
+        Result containing dict with keys: 'snps', 'bed_mode', 'total_before_bed', 'total_after_bed'
     """
     # Get chromosome list from VCF header
     try:
@@ -251,6 +300,9 @@ def extract_snps_from_vcf(
     
     # Process BED regions based on mode
     bed_regions = None
+    bed_applied = bed_path is not None
+    bed_mode_used = bed_mode if bed_applied else None
+    
     if bed_path:
         if bed_mode == "remove":
             # Generate inverted BED for remove mode
@@ -316,4 +368,10 @@ def extract_snps_from_vcf(
     if total_indels > 0:
         logger.info(f"Skipped {total_indels} indels (only SNPs extracted)")
     
-    return Ok(all_snps)
+    result = {
+        'snps': all_snps,
+        'bed_applied': bed_applied,
+        'bed_mode': bed_mode_used,
+    }
+    
+    return Ok(result)

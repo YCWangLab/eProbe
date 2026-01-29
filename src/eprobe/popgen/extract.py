@@ -24,7 +24,7 @@ import numpy as np
 import pysam
 
 from eprobe.core.result import Result, Ok, Err, try_except
-from eprobe.core.vcf import extract_snps_from_vcf
+from eprobe.core.vcf import extract_snps_from_vcf, count_snps_in_vcf
 from eprobe.core.models import SNP
 
 logger = logging.getLogger(__name__)
@@ -309,7 +309,23 @@ def run_extract(
     if not fai_path.exists():
         return Err(f"Reference index not found: {fai_path}. Run 'samtools faidx {reference_path}'")
     
-    # Step 1: Extract raw SNPs from VCF (with multiprocessing)
+    # Check VCF index exists
+    vcf_index = Path(str(vcf_path) + ".tbi")
+    if not vcf_index.exists():
+        return Err(f"VCF index not found: {vcf_index}. Run 'tabix -p vcf {vcf_path}'")
+    
+    # Step 1a: Fast count total SNPs in VCF (for BED filter statistics)
+    total_snps_in_vcf = None
+    if bed_path:
+        logger.info("Counting total SNPs in VCF (fast scan)...")
+        count_result = count_snps_in_vcf(vcf_path, threads=threads)
+        if count_result.is_ok():
+            total_snps_in_vcf = count_result.unwrap()
+            logger.info(f"Total SNPs in VCF: {total_snps_in_vcf:,}")
+        else:
+            logger.warning(f"Failed to count SNPs: {count_result.unwrap_err()}")
+    
+    # Step 1b: Extract raw SNPs from VCF (with BED filtering if specified)
     logger.info("Extracting SNPs from VCF...")
     vcf_result = extract_snps_from_vcf(
         vcf_path, bed_path, bed_mode, fai_path=fai_path, threads=threads
@@ -317,7 +333,11 @@ def run_extract(
     if vcf_result.is_err():
         return Err(f"VCF extraction failed: {vcf_result.unwrap_err()}")
     
-    raw_snps = vcf_result.unwrap()
+    vcf_data = vcf_result.unwrap()
+    raw_snps = vcf_data['snps']
+    bed_applied = vcf_data['bed_applied']
+    bed_mode_applied = vcf_data['bed_mode']
+    
     logger.info(f"Extracted {len(raw_snps)} SNPs from VCF")
     
     if not raw_snps:
@@ -378,6 +398,13 @@ def run_extract(
         "final_snp_count": len(final_snps),
         "cluster_removed": len(snps_with_flanks) - len(final_snps) if cluster_mode else 0,
         "output_file": str(output_path),
+        # BED filter statistics
+        "bed_applied": bed_applied,
+        "bed_mode": bed_mode_applied,
+        "total_snps_in_vcf": total_snps_in_vcf,
+        "bed_kept": len(raw_snps) if bed_applied else None,
+        "bed_removed": (total_snps_in_vcf - len(raw_snps)) if bed_applied and total_snps_in_vcf else None,
+    }
     }
     
     return Ok(stats)

@@ -53,7 +53,7 @@ def popgen(ctx: click.Context) -> None:
     "-v", "--vcf",
     required=True,
     type=click.Path(exists=True, path_type=Path),
-    help="Input VCF file (compressed .vcf.gz with .tbi index).",
+    help="Input VCF file (MUST be bgzip compressed .vcf.gz with tabix index .tbi).",
 )
 @click.option(
     "-r", "--reference",
@@ -150,6 +150,13 @@ def extract(
     
     verbose = ctx.obj.get("verbose", False)
     
+    # Check VCF index exists
+    vcf_index = Path(str(vcf) + ".tbi")
+    if not vcf_index.exists():
+        echo_error(f"VCF index not found: {vcf_index}")
+        echo_error("Please create index with: tabix -p vcf {vcf}")
+        raise SystemExit(1)
+    
     # Report BED filtering step
     if keep_bed and remove_bed:
         echo_error("Cannot use both --keep_bed and --remove_bed simultaneously")
@@ -179,6 +186,7 @@ def extract(
         max_cluster_snp=max_cluster_snp,
         cluster_mode=cluster_filter,
         bed_path=bed_path_used,
+        bed_mode=bed_filter_type if bed_filter_type else "keep",
         verbose=verbose,
     )
     
@@ -188,16 +196,36 @@ def extract(
     
     stats = result.unwrap()
     
-    # Step 2: Report SNP extraction
-    echo_success(f"→ Step 2: Extracted {stats['raw_snp_count']} SNPs")
+    # Step 2: Report BED filtering (if applied)
+    if stats.get('bed_applied'):
+        bed_mode = stats.get('bed_mode')
+        total_vcf = stats.get('total_snps_in_vcf')
+        kept = stats.get('bed_kept')
+        removed = stats.get('bed_removed')
+        
+        if bed_mode == 'keep':
+            echo_success(f"→ Step 2: BED filter (--keep_bed)")
+            echo_info(f"  ├─ Total SNPs in VCF: {total_vcf:,}")
+            echo_info(f"  ├─ Kept (in BED regions): {kept:,}")
+            echo_info(f"  └─ Removed (outside BED): {removed:,}")
+        elif bed_mode == 'remove':
+            echo_success(f"→ Step 2: BED filter (--remove_bed)")
+            echo_info(f"  ├─ Total SNPs in VCF: {total_vcf:,}")
+            echo_info(f"  ├─ Removed (in BED regions): {removed:,}")
+            echo_info(f"  └─ Kept (outside BED): {kept:,}")
+    else:
+        echo_success(f"→ Step 2: Extracted {stats['raw_snp_count']:,} SNPs from VCF")
     
     # Step 3: Report cluster filtering
     if cluster_filter:
         filtered_count = stats.get('cluster_removed', 0)
         final_count = stats['final_snp_count']
-        echo_success(f"→ Step 3: Filtered {filtered_count} SNPs in clusters")
-        echo_info(f"  └─ Final: {final_count} SNPs")
+        echo_success(f"→ Step 3: Cluster filter")
+        echo_info(f"  ├─ Removed (in clusters): {filtered_count:,}")
+        echo_info(f"  └─ Final output: {final_count:,} SNPs")
     else:
+        final_count = stats['final_snp_count']
+        echo_success(f"→ Step 3: Final output: {final_count:,} SNPs")
         echo_info(f"  └─ Cluster filtering disabled")
     
     echo_info(f"Output: {stats['output_file']}")
