@@ -22,6 +22,23 @@ from eprobe.core.models import SNP
 logger = logging.getLogger(__name__)
 
 
+def _count_snps_for_chrom(vcf_path: Path, chrom: str) -> int:
+    """Count biallelic SNPs in one chromosome."""
+    count = 0
+    try:
+        vcf = VCF(str(vcf_path))
+        for variant in vcf(chrom):
+            # Check if biallelic SNP
+            if len(variant.REF) == 1 and variant.ALT and len(variant.ALT) > 0:
+                first_alt = variant.ALT[0]
+                if len(first_alt) == 1 and first_alt in "ACGT":
+                    count += 1
+        vcf.close()
+    except Exception:
+        pass
+    return count
+
+
 def count_snps_in_vcf(vcf_path: Path, threads: int = 1) -> Result[int, str]:
     """
     Fast count of total biallelic SNPs in VCF file.
@@ -41,22 +58,6 @@ def count_snps_in_vcf(vcf_path: Path, threads: int = 1) -> Result[int, str]:
         vcf.close()
     except Exception as e:
         return Err(f"Failed to read VCF: {e}")
-    
-    def _count_snps_for_chrom(vcf_path: Path, chrom: str) -> int:
-        """Count SNPs in one chromosome."""
-        count = 0
-        try:
-            vcf = VCF(str(vcf_path))
-            for variant in vcf(chrom):
-                # Check if biallelic SNP
-                if len(variant.REF) == 1 and variant.ALT and len(variant.ALT) > 0:
-                    first_alt = variant.ALT[0]
-                    if len(first_alt) == 1 and first_alt in "ACGT":
-                        count += 1
-            vcf.close()
-        except Exception:
-            pass
-        return count
     
     total = 0
     if threads == 1:
