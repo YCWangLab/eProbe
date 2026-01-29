@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple, Optional
 import logging
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from cyvcf2 import VCF
@@ -66,43 +67,46 @@ def _extract_snps_for_chromosome(
         # Fetch variants
         if regions:
             # Filter by BED regions
-            for region_chrom, region_start, region_end in regions:
-                if region_chrom != chrom:
-                    continue
-                for variant in vcf(f"{region_chrom}:{region_start}-{region_end}"):
-                    if variant.CHROM != chrom:
+            # Suppress cyvcf2 warnings for empty intervals
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="no intervals found")
+                for region_chrom, region_start, region_end in regions:
+                    if region_chrom != chrom:
                         continue
-                    
-                    # Check if SNP (single base ref and alt)
-                    if len(variant.REF) != 1:
-                        indels += 1
-                        continue
-                    
-                    if not variant.ALT or len(variant.ALT) == 0:
-                        continue
-                    
-                    first_alt = variant.ALT[0]
-                    if len(first_alt) != 1 or first_alt not in "ACGT":
-                        indels += 1
-                        continue
-                    
-                    # Count multi-allelic
-                    if len(variant.ALT) > 1:
-                        multi_allelic += 1
-                    
-                    # Create SNP (always use first alt)
-                    snp = SNP.from_vcf_record(
-                        chrom=variant.CHROM,
-                        pos=variant.POS,
-                        ref=variant.REF,
-                        alt=first_alt,
-                    )
-                    batch.append(snp)
-                    
-                    # Batch extend
-                    if len(batch) >= batch_size:
-                        snps.extend(batch)
-                        batch.clear()
+                    for variant in vcf(f"{region_chrom}:{region_start}-{region_end}"):
+                        if variant.CHROM != chrom:
+                            continue
+                        
+                        # Check if SNP (single base ref and alt)
+                        if len(variant.REF) != 1:
+                            indels += 1
+                            continue
+                        
+                        if not variant.ALT or len(variant.ALT) == 0:
+                            continue
+                        
+                        first_alt = variant.ALT[0]
+                        if len(first_alt) != 1 or first_alt not in "ACGT":
+                            indels += 1
+                            continue
+                        
+                        # Count multi-allelic
+                        if len(variant.ALT) > 1:
+                            multi_allelic += 1
+                        
+                        # Create SNP (always use first alt)
+                        snp = SNP.from_vcf_record(
+                            chrom=variant.CHROM,
+                            pos=variant.POS,
+                            ref=variant.REF,
+                            alt=first_alt,
+                        )
+                        batch.append(snp)
+                        
+                        # Batch extend
+                        if len(batch) >= batch_size:
+                            snps.extend(batch)
+                            batch.clear()
         else:
             # Fetch entire chromosome
             for variant in vcf(chrom):
