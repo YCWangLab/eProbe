@@ -175,6 +175,79 @@ def parse_kraken_output(output_path: Path) -> Result[Set[str], str]:
         return Err(f"Failed to parse Kraken output: {e}")
 
 
+def display_kraken_summary(kraken_output_file: Path, max_examples: int = 10) -> None:
+    """
+    Display summary statistics from kraken2 main output file.
+    
+    Args:
+        kraken_output_file: Path to kraken2 main output
+        max_examples: Maximum number of example sequences to show
+    """
+    try:
+        classified_count = 0
+        unclassified_count = 0
+        taxon_counts = {}
+        classified_examples = []
+        unclassified_examples = []
+        
+        logger.info("=== Kraken2 Analysis Summary ===")
+        
+        with open(kraken_output_file, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                    
+                parts = line.strip().split('\t')
+                if len(parts) < 3:
+                    continue
+                    
+                status = parts[0]  # 'C' or 'U'
+                seq_id = parts[1]
+                taxon_id = parts[2] if len(parts) > 2 else "0"
+                
+                if status == 'C':
+                    classified_count += 1
+                    if taxon_id in taxon_counts:
+                        taxon_counts[taxon_id] += 1
+                    else:
+                        taxon_counts[taxon_id] = 1
+                    
+                    if len(classified_examples) < max_examples:
+                        seq_len = parts[3] if len(parts) > 3 else "unknown"
+                        class_path = parts[4] if len(parts) > 4 else ""
+                        classified_examples.append((seq_id, taxon_id, seq_len, class_path))
+                        
+                elif status == 'U':
+                    unclassified_count += 1
+                    if len(unclassified_examples) < max_examples:
+                        unclassified_examples.append(seq_id)
+        
+        total = classified_count + unclassified_count
+        logger.info(f"Total sequences analyzed: {total}")
+        logger.info(f"  - Classified: {classified_count} ({classified_count/total*100:.1f}%)")
+        logger.info(f"  - Unclassified: {unclassified_count} ({unclassified_count/total*100:.1f}%)")
+        
+        if taxon_counts:
+            logger.info(f"Top taxa (by sequence count):")
+            sorted_taxa = sorted(taxon_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            for taxon_id, count in sorted_taxa:
+                logger.info(f"  - Taxon {taxon_id}: {count} sequences")
+        
+        if classified_examples:
+            logger.info(f"Classified examples (first {len(classified_examples)}):")
+            for seq_id, taxon_id, seq_len, class_path in classified_examples:
+                path_preview = class_path[:50] + "..." if len(class_path) > 50 else class_path
+                logger.info(f"  - {seq_id}: taxon={taxon_id}, len={seq_len}, path={path_preview}")
+        
+        if unclassified_examples:
+            logger.info(f"Unclassified examples: {', '.join(unclassified_examples[:5])}")
+        
+        logger.info("=" * 40)
+        
+    except Exception as e:
+        logger.warning(f"Could not parse kraken output for summary: {e}")
+
+
 def filter_background_noise(
     snps: List[SNP],
     db_path: Path,
@@ -204,7 +277,7 @@ def filter_background_noise(
     # Use shared FASTA or create temporary one
     if fasta_path is not None:
         # Use shared FASTA (optimization)
-        output_path = fasta_path.parent / "kraken2.out"
+        output_path = fasta_path.parent / "kraken2_main.out"
         
         kraken_result = run_kraken2(fasta_path, db_path, output_path, threads)
         if kraken_result.is_err():
@@ -216,11 +289,18 @@ def filter_background_noise(
         
         classified_ids = classified_result.unwrap()
         
+        # DO NOT delete kraken2 files - keep them for analysis
+        logger.info(f"Kraken2 output files preserved in: {fasta_path.parent}")
+        logger.info(f"  - Main output: {output_path}")
+        logger.info(f"  - Report: {fasta_path.parent / 'kraken2.report'}")
+        logger.info(f"  - Classified: {fasta_path.parent / 'kraken2.classified.fasta'}")
+        logger.info(f"  - Unclassified: {fasta_path.parent / 'kraken2.unclassified.fasta'}")
+        
     else:
-        # Fallback: create temporary FASTA
+        # Fallback: create temporary FASTA but save kraken2 outputs permanently
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_fasta_path = Path(tmpdir) / "probes.fa"
-            output_path = Path(tmpdir) / "kraken2.out"
+            temp_output_path = Path(tmpdir) / "kraken2_main.out"
             
             # Write probe sequences
             sequences = {
@@ -233,22 +313,55 @@ def filter_background_noise(
                 return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
             
             # Run Kraken2
-            kraken_result = run_kraken2(temp_fasta_path, db_path, output_path, threads)
+            kraken_result = run_kraken2(temp_fasta_path, db_path, temp_output_path, threads)
             if kraken_result.is_err():
                 return Err(kraken_result.unwrap_err())
             
             # Parse results
-            classified_result = parse_kraken_output(output_path)
+            classified_result = parse_kraken_output(temp_output_path)
             if classified_result.is_err():
                 return Err(classified_result.unwrap_err())
             
             classified_ids = classified_result.unwrap()
+            
+            # Copy kraken2 output files to permanent location (current working directory)
+            permanent_dir = Path.cwd()
+            kraken_files = [
+                ("kraken2_main.out", temp_output_path),
+                ("kraken2.report", Path(tmpdir) / "kraken2.report"),
+                ("kraken2.classified.fasta", Path(tmpdir) / "kraken2.classified.fasta"),
+                ("kraken2.unclassified.fasta", Path(tmpdir) / "kraken2.unclassified.fasta")
+            ]
+            
+            logger.info(f"Copying Kraken2 output files to: {permanent_dir}")
+            for perm_name, temp_file in kraken_files:
+                if temp_file.exists():
+                    perm_path = permanent_dir / perm_name
+                    import shutil
+                    shutil.copy2(temp_file, perm_path)
+                    logger.info(f"  ✓ Saved: {perm_path}")
+                else:
+                    logger.warning(f"  ✗ Missing: {temp_file}")
     
     # Filter out classified SNPs
     filtered_snps = [snp for snp in snps if snp.id not in classified_ids]
     removed = len(snps) - len(filtered_snps)
     
     logger.info(f"Background filter: removed {removed} SNPs ({len(classified_ids)} matched noise)")
+    
+    # Generate and display kraken2 analysis summary
+    try:
+        if 'permanent_dir' in locals():
+            kraken_main_file = permanent_dir / "kraken2_main.out"
+        elif 'output_path' in locals():
+            kraken_main_file = output_path
+        else:
+            kraken_main_file = None
+            
+        if kraken_main_file and kraken_main_file.exists():
+            display_kraken_summary(kraken_main_file)
+    except Exception as e:
+        logger.warning(f"Could not display kraken summary: {e}")
     
     return Ok(filtered_snps)
 
