@@ -1172,7 +1172,7 @@ def run_filter(
             
             for idx, db_path in enumerate(bg_databases, 1):
                 logger.info(f"Background filter {idx}/{len(bg_databases)}: {db_path.name}")
-                result = filter_background_noise(snps, db_path, fasta_path, threads, output_path.parent)
+                result = filter_background_noise(snps, db_path, fasta_path, threads, output_prefix.parent)
                 if result.is_err():
                     return Err(result.unwrap_err())
                 snps = result.unwrap()
