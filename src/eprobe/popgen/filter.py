@@ -144,108 +144,125 @@ def run_kraken2(
         return Err(f"Kraken2 execution error: {e}")
 
 
-def parse_kraken_output(output_path: Path) -> Result[Set[str], str]:
+def parse_kraken_kmer_matches(output_path: Path, match_threshold: int = 10) -> Result[tuple[Set[str], Dict[str, int]], str]:
     """
-    Parse Kraken2 output and return classified sequence IDs.
+    Parse Kraken2 output as simple kmer matcher (ignore taxonomy classification).
+    
+    Counts how many kmers match to non-zero taxid in column 5.
+    Column 5 format: "taxid:count taxid:count ..."
+    Examples:
+        - "0:35 586:1 0:29"  -> 1 kmer matched (586:1)
+        - "562:15 0:50 585:8" -> 23 kmers matched (15+8)
+        - "0:65"              -> 0 kmers matched
+        - "A:35 0:30"         -> 0 kmers matched (A=ambiguous, not real match)
     
     Args:
-        output_path: Kraken2 output file
+        output_path: Kraken2 main output file
+        match_threshold: Remove sequences with >= this many matched kmers
         
     Returns:
-        Result containing set of classified sequence IDs
+        Tuple of (sequences_to_remove, kmer_match_counts)
+        - sequences_to_remove: Set of sequence IDs exceeding threshold
+        - kmer_match_counts: Dict {seq_id: matched_kmer_count}
     """
     try:
-        classified_ids = set()
+        sequences_to_remove = set()
+        kmer_match_counts = {}
         
         with open(output_path, 'r') as f:
             for line in f:
-                if line.strip():
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 2:
-                        classification = parts[0]  # 'C' or 'U'
-                        seq_id = parts[1]
-                        
-                        if classification == 'C':  # Classified
-                            classified_ids.add(seq_id)
-        
-        logger.info(f"Parsed Kraken2 output: {len(classified_ids)} classified sequences")
-        return Ok(classified_ids)
-        
-    except Exception as e:
-        return Err(f"Failed to parse Kraken output: {e}")
-
-
-def display_kraken_summary(kraken_output_file: Path, max_examples: int = 10) -> None:
-    """
-    Display summary statistics from kraken2 main output file.
-    
-    Args:
-        kraken_output_file: Path to kraken2 main output
-        max_examples: Maximum number of example sequences to show
-    """
-    try:
-        classified_count = 0
-        unclassified_count = 0
-        taxon_counts = {}
-        classified_examples = []
-        unclassified_examples = []
-        
-        logger.info("=== Kraken2 Analysis Summary ===")
-        
-        with open(kraken_output_file, 'r') as f:
-            for line_num, line in enumerate(f, 1):
                 if not line.strip():
                     continue
-                    
-                parts = line.strip().split('\t')
-                if len(parts) < 3:
-                    continue
-                    
-                status = parts[0]  # 'C' or 'U'
-                seq_id = parts[1]
-                taxon_id = parts[2] if len(parts) > 2 else "0"
                 
-                if status == 'C':
-                    classified_count += 1
-                    if taxon_id in taxon_counts:
-                        taxon_counts[taxon_id] += 1
-                    else:
-                        taxon_counts[taxon_id] = 1
+                parts = line.strip().split('\t')
+                if len(parts) < 5:
+                    continue
+                
+                seq_id = parts[1]
+                lca_mappings = parts[4]  # Column 5: kmer match details
+                
+                # Count kmers matched to database (non-zero, non-ambiguous taxid)
+                matched_kmers = 0
+                
+                for mapping in lca_mappings.split():
+                    if ':' not in mapping:
+                        continue
                     
-                    if len(classified_examples) < max_examples:
-                        seq_len = parts[3] if len(parts) > 3 else "unknown"
-                        class_path = parts[4] if len(parts) > 4 else ""
-                        classified_examples.append((seq_id, taxon_id, seq_len, class_path))
+                    try:
+                        taxid_str, count_str = mapping.split(':', 1)
                         
-                elif status == 'U':
-                    unclassified_count += 1
-                    if len(unclassified_examples) < max_examples:
-                        unclassified_examples.append(seq_id)
+                        # Skip special markers
+                        if taxid_str in ['0', 'A']:  # 0=unassigned, A=ambiguous
+                            continue
+                        
+                        # Count real database matches (taxid > 0)
+                        taxid = int(taxid_str)
+                        count = int(count_str)
+                        
+                        if taxid > 0:
+                            matched_kmers += count
+                            
+                    except (ValueError, IndexError):
+                        continue
+                
+                kmer_match_counts[seq_id] = matched_kmers
+                
+                # Mark for removal if exceeds threshold
+                if matched_kmers >= match_threshold:
+                    sequences_to_remove.add(seq_id)
         
-        total = classified_count + unclassified_count
-        logger.info(f"Total sequences analyzed: {total}")
-        logger.info(f"  - Classified: {classified_count} ({classified_count/total*100:.1f}%)")
-        logger.info(f"  - Unclassified: {unclassified_count} ({unclassified_count/total*100:.1f}%)")
+        logger.info(f"Kmer match analysis: {len(kmer_match_counts)} sequences analyzed")
+        logger.info(f"Match threshold: {match_threshold} kmers")
+        logger.info(f"Sequences to remove: {len(sequences_to_remove)} (>= {match_threshold} matched kmers)")
         
-        if taxon_counts:
-            logger.info(f"Top taxa (by sequence count):")
-            sorted_taxa = sorted(taxon_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            for taxon_id, count in sorted_taxa:
-                logger.info(f"  - Taxon {taxon_id}: {count} sequences")
-        
-        if classified_examples:
-            logger.info(f"Classified examples (first {len(classified_examples)}):")
-            for seq_id, taxon_id, seq_len, class_path in classified_examples:
-                path_preview = class_path[:50] + "..." if len(class_path) > 50 else class_path
-                logger.info(f"  - {seq_id}: taxon={taxon_id}, len={seq_len}, path={path_preview}")
-        
-        if unclassified_examples:
-            logger.info(f"Unclassified examples: {', '.join(unclassified_examples[:5])}")
-        
-        logger.info("=" * 40)
+        return Ok((sequences_to_remove, kmer_match_counts))
         
     except Exception as e:
-        logger.warning(f"Could not parse kraken output for summary: {e}")
+        return Err(f"Failed to parse kraken kmer matches: {e}")
+
+
+def display_kraken_summary(kmer_match_counts: Dict[str, int], match_threshold: int) -> None:
+    """
+    Display kmer match statistics summary.
+    
+    Args:
+        kmer_match_counts: Dict {seq_id: matched_kmer_count}
+        match_threshold: Threshold used for filtering
+    """
+    if not kmer_match_counts:
+        return
+    
+    matched_counts = list(kmer_match_counts.values())
+    total_seqs = len(matched_counts)
+    
+    logger.info("=" * 60)
+    logger.info("=== Kraken2 Kmer Match Analysis ===")
+    logger.info(f"Total sequences: {total_seqs}")
+    logger.info(f"Filtering threshold: >= {match_threshold} matched kmers")
+    
+    logger.info(f"\nMatched kmer statistics:")
+    logger.info(f"  Min:    {min(matched_counts)}")
+    logger.info(f"  Max:    {max(matched_counts)}")
+    logger.info(f"  Mean:   {sum(matched_counts)/len(matched_counts):.1f}")
+    logger.info(f"  Median: {sorted(matched_counts)[len(matched_counts)//2]}")
+    
+    # Distribution
+    bins = [(0, 0), (1, 5), (6, 10), (11, 20), (21, 50), (51, float('inf'))]
+    logger.info(f"\nMatch distribution:")
+    for low, high in bins:
+        if high == float('inf'):
+            count = sum(1 for c in matched_counts if c > low)
+            label = f"  >{low:>3} kmers"
+        elif low == high:
+            count = sum(1 for c in matched_counts if c == low)
+            label = f"  {low:>3} kmers "
+        else:
+            count = sum(1 for c in matched_counts if low <= c <= high)
+            label = f"  {low:>3}-{high:<3}   "
+        pct = count / total_seqs * 100
+        logger.info(f"{label}: {count:>6} seqs ({pct:>5.1f}%)")
+    
+    logger.info("=" * 60)
 
 
 def filter_background_noise(
@@ -253,20 +270,20 @@ def filter_background_noise(
     db_path: Path,
     fasta_path: Optional[Path] = None,
     threads: int = 1,
-    output_dir: Optional[Path] = None,
+    kmer_threshold: int = 10,
 ) -> Result[List[SNP], str]:
     """
-    Filter SNPs whose probe sequences match background database.
+    Filter SNPs using Kraken2 as simple kmer matcher (ignore taxonomy).
     
-    Uses Kraken2 to identify sequences that match contaminant/noise database.
-    SNPs with matching sequences are removed.
+    Removes sequences with >= kmer_threshold kmers matching background database.
+    Kraken2 column 5 analysis: counts kmers matching non-zero taxid.
     
     Args:
         snps: Input SNP list
         db_path: Kraken2 database path
-        fasta_path: Optional pre-computed FASTA file (optimization)
+        fasta_path: Optional pre-computed FASTA file
         threads: Number of threads
-        output_dir: Directory to save kraken2 output files (if None, uses cwd)
+        kmer_threshold: Remove sequences with >= this many matched kmers (default: 10)
         
     Returns:
         Result containing filtered SNP list
@@ -274,75 +291,76 @@ def filter_background_noise(
     if not snps:
         return Ok([])
     
-    logger.info(f"Running background noise filter (Kraken2) on {len(snps)} SNPs")
-    
-    # Determine output directory for kraken2 files
-    if output_dir is None:
-        output_dir = Path.cwd()
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Always save kraken2 output to the specified output directory
-    kraken_output_path = output_dir / "kraken2_main.out"
+    logger.info(f"Running background noise filter (Kraken2 kmer matching)")
+    logger.info(f"Filtering threshold: >= {kmer_threshold} matched kmers")
+    logger.info(f"Processing {len(snps)} SNPs")
     
     # Use shared FASTA or create temporary one
-    if fasta_path is not None:
-        # Use shared FASTA
+    cleanup_fasta = False
+    if fasta_path is None:
+        # Create temporary FASTA
+        import tempfile
+        temp_fasta = tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False)
+        fasta_path = Path(temp_fasta.name)
+        cleanup_fasta = True
+        
+        sequences = {snp.id: probe_sequences[snp.id] for snp in snps}
+        write_result = write_fasta(sequences, fasta_path)
+        if write_result.is_err():
+            return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
+    
+    # Create temporary output file
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.kraken.out', delete=False) as temp_out:
+        kraken_output_path = Path(temp_out.name)
+    
+    try:
+        # Run Kraken2
         kraken_result = run_kraken2(fasta_path, db_path, kraken_output_path, threads)
         if kraken_result.is_err():
             return Err(kraken_result.unwrap_err())
         
-        classified_result = parse_kraken_output(kraken_output_path)
-        if classified_result.is_err():
-            return Err(classified_result.unwrap_err())
+        # Parse kmer matches
+        parse_result = parse_kraken_kmer_matches(kraken_output_path, kmer_threshold)
+        if parse_result.is_err():
+            return Err(parse_result.unwrap_err())
         
-        classified_ids = classified_result.unwrap()
+        sequences_to_remove, kmer_match_counts = parse_result.unwrap()
         
-    else:
-        # Fallback: create temporary FASTA
-        with tempfile.TemporaryDirectory() as tmpdir:
-            temp_fasta_path = Path(tmpdir) / "probes.fa"
+        # Display statistics
+        display_kraken_summary(kmer_match_counts, kmer_threshold)
+        
+        # Filter SNPs
+        filtered_snps = [snp for snp in snps if snp.id not in sequences_to_remove]
+        removed = len(snps) - len(filtered_snps)
+        
+        logger.info(f"Background filter: removed {removed} SNPs, {len(filtered_snps)} remaining")
+        
+        return Ok(filtered_snps)
+        
+    finally:
+        # Clean up temporary files
+        try:
+            if cleanup_fasta and fasta_path.exists():
+                fasta_path.unlink()
+                logger.debug(f"Cleaned up temp FASTA: {fasta_path}")
             
-            # Write probe sequences
-            sequences = {
-                snp.id: probe_sequences[snp.id]
-                for snp in snps
-            }
+            if kraken_output_path.exists():
+                kraken_output_path.unlink()
+                logger.debug(f"Cleaned up kraken output: {kraken_output_path}")
             
-            write_result = write_fasta(sequences, temp_fasta_path)
-            if write_result.is_err():
-                return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
+            # Clean up additional kraken files
+            report_path = kraken_output_path.parent / "kraken2.report"
+            classified_path = kraken_output_path.parent / "kraken2.classified.fasta"
+            unclassified_path = kraken_output_path.parent / "kraken2.unclassified.fasta"
             
-            # Run Kraken2 - output to permanent location
-            kraken_result = run_kraken2(temp_fasta_path, db_path, kraken_output_path, threads)
-            if kraken_result.is_err():
-                return Err(kraken_result.unwrap_err())
-            
-            # Parse results
-            classified_result = parse_kraken_output(kraken_output_path)
-            if classified_result.is_err():
-                return Err(classified_result.unwrap_err())
-            
-            classified_ids = classified_result.unwrap()
-    
-    # Log saved kraken2 files
-    logger.info(f"Kraken2 output files saved to: {output_dir}")
-    logger.info(f"  - Main output: {kraken_output_path}")
-    logger.info(f"  - Report: {output_dir / 'kraken2.report'}")
-    logger.info(f"  - Classified: {output_dir / 'kraken2.classified.fasta'}")
-    logger.info(f"  - Unclassified: {output_dir / 'kraken2.unclassified.fasta'}")
-    
-    # Filter out classified SNPs
-    filtered_snps = [snp for snp in snps if snp.id not in classified_ids]
-    removed = len(snps) - len(filtered_snps)
-    
-    logger.info(f"Background filter: removed {removed} SNPs ({len(classified_ids)} matched noise)")
-    
-    # Generate and display kraken2 analysis summary
-    if kraken_output_path.exists():
-        display_kraken_summary(kraken_output_path)
-    
-    return Ok(filtered_snps)
+            for cleanup_file in [report_path, classified_path, unclassified_path]:
+                if cleanup_file.exists():
+                    cleanup_file.unlink()
+                    logger.debug(f"Cleaned up: {cleanup_file}")
+                    
+        except Exception as e:
+            logger.warning(f"Failed to clean up temporary files: {e}")
 
 
 # =============================================================================
@@ -1172,7 +1190,7 @@ def run_filter(
             
             for idx, db_path in enumerate(bg_databases, 1):
                 logger.info(f"Background filter {idx}/{len(bg_databases)}: {db_path.name}")
-                result = filter_background_noise(snps, db_path, fasta_path, threads, output_prefix.parent)
+                result = filter_background_noise(snps, db_path, fasta_path, threads)
                 if result.is_err():
                     return Err(result.unwrap_err())
                 snps = result.unwrap()
