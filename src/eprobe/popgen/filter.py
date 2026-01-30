@@ -253,6 +253,7 @@ def filter_background_noise(
     db_path: Path,
     fasta_path: Optional[Path] = None,
     threads: int = 1,
+    output_dir: Optional[Path] = None,
 ) -> Result[List[SNP], str]:
     """
     Filter SNPs whose probe sequences match background database.
@@ -265,6 +266,7 @@ def filter_background_noise(
         db_path: Kraken2 database path
         fasta_path: Optional pre-computed FASTA file (optimization)
         threads: Number of threads
+        output_dir: Directory to save kraken2 output files (if None, uses cwd)
         
     Returns:
         Result containing filtered SNP list
@@ -274,33 +276,32 @@ def filter_background_noise(
     
     logger.info(f"Running background noise filter (Kraken2) on {len(snps)} SNPs")
     
+    # Determine output directory for kraken2 files
+    if output_dir is None:
+        output_dir = Path.cwd()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Always save kraken2 output to the specified output directory
+    kraken_output_path = output_dir / "kraken2_main.out"
+    
     # Use shared FASTA or create temporary one
     if fasta_path is not None:
-        # Use shared FASTA (optimization)
-        output_path = fasta_path.parent / "kraken2_main.out"
-        
-        kraken_result = run_kraken2(fasta_path, db_path, output_path, threads)
+        # Use shared FASTA
+        kraken_result = run_kraken2(fasta_path, db_path, kraken_output_path, threads)
         if kraken_result.is_err():
             return Err(kraken_result.unwrap_err())
         
-        classified_result = parse_kraken_output(output_path)
+        classified_result = parse_kraken_output(kraken_output_path)
         if classified_result.is_err():
             return Err(classified_result.unwrap_err())
         
         classified_ids = classified_result.unwrap()
         
-        # DO NOT delete kraken2 files - keep them for analysis
-        logger.info(f"Kraken2 output files preserved in: {fasta_path.parent}")
-        logger.info(f"  - Main output: {output_path}")
-        logger.info(f"  - Report: {fasta_path.parent / 'kraken2.report'}")
-        logger.info(f"  - Classified: {fasta_path.parent / 'kraken2.classified.fasta'}")
-        logger.info(f"  - Unclassified: {fasta_path.parent / 'kraken2.unclassified.fasta'}")
-        
     else:
-        # Fallback: create temporary FASTA but save kraken2 outputs permanently
+        # Fallback: create temporary FASTA
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_fasta_path = Path(tmpdir) / "probes.fa"
-            temp_output_path = Path(tmpdir) / "kraken2_main.out"
             
             # Write probe sequences
             sequences = {
@@ -312,36 +313,24 @@ def filter_background_noise(
             if write_result.is_err():
                 return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
             
-            # Run Kraken2
-            kraken_result = run_kraken2(temp_fasta_path, db_path, temp_output_path, threads)
+            # Run Kraken2 - output to permanent location
+            kraken_result = run_kraken2(temp_fasta_path, db_path, kraken_output_path, threads)
             if kraken_result.is_err():
                 return Err(kraken_result.unwrap_err())
             
             # Parse results
-            classified_result = parse_kraken_output(temp_output_path)
+            classified_result = parse_kraken_output(kraken_output_path)
             if classified_result.is_err():
                 return Err(classified_result.unwrap_err())
             
             classified_ids = classified_result.unwrap()
-            
-            # Copy kraken2 output files to permanent location (current working directory)
-            permanent_dir = Path.cwd()
-            kraken_files = [
-                ("kraken2_main.out", temp_output_path),
-                ("kraken2.report", Path(tmpdir) / "kraken2.report"),
-                ("kraken2.classified.fasta", Path(tmpdir) / "kraken2.classified.fasta"),
-                ("kraken2.unclassified.fasta", Path(tmpdir) / "kraken2.unclassified.fasta")
-            ]
-            
-            logger.info(f"Copying Kraken2 output files to: {permanent_dir}")
-            for perm_name, temp_file in kraken_files:
-                if temp_file.exists():
-                    perm_path = permanent_dir / perm_name
-                    import shutil
-                    shutil.copy2(temp_file, perm_path)
-                    logger.info(f"  ✓ Saved: {perm_path}")
-                else:
-                    logger.warning(f"  ✗ Missing: {temp_file}")
+    
+    # Log saved kraken2 files
+    logger.info(f"Kraken2 output files saved to: {output_dir}")
+    logger.info(f"  - Main output: {kraken_output_path}")
+    logger.info(f"  - Report: {output_dir / 'kraken2.report'}")
+    logger.info(f"  - Classified: {output_dir / 'kraken2.classified.fasta'}")
+    logger.info(f"  - Unclassified: {output_dir / 'kraken2.unclassified.fasta'}")
     
     # Filter out classified SNPs
     filtered_snps = [snp for snp in snps if snp.id not in classified_ids]
@@ -350,18 +339,8 @@ def filter_background_noise(
     logger.info(f"Background filter: removed {removed} SNPs ({len(classified_ids)} matched noise)")
     
     # Generate and display kraken2 analysis summary
-    try:
-        if 'permanent_dir' in locals():
-            kraken_main_file = permanent_dir / "kraken2_main.out"
-        elif 'output_path' in locals():
-            kraken_main_file = output_path
-        else:
-            kraken_main_file = None
-            
-        if kraken_main_file and kraken_main_file.exists():
-            display_kraken_summary(kraken_main_file)
-    except Exception as e:
-        logger.warning(f"Could not display kraken summary: {e}")
+    if kraken_output_path.exists():
+        display_kraken_summary(kraken_output_path)
     
     return Ok(filtered_snps)
 
@@ -1193,7 +1172,7 @@ def run_filter(
             
             for idx, db_path in enumerate(bg_databases, 1):
                 logger.info(f"Background filter {idx}/{len(bg_databases)}: {db_path.name}")
-                result = filter_background_noise(snps, db_path, fasta_path, threads)
+                result = filter_background_noise(snps, db_path, fasta_path, threads, output_path.parent)
                 if result.is_err():
                     return Err(result.unwrap_err())
                 snps = result.unwrap()
