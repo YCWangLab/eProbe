@@ -270,7 +270,7 @@ def filter_background_noise(
     db_path: Path,
     fasta_path: Optional[Path] = None,
     threads: int = 1,
-    kmer_threshold: int = 10,
+    kmer_threshold: int = 1,
 ) -> Result[List[SNP], str]:
     """
     Filter SNPs using Kraken2 as simple kmer matcher (ignore taxonomy).
@@ -283,7 +283,7 @@ def filter_background_noise(
         db_path: Kraken2 database path
         fasta_path: Optional pre-computed FASTA file
         threads: Number of threads
-        kmer_threshold: Remove sequences with >= this many matched kmers (default: 10)
+        kmer_threshold: Remove sequences with >= this many matched kmers (default: 1)
         
     Returns:
         Result containing filtered SNP list
