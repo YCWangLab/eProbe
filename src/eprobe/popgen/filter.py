@@ -366,12 +366,15 @@ def filter_background_noise(
 # =============================================================================
 # Accessibility Filter (Bowtie2)
 # =============================================================================
+# Accessibility Filter (Bowtie2) - Multi-genome Universality + Mappability
+# =============================================================================
 
 def run_bowtie2(
     fasta_path: Path,
     index_path: Path,
     output_path: Path,
     threads: int = 1,
+    report_all: bool = False,
 ) -> Result[Path, str]:
     """
     Run Bowtie2 alignment for accessibility check.
@@ -381,6 +384,7 @@ def run_bowtie2(
         index_path: Bowtie2 index prefix
         output_path: Output SAM file
         threads: Number of threads
+        report_all: If True, report all alignments (-a); else report up to 10 (-k 10)
         
     Returns:
         Result containing path to output file
@@ -391,9 +395,12 @@ def run_bowtie2(
         "-f", str(fasta_path),
         "-S", str(output_path),
         "-p", str(threads),
-        "--no-unal",  # Don't output unaligned sequences
-        "-k", "2",    # Report up to 2 alignments
     ]
+    
+    if report_all:
+        cmd.append("-a")  # Report all alignments
+    else:
+        cmd.extend(["-k", "10"])  # Report up to 10 alignments
     
     logger.debug(f"Running Bowtie2: {' '.join(cmd)}")
     
@@ -411,53 +418,143 @@ def run_bowtie2(
         return Err("Bowtie2 not found. Please install Bowtie2 and ensure it's in PATH.")
 
 
-def parse_bowtie2_alignments(
+def parse_bowtie2_accessibility(
     sam_path: Path,
-    max_hits: int = 1,
-) -> Result[Set[str], str]:
+    mode: str = "strict",
+    score_diff_threshold: int = 10,
+) -> Result[Dict[str, Dict], str]:
     """
-    Parse Bowtie2 SAM output to find multi-mapping sequences.
+    Parse Bowtie2 SAM output for accessibility analysis.
     
-    Returns set of sequence IDs that have more than max_hits alignments.
+    Returns detailed alignment info for each sequence:
+    - aligned: whether the sequence aligned to this genome
+    - hit_count: number of alignment positions
+    - best_score: best alignment score (AS tag)
+    - second_score: second-best alignment score (XS tag)
+    - score_diff: difference between best and second-best
+    - mappable: whether the sequence passes mappability check
+    
+    Args:
+        sam_path: Path to SAM file
+        mode: "strict" (unique only) or "relaxed" (allow multi if distinguishable)
+        score_diff_threshold: Minimum score difference for relaxed mode
+        
+    Returns:
+        Dict {seq_id: alignment_info}
     """
-    hit_counts: Dict[str, int] = {}
+    results: Dict[str, Dict] = {}
     
     try:
         with open(sam_path) as f:
             for line in f:
                 if line.startswith("@"):  # Skip header
                     continue
+                    
                 parts = line.strip().split("\t")
-                if len(parts) >= 3:
-                    seq_id = parts[0]
-                    flag = int(parts[1])
-                    if not (flag & 4):  # Not unmapped
-                        hit_counts[seq_id] = hit_counts.get(seq_id, 0) + 1
+                if len(parts) < 11:
+                    continue
+                
+                seq_id = parts[0]
+                flag = int(parts[1])
+                
+                # Initialize result for this sequence
+                if seq_id not in results:
+                    results[seq_id] = {
+                        "aligned": False,
+                        "hit_count": 0,
+                        "best_score": None,
+                        "second_score": None,
+                        "score_diff": None,
+                        "mappable": False,
+                    }
+                
+                # Check if mapped (flag bit 4 = unmapped)
+                if flag & 4:  # Unmapped
+                    continue
+                
+                results[seq_id]["aligned"] = True
+                results[seq_id]["hit_count"] += 1
+                
+                # Parse optional tags for alignment scores
+                tags = {tag.split(":")[0]: tag.split(":")[-1] for tag in parts[11:] if ":" in tag}
+                
+                # AS = alignment score of current alignment
+                # XS = alignment score of second-best alignment
+                if "AS" in tags:
+                    current_score = int(tags["AS"])
+                    
+                    if results[seq_id]["best_score"] is None:
+                        results[seq_id]["best_score"] = current_score
+                    elif current_score > results[seq_id]["best_score"]:
+                        # This is now the best, old best becomes second
+                        results[seq_id]["second_score"] = results[seq_id]["best_score"]
+                        results[seq_id]["best_score"] = current_score
+                    elif results[seq_id]["second_score"] is None or current_score > results[seq_id]["second_score"]:
+                        results[seq_id]["second_score"] = current_score
+                
+                # XS tag directly gives second-best score (if available)
+                if "XS" in tags and results[seq_id]["second_score"] is None:
+                    results[seq_id]["second_score"] = int(tags["XS"])
         
-        multi_mapping = {
-            seq_id for seq_id, count in hit_counts.items()
-            if count > max_hits
-        }
-        return Ok(multi_mapping)
+        # Calculate mappability for each sequence
+        for seq_id, info in results.items():
+            if not info["aligned"]:
+                info["mappable"] = False
+                continue
+            
+            # Calculate score difference
+            if info["best_score"] is not None and info["second_score"] is not None:
+                info["score_diff"] = info["best_score"] - info["second_score"]
+            else:
+                info["score_diff"] = None  # Only one alignment, perfectly unique
+            
+            # Determine mappability based on mode
+            if mode == "strict":
+                # Strict: must have exactly 1 alignment position
+                info["mappable"] = info["hit_count"] == 1
+            elif mode == "relaxed":
+                # Relaxed: unique OR (multiple with sufficient score difference)
+                if info["hit_count"] == 1:
+                    info["mappable"] = True
+                elif info["score_diff"] is not None and info["score_diff"] >= score_diff_threshold:
+                    info["mappable"] = True
+                else:
+                    info["mappable"] = False
+            else:
+                info["mappable"] = info["hit_count"] >= 1  # Any alignment counts
+        
+        return Ok(results)
+        
     except Exception as e:
         return Err(f"Failed to parse Bowtie2 output: {e}")
 
 
 def filter_accessibility(
     snps: List[SNP],
-    index_path: Path,
+    index_paths: List[Path],
     threads: int = 1,
+    mode: str = "strict",
+    score_diff_threshold: int = 10,
+    min_genomes: Optional[int] = None,
+    fasta_path: Optional[Path] = None,
+    probe_sequences: Optional[Dict[str, str]] = None,
 ) -> Result[List[SNP], str]:
     """
-    Filter SNPs based on genomic accessibility.
+    Filter SNPs based on genomic accessibility across multiple genomes.
     
-    Uses Bowtie2 to check if probe sequences map uniquely to the genome.
-    SNPs with multi-mapping probes are removed.
+    Two-step filtering:
+    1. Universality: Probe must align to at least min_genomes (default: ALL)
+    2. Mappability: Probe must pass mappability check in ALL aligned genomes
     
     Args:
         snps: Input SNP list
-        index_path: Bowtie2 index prefix path
+        index_paths: List of Bowtie2 index prefix paths (multiple genomes)
         threads: Number of threads
+        mode: "strict" (unique alignment only) or "relaxed" (allow distinguishable multi-mapping)
+        score_diff_threshold: Minimum AS-XS score difference for relaxed mode
+        min_genomes: Minimum number of genomes to align to (default: len(index_paths))
+        fasta_path: Path to existing FASTA file with probe sequences (optional)
+        probe_sequences: Dict mapping SNP ID to probe sequence (optional, used if fasta_path not provided)
         
     Returns:
         Result containing filtered SNP list
@@ -465,41 +562,162 @@ def filter_accessibility(
     if not snps:
         return Ok([])
     
-    logger.info(f"Running accessibility filter (Bowtie2) on {len(snps)} SNPs")
+    if not index_paths:
+        return Err("No genome indices provided for accessibility filter")
     
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fasta_path = Path(tmpdir) / "probes.fa"
-        sam_path = Path(tmpdir) / "alignments.sam"
+    if fasta_path is None and probe_sequences is None:
+        return Err("Either fasta_path or probe_sequences must be provided")
+    
+    # Set default min_genomes to all genomes
+    if min_genomes is None:
+        min_genomes = len(index_paths)
+    elif min_genomes > len(index_paths):
+        return Err(f"min_genomes ({min_genomes}) cannot exceed total genomes ({len(index_paths)})")
+    elif min_genomes < 1:
+        return Err(f"min_genomes must be at least 1")
+    
+    logger.info(f"Running accessibility filter on {len(snps)} SNPs")
+    logger.info(f"Mode: {mode}, Score diff threshold: {score_diff_threshold}")
+    logger.info(f"Genomes to check: {len(index_paths)}")
+    logger.info(f"Minimum genomes required: {min_genomes}")
+    
+    # Distribute threads across genomes
+    threads_per_genome = max(1, threads // len(index_paths))
+    logger.info(f"Threads per genome: {threads_per_genome} (total: {threads})")
+    
+    # Track which SNPs pass each genome
+    # snp_id -> genome_index -> alignment_info
+    all_results: Dict[str, Dict[int, Dict]] = {snp.id: {} for snp in snps}
+    
+    # Use existing FASTA or create a temp file from probe_sequences
+    use_temp_fasta = fasta_path is None
+    
+    if use_temp_fasta:
+        import tempfile as tf
+        temp_dir = tf.mkdtemp()
+        fasta_path = Path(temp_dir) / "probes.fa"
         
         # Write probe sequences
-        sequences = {
-            snp.id: probe_sequences[snp.id]
-            for snp in snps
-        }
-        
+        sequences = {snp.id: probe_sequences[snp.id] for snp in snps}
         write_result = write_fasta(sequences, fasta_path)
         if write_result.is_err():
             return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
-        
-        # Run Bowtie2
-        bt2_result = run_bowtie2(fasta_path, index_path, sam_path, threads)
-        if bt2_result.is_err():
-            return Err(bt2_result.unwrap_err())
-        
-        # Parse results
-        multi_map_result = parse_bowtie2_alignments(sam_path)
-        if multi_map_result.is_err():
-            return Err(multi_map_result.unwrap_err())
-        
-        multi_mapping_ids = multi_map_result.unwrap()
     
-    # Filter out multi-mapping SNPs
-    filtered_snps = [snp for snp in snps if snp.id not in multi_mapping_ids]
-    removed = len(snps) - len(filtered_snps)
+    try:
+        # Run Bowtie2 against each genome
+        for genome_idx, index_path in enumerate(index_paths):
+            genome_name = index_path.stem if hasattr(index_path, 'stem') else str(index_path)
+            logger.info(f"  Checking genome {genome_idx + 1}/{len(index_paths)}: {genome_name}")
+            
+            sam_path = fasta_path.parent / f"genome_{genome_idx}.sam"
+            
+            # Run Bowtie2 with distributed threads
+            bt2_result = run_bowtie2(fasta_path, index_path, sam_path, threads_per_genome)
+            if bt2_result.is_err():
+                return Err(bt2_result.unwrap_err())
+            
+            # Parse results
+            parse_result = parse_bowtie2_accessibility(sam_path, mode, score_diff_threshold)
+            if parse_result.is_err():
+                return Err(parse_result.unwrap_err())
+            
+            genome_results = parse_result.unwrap()
+            
+            # Store results for this genome
+            for seq_id in all_results:
+                if seq_id in genome_results:
+                    all_results[seq_id][genome_idx] = genome_results[seq_id]
+                else:
+                    # Sequence not in results = not aligned
+                    all_results[seq_id][genome_idx] = {
+                        "aligned": False,
+                        "hit_count": 0,
+                        "mappable": False,
+                    }
+            
+            # Clean up SAM file
+            sam_path.unlink()
+    finally:
+        # Clean up temp FASTA if we created it
+        if use_temp_fasta:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
     
-    logger.info(f"Accessibility filter: removed {removed} multi-mapping SNPs")
+    # Filter SNPs based on results across all genomes
+    n_genomes = len(index_paths)
+    passed_snps = []
     
-    return Ok(filtered_snps)
+    # Detailed statistics
+    stats = {
+        "passed": 0,
+        "insufficient_genomes": 0,  # Aligned to < min_genomes
+        "multi_mapped": 0,           # Multi-mapped in some genome (not mappable)
+    }
+    
+    # Per-genome statistics
+    genome_stats = {
+        "aligned_count": [0] * n_genomes,
+        "mappable_count": [0] * n_genomes,
+        "multi_mapped_count": [0] * n_genomes,  # Count of multi-mapped probes per genome
+    }
+    
+    for snp in snps:
+        snp_results = all_results[snp.id]
+        
+        # Count aligned and mappable genomes
+        aligned_genomes = []
+        mappable_genomes = []
+        multi_mapped_genomes = []
+        
+        for i in range(n_genomes):
+            result = snp_results.get(i, {})
+            if result.get("aligned", False):
+                aligned_genomes.append(i)
+                genome_stats["aligned_count"][i] += 1
+                
+                if result.get("mappable", False):
+                    mappable_genomes.append(i)
+                    genome_stats["mappable_count"][i] += 1
+                else:
+                    # Aligned but not mappable = multi-mapped
+                    multi_mapped_genomes.append(i)
+                    genome_stats["multi_mapped_count"][i] += 1
+        
+        # Check 1: Must align to at least min_genomes
+        if len(aligned_genomes) < min_genomes:
+            stats["insufficient_genomes"] += 1
+            continue
+        
+        # Check 2: All aligned genomes must be mappable (no multi-mapping)
+        if len(multi_mapped_genomes) > 0:
+            stats["multi_mapped"] += 1
+            continue
+        
+        # Passed both checks
+        stats["passed"] += 1
+        passed_snps.append(snp)
+    
+    # Log detailed statistics
+    logger.info(f"Accessibility filter results:")
+    logger.info(f"  Input: {len(snps)} SNPs")
+    logger.info(f"")
+    logger.info(f"  Per-genome alignment statistics:")
+    for i in range(n_genomes):
+        genome_name = index_paths[i].stem if hasattr(index_paths[i], 'stem') else f"genome_{i}"
+        aligned_pct = genome_stats["aligned_count"][i] / len(snps) * 100
+        mappable_pct = genome_stats["mappable_count"][i] / len(snps) * 100
+        multi_pct = genome_stats["multi_mapped_count"][i] / len(snps) * 100
+        logger.info(f"    Genome {i+1} ({genome_name}):")
+        logger.info(f"      - Aligned: {genome_stats['aligned_count'][i]} ({aligned_pct:.1f}%)")
+        logger.info(f"      - Mappable (unique): {genome_stats['mappable_count'][i]} ({mappable_pct:.1f}%)")
+        logger.info(f"      - Multi-mapped: {genome_stats['multi_mapped_count'][i]} ({multi_pct:.1f}%)")
+    logger.info(f"")
+    logger.info(f"  Filtering summary:")
+    logger.info(f"    - Insufficient genomes (< {min_genomes}): {stats['insufficient_genomes']}")
+    logger.info(f"    - Multi-mapped in some genome: {stats['multi_mapped']}")
+    logger.info(f"    - Passed: {stats['passed']} ({stats['passed']/len(snps)*100:.1f}%)")
+    
+    return Ok(passed_snps)
 
 
 # =============================================================================
@@ -1033,6 +1251,9 @@ def run_filter(
     filters: List[str],
     bg_db: Optional[str] = None,
     ac_db: Optional[str] = None,
+    ac_mode: str = "strict",
+    ac_score_diff: int = 10,
+    ac_min_genomes: Optional[int] = None,
     tx_db: Optional[str] = None,
     tx_ids: Optional[List[int]] = None,
     names_dmp: Optional[str] = None,
@@ -1066,6 +1287,9 @@ def run_filter(
         filters: List of filter names to apply
         bg_db: Kraken2 database(s) for background filter (comma-separated)
         ac_db: Bowtie2 index/indices for accessibility filter (comma-separated)
+        ac_mode: Accessibility filter mode ('strict' or 'relaxed')
+        ac_score_diff: Minimum score difference for relaxed mode (default: 10)
+        ac_min_genomes: Minimum number of genomes to align to (default: all)
         tx_db: Bowtie2 index/indices for taxonomic filter (comma-separated)
         tx_ids: Taxonomy IDs to keep (target taxa)
         names_dmp: NCBI taxonomy names.dmp file path
@@ -1208,16 +1432,22 @@ def run_filter(
             if ac_db is None:
                 return Err("AC filter requires --ac_db")
             
-            # Parse comma-separated databases
+            # Parse comma-separated databases - all genomes checked together
             ac_databases = [Path(db.strip()) for db in ac_db.split(",")]
-            logger.info(f"Running accessibility filter with {len(ac_databases)} database(s)")
+            logger.info(f"Running accessibility filter with {len(ac_databases)} genome(s)")
+            logger.info(f"Accessibility mode: {ac_mode}, score_diff_threshold: {ac_score_diff}")
             
-            for idx, db_path in enumerate(ac_databases, 1):
-                logger.info(f"Accessibility filter {idx}/{len(ac_databases)}: {db_path.name}")
-                result = filter_accessibility(snps, db_path, threads)
-                if result.is_err():
-                    return Err(result.unwrap_err())
-                snps = result.unwrap()
+            # All genomes are checked together for universality + mappability
+            result = filter_accessibility(
+                snps, ac_databases, threads, 
+                mode=ac_mode, 
+                score_diff_threshold=ac_score_diff,
+                min_genomes=ac_min_genomes,
+                fasta_path=fasta_path,
+            )
+            if result.is_err():
+                return Err(result.unwrap_err())
+            snps = result.unwrap()
             
             # Update shared FASTA with remaining SNPs for subsequent filters
             update_result = update_shared_fasta(snps, fasta_path, probe_sequences)

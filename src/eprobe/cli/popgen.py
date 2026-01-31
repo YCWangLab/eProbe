@@ -273,6 +273,29 @@ def extract(
     help="Bowtie2 database(s) for accessibility filtering (comma-separated).",
 )
 @click.option(
+    "--ac_mode",
+    type=click.Choice(["strict", "relaxed"]),
+    default="strict",
+    help="Accessibility filter mode: 'strict' requires unique alignment, 'relaxed' allows multi-map with score difference (default: strict).",
+)
+@click.option(
+    "--ac_score_diff",
+    type=int,
+    default=10,
+    help="Minimum alignment score difference for relaxed mode (default: 10). "
+         "This threshold determines how much better the best alignment must be compared to the second-best. "
+         "With Bowtie2's default scoring (~6 points per mismatch), a value of 10 requires ~2 mismatches difference. "
+         "Higher values (15+) = stricter filtering, lower values (5) = more permissive.",
+)
+@click.option(
+    "--ac_min_genomes",
+    type=int,
+    default=None,
+    help="Minimum number of genomes a probe must align to (default: all genomes). "
+         "Set to lower value to allow probes missing from some genomes. "
+         "Example: with 3 genomes, --ac_min_genomes 2 requires alignment to at least 2 genomes.",
+)
+@click.option(
     "--tx_db",
     type=str,
     help="Bowtie2 database(s) for taxonomic filtering (comma-separated).",
@@ -360,6 +383,9 @@ def filter(
     length: int,
     bg_db: Optional[str],
     ac_db: Optional[str],
+    ac_mode: str,
+    ac_score_diff: int,
+    ac_min_genomes: Optional[int],
     tx_db: Optional[str],
     tx_taxid: Optional[str],
     tx_names: Optional[Path],
@@ -427,6 +453,9 @@ def filter(
         probe_length=length,
         bg_db=bg_db,
         ac_db=ac_db,
+        ac_mode=ac_mode,
+        ac_score_diff=ac_score_diff,
+        ac_min_genomes=ac_min_genomes,
         tx_db=tx_db,
         tx_ids=tx_ids,
         names_dmp=str(tx_names) if tx_names else None,
