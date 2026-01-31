@@ -529,6 +529,17 @@ def run_bowtie2(
         logger.info(f"    - Aligned >1 times: {summary['aligned_multi']}")
         logger.info(f"    - Overall alignment rate: {summary['alignment_rate']:.1f}%")
         
+        # Verify SAM file was created and has content
+        output_path = Path(output_path)
+        if not output_path.exists():
+            return Err(f"SAM file not created: {output_path}")
+        
+        sam_size = output_path.stat().st_size
+        logger.info(f"    - SAM file size: {sam_size:,} bytes")
+        
+        if sam_size == 0:
+            return Err(f"SAM file is empty: {output_path}")
+        
         return Ok({
             "output_path": output_path,
             "summary": summary,
@@ -567,15 +578,35 @@ def parse_bowtie2_accessibility(
     results: Dict[str, Dict] = {}
     
     try:
+        # First check file size and basic info
+        sam_path = Path(sam_path)
+        if not sam_path.exists():
+            return Err(f"SAM file does not exist: {sam_path}")
+        
+        file_size = sam_path.stat().st_size
+        logger.debug(f"Parsing SAM file: {sam_path} (size: {file_size:,} bytes)")
+        
+        if file_size == 0:
+            return Err(f"SAM file is empty: {sam_path}")
+        
+        total_lines = 0
+        header_lines = 0
+        data_lines = 0
+        parsed_alignments = 0
+        
         with open(sam_path) as f:
             for line in f:
+                total_lines += 1
                 if line.startswith("@"):  # Skip header
+                    header_lines += 1
                     continue
-                    
+                
+                data_lines += 1
                 parts = line.strip().split("\t")
                 if len(parts) < 11:
                     continue
                 
+                parsed_alignments += 1
                 seq_id = parts[0]
                 flag = int(parts[1])
                 
@@ -617,6 +648,11 @@ def parse_bowtie2_accessibility(
                 # XS tag directly gives second-best score (if available)
                 if "XS" in tags and results[seq_id]["second_score"] is None:
                     results[seq_id]["second_score"] = int(tags["XS"])
+        
+        # Log parsing statistics
+        logger.info(f"    SAM file: {sam_path} ({file_size:,} bytes)")
+        logger.info(f"    SAM lines: total={total_lines}, header={header_lines}, data={data_lines}")
+        logger.info(f"    Parsed alignments: {parsed_alignments}, unique sequences: {len(results)}")
         
         # Calculate mappability for each sequence
         for seq_id, info in results.items():
@@ -777,11 +813,11 @@ def filter_accessibility(
             
             genome_results = parse_result.unwrap()
             
-            # Clean up SAM file
-            try:
-                sam_path.unlink()
-            except:
-                pass
+            # Log parsed sequence count for debugging
+            logger.info(f"    SAM parsed: {len(genome_results)} unique sequences found")
+            
+            # Don't clean up SAM file - let the parent function handle cleanup
+            # (allows inspection when keep_temp=True)
             
             return {
                 "genome_idx": genome_idx,
