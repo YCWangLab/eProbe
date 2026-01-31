@@ -1465,8 +1465,16 @@ def run_filter(
     Returns:
         Result containing filtering statistics
     """
+    # Configure logging to output to stderr
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+        logger.addHandler(handler)
+    
     if verbose:
         logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
     
     logger.info(f"Starting SNP filtering from {input_path}")
     logger.info(f"Enabled filters: {filters}")
