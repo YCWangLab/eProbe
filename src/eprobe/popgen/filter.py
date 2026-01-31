@@ -369,13 +369,119 @@ def filter_background_noise(
 # Accessibility Filter (Bowtie2) - Multi-genome Universality + Mappability
 # =============================================================================
 
+def validate_bowtie2_index(index_path: Path) -> Result[Path, str]:
+    """
+    Validate that a Bowtie2 index exists.
+    
+    Args:
+        index_path: Path to the Bowtie2 index prefix
+        
+    Returns:
+        Result containing the validated path or error message
+    """
+    # Bowtie2 index consists of .1.bt2, .2.bt2, .3.bt2, .4.bt2, .rev.1.bt2, .rev.2.bt2
+    # For large indices: .1.bt2l, .2.bt2l, etc.
+    index_path = Path(index_path)
+    
+    # Check for standard (.bt2) or large (.bt2l) index files
+    extensions_standard = [".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"]
+    extensions_large = [".1.bt2l", ".2.bt2l", ".3.bt2l", ".4.bt2l", ".rev.1.bt2l", ".rev.2.bt2l"]
+    
+    # Check standard index
+    standard_exists = all(
+        Path(str(index_path) + ext).exists() for ext in extensions_standard
+    )
+    
+    # Check large index
+    large_exists = all(
+        Path(str(index_path) + ext).exists() for ext in extensions_large
+    )
+    
+    if standard_exists or large_exists:
+        return Ok(index_path)
+    
+    # List what files we found
+    found_files = []
+    for ext in extensions_standard + extensions_large:
+        check_path = Path(str(index_path) + ext)
+        if check_path.exists():
+            found_files.append(ext)
+    
+    if found_files:
+        return Err(f"Incomplete Bowtie2 index at {index_path}. Found: {found_files}")
+    else:
+        return Err(f"Bowtie2 index not found at {index_path}. Expected files like {index_path}.1.bt2")
+
+
+def parse_bowtie2_summary(stderr: str) -> Dict[str, Any]:
+    """
+    Parse Bowtie2 stderr output for alignment summary.
+    
+    Bowtie2 outputs something like:
+        10000 reads; of these:
+          10000 (100.00%) were unpaired; of these:
+            500 (5.00%) aligned 0 times
+            8500 (85.00%) aligned exactly 1 time
+            1000 (10.00%) aligned >1 times
+        95.00% overall alignment rate
+        
+    Returns:
+        Dict with parsed statistics
+    """
+    summary = {
+        "total_reads": 0,
+        "aligned_0_times": 0,
+        "aligned_1_time": 0,
+        "aligned_multi": 0,
+        "alignment_rate": 0.0,
+        "raw_output": stderr,
+    }
+    
+    import re
+    
+    for line in stderr.split('\n'):
+        line = line.strip()
+        
+        # Match total reads
+        match = re.match(r'^(\d+) reads?; of these:', line)
+        if match:
+            summary["total_reads"] = int(match.group(1))
+            continue
+        
+        # Match aligned 0 times
+        match = re.match(r'^(\d+) \([\d.]+%\) aligned 0 times?', line)
+        if match:
+            summary["aligned_0_times"] = int(match.group(1))
+            continue
+        
+        # Match aligned exactly 1 time
+        match = re.match(r'^(\d+) \([\d.]+%\) aligned exactly 1 time', line)
+        if match:
+            summary["aligned_1_time"] = int(match.group(1))
+            continue
+        
+        # Match aligned >1 times
+        match = re.match(r'^(\d+) \([\d.]+%\) aligned >1 times?', line)
+        if match:
+            summary["aligned_multi"] = int(match.group(1))
+            continue
+        
+        # Match overall alignment rate
+        match = re.match(r'^([\d.]+)% overall alignment rate', line)
+        if match:
+            summary["alignment_rate"] = float(match.group(1))
+            continue
+    
+    return summary
+
+
 def run_bowtie2(
     fasta_path: Path,
     index_path: Path,
     output_path: Path,
     threads: int = 1,
     report_all: bool = False,
-) -> Result[Path, str]:
+) -> Result[Dict[str, Any], str]:
     """
     Run Bowtie2 alignment for accessibility check.
     
@@ -387,7 +493,7 @@ def run_bowtie2(
         report_all: If True, report all alignments (-a); else report up to 10 (-k 10)
         
     Returns:
-        Result containing path to output file
+        Result containing dict with output_path and alignment summary
     """
     cmd = [
         "bowtie2",
@@ -402,7 +508,7 @@ def run_bowtie2(
     else:
         cmd.extend(["-k", "10"])  # Report up to 10 alignments
     
-    logger.debug(f"Running Bowtie2: {' '.join(cmd)}")
+    logger.info(f"Running Bowtie2: {' '.join(cmd)}")
     
     try:
         result = subprocess.run(
@@ -411,7 +517,23 @@ def run_bowtie2(
             text=True,
             check=True,
         )
-        return Ok(output_path)
+        
+        # Parse bowtie2 summary from stderr
+        summary = parse_bowtie2_summary(result.stderr)
+        
+        # Log alignment summary
+        logger.info(f"  Bowtie2 completed:")
+        logger.info(f"    - Total reads: {summary['total_reads']}")
+        logger.info(f"    - Aligned 0 times: {summary['aligned_0_times']}")
+        logger.info(f"    - Aligned exactly 1 time: {summary['aligned_1_time']}")
+        logger.info(f"    - Aligned >1 times: {summary['aligned_multi']}")
+        logger.info(f"    - Overall alignment rate: {summary['alignment_rate']:.1f}%")
+        
+        return Ok({
+            "output_path": output_path,
+            "summary": summary,
+        })
+        
     except subprocess.CalledProcessError as e:
         return Err(f"Bowtie2 failed: {e.stderr}")
     except FileNotFoundError:
@@ -568,6 +690,14 @@ def filter_accessibility(
     if fasta_path is None and probe_sequences is None:
         return Err("Either fasta_path or probe_sequences must be provided")
     
+    # Validate all Bowtie2 indices exist before starting
+    logger.info("Validating Bowtie2 indices...")
+    for idx, index_path in enumerate(index_paths):
+        validate_result = validate_bowtie2_index(index_path)
+        if validate_result.is_err():
+            return Err(f"Genome {idx + 1}: {validate_result.unwrap_err()}")
+        logger.info(f"  Genome {idx + 1}: {index_path} ✓")
+    
     # Set default min_genomes to all genomes
     if min_genomes is None:
         min_genomes = len(index_paths)
@@ -605,6 +735,8 @@ def filter_accessibility(
     
     try:
         # Run Bowtie2 against each genome
+        bowtie2_summaries = []
+        
         for genome_idx, index_path in enumerate(index_paths):
             genome_name = index_path.stem if hasattr(index_path, 'stem') else str(index_path)
             logger.info(f"  Checking genome {genome_idx + 1}/{len(index_paths)}: {genome_name}")
@@ -616,12 +748,35 @@ def filter_accessibility(
             if bt2_result.is_err():
                 return Err(bt2_result.unwrap_err())
             
-            # Parse results
+            bt2_output = bt2_result.unwrap()
+            bowtie2_summaries.append({
+                "genome": genome_name,
+                "summary": bt2_output["summary"],
+            })
+            
+            # Validate alignment rate - warn if very low
+            alignment_rate = bt2_output["summary"]["alignment_rate"]
+            if alignment_rate < 1.0:
+                logger.warning(f"    WARNING: Very low alignment rate ({alignment_rate:.1f}%). Check if correct genome index is used.")
+            elif alignment_rate < 50.0:
+                logger.warning(f"    WARNING: Low alignment rate ({alignment_rate:.1f}%). Some probes may not be in this genome.")
+            
+            # Parse SAM results
             parse_result = parse_bowtie2_accessibility(sam_path, mode, score_diff_threshold)
             if parse_result.is_err():
                 return Err(parse_result.unwrap_err())
             
             genome_results = parse_result.unwrap()
+            
+            # Log parsed statistics
+            aligned_in_genome = sum(1 for r in genome_results.values() if r.get("aligned", False))
+            mappable_in_genome = sum(1 for r in genome_results.values() if r.get("mappable", False))
+            multi_in_genome = aligned_in_genome - mappable_in_genome
+            logger.info(f"    SAM parsing results:")
+            logger.info(f"      - Sequences with alignments: {len(genome_results)}")
+            logger.info(f"      - Aligned: {aligned_in_genome}")
+            logger.info(f"      - Mappable (unique/distinguishable): {mappable_in_genome}")
+            logger.info(f"      - Multi-mapped (filtered): {multi_in_genome}")
             
             # Store results for this genome
             for seq_id in all_results:
