@@ -734,51 +734,95 @@ def filter_accessibility(
             return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
     
     try:
-        # Run Bowtie2 against each genome
-        bowtie2_summaries = []
+        # Run Bowtie2 against all genomes in parallel
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        for genome_idx, index_path in enumerate(index_paths):
+        def run_single_genome(args):
+            """Run Bowtie2 and parse results for a single genome."""
+            genome_idx, index_path = args
             genome_name = index_path.stem if hasattr(index_path, 'stem') else str(index_path)
-            logger.info(f"  Checking genome {genome_idx + 1}/{len(index_paths)}: {genome_name}")
-            
             sam_path = fasta_path.parent / f"genome_{genome_idx}.sam"
             
-            # Run Bowtie2 with distributed threads
+            # Run Bowtie2
             bt2_result = run_bowtie2(fasta_path, index_path, sam_path, threads_per_genome)
             if bt2_result.is_err():
-                return Err(bt2_result.unwrap_err())
+                return {"error": bt2_result.unwrap_err(), "genome_idx": genome_idx}
             
             bt2_output = bt2_result.unwrap()
-            bowtie2_summaries.append({
-                "genome": genome_name,
-                "summary": bt2_output["summary"],
-            })
-            
-            # Validate alignment rate - warn if very low
-            alignment_rate = bt2_output["summary"]["alignment_rate"]
-            if alignment_rate < 1.0:
-                logger.warning(f"    WARNING: Very low alignment rate ({alignment_rate:.1f}%). Check if correct genome index is used.")
-            elif alignment_rate < 50.0:
-                logger.warning(f"    WARNING: Low alignment rate ({alignment_rate:.1f}%). Some probes may not be in this genome.")
             
             # Parse SAM results
             parse_result = parse_bowtie2_accessibility(sam_path, mode, score_diff_threshold)
             if parse_result.is_err():
-                return Err(parse_result.unwrap_err())
+                return {"error": parse_result.unwrap_err(), "genome_idx": genome_idx}
             
             genome_results = parse_result.unwrap()
             
-            # Log parsed statistics
-            aligned_in_genome = sum(1 for r in genome_results.values() if r.get("aligned", False))
-            mappable_in_genome = sum(1 for r in genome_results.values() if r.get("mappable", False))
-            multi_in_genome = aligned_in_genome - mappable_in_genome
-            logger.info(f"    SAM parsing results:")
-            logger.info(f"      - Sequences with alignments: {len(genome_results)}")
-            logger.info(f"      - Aligned: {aligned_in_genome}")
-            logger.info(f"      - Mappable (unique/distinguishable): {mappable_in_genome}")
-            logger.info(f"      - Multi-mapped (filtered): {multi_in_genome}")
+            # Clean up SAM file
+            try:
+                sam_path.unlink()
+            except:
+                pass
             
-            # Store results for this genome
+            return {
+                "genome_idx": genome_idx,
+                "genome_name": genome_name,
+                "summary": bt2_output["summary"],
+                "results": genome_results,
+            }
+        
+        # Determine parallelism: run all genomes in parallel
+        n_parallel = len(index_paths)
+        logger.info(f"Running {n_parallel} Bowtie2 jobs in parallel ({threads_per_genome} threads each)")
+        
+        bowtie2_summaries = []
+        genome_outputs = {}
+        
+        with ThreadPoolExecutor(max_workers=n_parallel) as executor:
+            # Submit all jobs
+            future_to_genome = {
+                executor.submit(run_single_genome, (idx, path)): idx
+                for idx, path in enumerate(index_paths)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_genome):
+                result = future.result()
+                
+                if "error" in result:
+                    return Err(f"Genome {result['genome_idx'] + 1}: {result['error']}")
+                
+                genome_idx = result["genome_idx"]
+                genome_name = result["genome_name"]
+                summary = result["summary"]
+                genome_results = result["results"]
+                
+                genome_outputs[genome_idx] = genome_results
+                bowtie2_summaries.append({
+                    "genome": genome_name,
+                    "summary": summary,
+                })
+                
+                # Log results for this genome
+                logger.info(f"  Genome {genome_idx + 1}/{len(index_paths)}: {genome_name}")
+                logger.info(f"    Bowtie2: {summary['alignment_rate']:.1f}% aligned "
+                           f"(0: {summary['aligned_0_times']}, 1: {summary['aligned_1_time']}, >1: {summary['aligned_multi']})")
+                
+                # Warn if alignment rate is low
+                if summary["alignment_rate"] < 1.0:
+                    logger.warning(f"    WARNING: Very low alignment rate ({summary['alignment_rate']:.1f}%). Check genome index.")
+                elif summary["alignment_rate"] < 50.0:
+                    logger.warning(f"    WARNING: Low alignment rate ({summary['alignment_rate']:.1f}%).")
+                
+                # Log parsed statistics
+                aligned_in_genome = sum(1 for r in genome_results.values() if r.get("aligned", False))
+                mappable_in_genome = sum(1 for r in genome_results.values() if r.get("mappable", False))
+                multi_in_genome = aligned_in_genome - mappable_in_genome
+                logger.info(f"    Parsed: {aligned_in_genome} aligned, {mappable_in_genome} mappable, {multi_in_genome} multi-mapped")
+        
+        # Collect results from all genomes into all_results
+        for genome_idx in range(len(index_paths)):
+            genome_results = genome_outputs.get(genome_idx, {})
+            
             for seq_id in all_results:
                 if seq_id in genome_results:
                     all_results[seq_id][genome_idx] = genome_results[seq_id]
@@ -789,9 +833,6 @@ def filter_accessibility(
                         "hit_count": 0,
                         "mappable": False,
                     }
-            
-            # Clean up SAM file
-            sam_path.unlink()
     finally:
         # Clean up temp FASTA if we created it
         if use_temp_fasta:
