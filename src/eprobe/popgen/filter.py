@@ -660,6 +660,7 @@ def filter_accessibility(
     min_genomes: Optional[int] = None,
     fasta_path: Optional[Path] = None,
     probe_sequences: Optional[Dict[str, str]] = None,
+    work_dir: Optional[Path] = None,
 ) -> Result[List[SNP], str]:
     """
     Filter SNPs based on genomic accessibility across multiple genomes.
@@ -719,19 +720,38 @@ def filter_accessibility(
     # snp_id -> genome_index -> alignment_info
     all_results: Dict[str, Dict[int, Dict]] = {snp.id: {} for snp in snps}
     
+    # Create temp directory for this AC filter run
+    # Use work_dir if provided, otherwise use system temp
+    import tempfile as tf
+    import time
+    if work_dir is not None:
+        work_dir = Path(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        ac_temp_dir = work_dir / f"eprobe_ac_{int(time.time())}"
+        ac_temp_dir.mkdir(parents=True, exist_ok=True)
+        keep_temp = True  # Keep temp files when work_dir is specified
+    else:
+        ac_temp_dir = Path(tf.mkdtemp(prefix="eprobe_ac_"))
+        keep_temp = False
+    logger.info(f"Using temp directory: {ac_temp_dir}")
+    
     # Use existing FASTA or create a temp file from probe_sequences
     use_temp_fasta = fasta_path is None
     
     if use_temp_fasta:
-        import tempfile as tf
-        temp_dir = tf.mkdtemp()
-        fasta_path = Path(temp_dir) / "probes.fa"
+        fasta_path = ac_temp_dir / "probes.fa"
         
         # Write probe sequences
         sequences = {snp.id: probe_sequences[snp.id] for snp in snps}
         write_result = write_fasta(sequences, fasta_path)
         if write_result.is_err():
             return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
+    else:
+        # Copy the shared FASTA to our temp dir to keep SAM files together
+        import shutil
+        local_fasta = ac_temp_dir / "probes.fa"
+        shutil.copy(fasta_path, local_fasta)
+        fasta_path = local_fasta
     
     try:
         # Run Bowtie2 against all genomes in parallel
@@ -741,7 +761,7 @@ def filter_accessibility(
             """Run Bowtie2 and parse results for a single genome."""
             genome_idx, index_path = args
             genome_name = index_path.stem if hasattr(index_path, 'stem') else str(index_path)
-            sam_path = fasta_path.parent / f"genome_{genome_idx}.sam"
+            sam_path = ac_temp_dir / f"genome_{genome_idx}.sam"
             
             # Run Bowtie2
             bt2_result = run_bowtie2(fasta_path, index_path, sam_path, threads_per_genome)
@@ -834,10 +854,13 @@ def filter_accessibility(
                         "mappable": False,
                     }
     finally:
-        # Clean up temp FASTA if we created it
-        if use_temp_fasta:
+        # Clean up the dedicated temp directory only if not keeping
+        if not keep_temp:
             import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(ac_temp_dir, ignore_errors=True)
+            logger.debug(f"Cleaned up temp directory: {ac_temp_dir}")
+        else:
+            logger.info(f"Temp files kept at: {ac_temp_dir}")
     
     # Filter SNPs based on results across all genomes
     n_genomes = len(index_paths)
@@ -1648,6 +1671,7 @@ def run_filter(
                 score_diff_threshold=ac_score_diff,
                 min_genomes=ac_min_genomes,
                 fasta_path=fasta_path,
+                work_dir=output_prefix.parent,  # Keep temp files in output directory
             )
             if result.is_err():
                 return Err(result.unwrap_err())
