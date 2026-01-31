@@ -76,8 +76,13 @@ class SNP:
     
     @property
     def id(self) -> str:
-        """Generate unique identifier for this SNP."""
-        return f"{self.chrom}:{self.pos}_{self.ref}>{self.alt}"
+        """Generate unique identifier for this SNP.
+        
+        Format: {chrom}:{pos}_{ref}_to_{alt}
+        Note: Uses '_to_' instead of '>' to avoid conflicts with FASTA format,
+        where '>' is the sequence header delimiter.
+        """
+        return f"{self.chrom}:{self.pos}_{self.ref}_to_{self.alt}"
 
 
 @dataclass
