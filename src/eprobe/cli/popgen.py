@@ -306,6 +306,11 @@ def extract(
     help="Target taxon ID(s) for taxonomic filtering (comma-separated, e.g., '4530,4531').",
 )
 @click.option(
+    "--tx_target_names",
+    type=str,
+    help="Target taxonomy name(s) for filtering (comma-separated, e.g., 'Tacamahaca,Populus').",
+)
+@click.option(
     "--tx_names",
     type=click.Path(exists=True, path_type=Path),
     help="NCBI taxonomy names.dmp file (required for taxonomic filter).",
@@ -388,6 +393,7 @@ def filter(
     ac_min_genomes: Optional[int],
     tx_db: Optional[str],
     tx_taxid: Optional[str],
+    tx_target_names: Optional[str],
     tx_names: Optional[Path],
     tx_nodes: Optional[Path],
     tx_acc2tax: Optional[Path],
@@ -424,10 +430,35 @@ def filter(
     gc_min, gc_max = map(float, gc.split(","))
     tm_min, tm_max = map(float, tm.split(","))
     
-    # Parse taxonomy IDs
+    # Parse taxonomy IDs (from both taxid and target names)
     tx_ids = None
     if tx_taxid:
         tx_ids = [int(t.strip()) for t in tx_taxid.split(",")]
+    
+    # If target names provided, convert to taxids
+    if tx_target_names:
+        if not tx_names:
+            echo_error("--tx_target_names requires --tx_names (names.dmp file)")
+            raise SystemExit(1)
+        
+        # Parse names.dmp and convert target names to taxids
+        from eprobe.popgen.filter import parse_taxonomy_names_to_taxids
+        target_name_list = [n.strip() for n in tx_target_names.split(",")]
+        
+        name_result = parse_taxonomy_names_to_taxids(tx_names, target_name_list)
+        if name_result.is_err():
+            echo_error(f"Failed to parse taxonomy names: {name_result.unwrap_err()}")
+            raise SystemExit(1)
+        
+        name_taxids = name_result.unwrap()
+        echo_info(f"Converted taxonomy names to IDs: {dict(zip(target_name_list, name_taxids))}")
+        
+        # Merge with taxids from --tx_taxid
+        if tx_ids is None:
+            tx_ids = name_taxids
+        else:
+            tx_ids.extend(name_taxids)
+            tx_ids = list(set(tx_ids))  # Remove duplicates
     
     # Determine which filters to apply
     filters = []
@@ -495,7 +526,28 @@ def filter(
         if 'ac_remaining' in stats:
             echo_info(f"    ├─ Accessibility filter: {stats['ac_remaining']} SNPs remaining")
         if 'tx_remaining' in stats:
-            echo_info(f"    └─ Taxonomic filter: {stats['tx_remaining']} SNPs remaining")
+            echo_info(f"    ├─ Taxonomic filter: {stats['tx_remaining']} SNPs remaining")
+            
+            # Show per-taxid statistics if available
+            if 'tx_taxid_counts' in stats and stats['tx_taxid_counts']:
+                taxid_counts = stats['tx_taxid_counts']
+                
+                # Try to get taxon names if names.dmp available
+                taxid_names = {}
+                if tx_names:
+                    from eprobe.popgen.filter import get_taxid_names
+                    name_result = get_taxid_names(tx_names, list(taxid_counts.keys()))
+                    if name_result.is_ok():
+                        taxid_names = name_result.unwrap()
+                
+                echo_info(f"    │  Probes per taxonomy node:")
+                for taxid in sorted(taxid_counts.keys()):
+                    count = taxid_counts[taxid]
+                    name = taxid_names.get(taxid, "")
+                    if name:
+                        echo_info(f"    │    ├─ {taxid} ({name}): {count} probes")
+                    else:
+                        echo_info(f"    │    ├─ {taxid}: {count} probes")
     
     # Step 2: Biophysical filter
     if 'biophysical' in stats['filters_applied'] and 'biophysical_details' in stats:

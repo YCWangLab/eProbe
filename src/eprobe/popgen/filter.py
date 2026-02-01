@@ -1275,37 +1275,253 @@ def run_ngslca(
         return Err("ngsLCA not found. Please install ngsLCA and ensure it's in PATH.")
 
 
+def parse_taxonomy_names_to_taxids(
+    names_dmp: Path,
+    target_names: List[str],
+) -> Result[List[int], str]:
+    """
+    Convert taxonomy names to taxonomy IDs using names.dmp.
+    
+    Searches for scientific names matching the target names.
+    Format: taxid | name | unique_name | name_class |
+    Example: 9606 | Homo sapiens | | scientific name |
+    
+    Args:
+        names_dmp: Path to NCBI names.dmp file
+        target_names: List of taxonomy names to search for
+        
+    Returns:
+        Result containing list of taxonomy IDs (in same order as target_names)
+    """
+    name_to_taxid = {}
+    
+    try:
+        # Build a map of scientific names to taxids
+        with open(names_dmp, 'r') as f:
+            for line in f:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 4:
+                    taxid = int(parts[0])
+                    name = parts[1]
+                    name_class = parts[3]
+                    
+                    # Only use scientific names for matching
+                    if name_class == 'scientific name':
+                        name_to_taxid[name] = taxid
+        
+        # Convert target names to taxids
+        taxids = []
+        not_found = []
+        
+        for target in target_names:
+            if target in name_to_taxid:
+                taxids.append(name_to_taxid[target])
+            else:
+                not_found.append(target)
+        
+        if not_found:
+            return Err(f"Taxonomy names not found: {', '.join(not_found)}")
+        
+        return Ok(taxids)
+        
+    except Exception as e:
+        return Err(f"Failed to parse names.dmp: {e}")
+
+
+def get_taxid_names(
+    names_dmp: Path,
+    taxids: List[int],
+) -> Result[Dict[int, str], str]:
+    """
+    Get scientific names for taxonomy IDs from names.dmp.
+    
+    Args:
+        names_dmp: Path to NCBI names.dmp file
+        taxids: List of taxonomy IDs to look up
+        
+    Returns:
+        Result containing dict mapping taxid -> scientific name
+    """
+    taxid_set = set(taxids)
+    taxid_to_name = {}
+    
+    try:
+        with open(names_dmp, 'r') as f:
+            for line in f:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 4:
+                    taxid = int(parts[0])
+                    if taxid in taxid_set:
+                        name = parts[1]
+                        name_class = parts[3]
+                        
+                        # Only use scientific names
+                        if name_class == 'scientific name':
+                            taxid_to_name[taxid] = name
+        
+        return Ok(taxid_to_name)
+        
+    except Exception as e:
+        return Err(f"Failed to parse names.dmp: {e}")
+
+
+def parse_taxonomy_nodes(nodes_dmp: Path) -> Result[Dict[int, int], str]:
+    """
+    Parse NCBI taxonomy nodes.dmp to build taxid -> parent_taxid mapping.
+    
+    Args:
+        nodes_dmp: Path to NCBI nodes.dmp file
+        
+    Returns:
+        Result containing dict {taxid: parent_taxid}
+    """
+    parent_map = {}
+    
+    try:
+        with open(nodes_dmp, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t|\t')
+                if len(parts) >= 2:
+                    taxid = int(parts[0].strip())
+                    parent_taxid = int(parts[1].strip())
+                    parent_map[taxid] = parent_taxid
+        
+        logger.debug(f"Parsed {len(parent_map)} taxonomy nodes from {nodes_dmp}")
+        return Ok(parent_map)
+        
+    except Exception as e:
+        return Err(f"Failed to parse nodes.dmp: {e}")
+
+
+def is_descendant_of(taxid: int, target_taxids: List[int], parent_map: Dict[int, int]) -> bool:
+    """
+    Check if taxid is a descendant of (or equal to) any target taxid.
+    
+    Walks up the taxonomy tree from taxid to root, checking if any
+    ancestor matches a target taxid. This allows filtering by clade:
+    specifying a high-level taxid (e.g., family) will keep all sequences
+    assigned to that family or any of its descendants (genera, species, etc.).
+    
+    Args:
+        taxid: Taxonomy ID to check
+        target_taxids: List of target taxonomy IDs
+        parent_map: Mapping of taxid -> parent_taxid from nodes.dmp
+        
+    Returns:
+        True if taxid is equal to or descendant of any target_taxid
+    """
+    if taxid in target_taxids:
+        return True
+    
+    # Walk up the taxonomy tree
+    current = taxid
+    visited = set()
+    
+    while current in parent_map:
+        parent = parent_map[current]
+        
+        # Prevent infinite loops
+        if parent in visited or parent == current:
+            break
+        
+        visited.add(current)
+        current = parent
+        
+        if current in target_taxids:
+            return True
+    
+    return False
+
+
 def parse_lca_results(
     lca_path: Path,
     target_taxids: List[int],
-) -> Result[Set[str], str]:
+    nodes_dmp: Optional[Path] = None,
+) -> Result[Tuple[Set[str], Dict[int, int]], str]:
     """
     Parse ngsLCA output to extract sequences assigned to target taxa.
+    
+    If nodes_dmp is provided, uses taxonomy hierarchy to include sequences
+    assigned to target taxids OR their descendants (e.g., specifying a family
+    taxid will keep all sequences from that family's genera and species).
+    
+    If nodes_dmp is None, only exact taxid matches are kept.
     
     Args:
         lca_path: Path to .lca file
         target_taxids: List of target taxonomy IDs
+        nodes_dmp: Optional path to NCBI nodes.dmp for hierarchy checking
         
     Returns:
-        Result containing set of sequence IDs assigned to target taxa
+        Result containing tuple of (sequence IDs set, taxid->count dict)
     """
     import re
     
     assigned_ids: Set[str] = set()
+    taxid_counts: Dict[int, int] = {}
+    
+    # Parse taxonomy hierarchy if provided
+    parent_map = None
+    if nodes_dmp is not None:
+        parse_result = parse_taxonomy_nodes(nodes_dmp)
+        if parse_result.is_err():
+            logger.warning(f"Could not parse taxonomy nodes: {parse_result.unwrap_err()}")
+            logger.warning("Falling back to exact taxid matching only")
+        else:
+            parent_map = parse_result.unwrap()
+            logger.info(f"Using taxonomy hierarchy: will include sequences assigned to target taxa and their descendants")
+    else:
+        logger.info("No nodes.dmp provided: using exact taxid matching only")
     
     try:
         with open(lca_path) as f:
             for line in f:
-                # Check if line contains any target taxid
-                for taxid in target_taxids:
-                    if re.search(rf'\s+{taxid}:', line):
-                        # Extract sequence ID (before last 3 colons)
-                        parts = line.split('\t')[0].split(':')
-                        seq_id = ':'.join(parts[:-3])
-                        assigned_ids.add(seq_id.strip())
-                        break
+                # ngsLCA output format: seq_id\ttaxid:count\t...
+                # Extract taxid from the line
+                parts = line.strip().split('\t')
+                if len(parts) < 2:
+                    continue
+                
+                # Find taxid assignments in the line
+                taxid_matches = re.findall(r'(\d+):', line)
+                if not taxid_matches:
+                    continue
+                
+                # Check each taxid found in the line
+                match_found = False
+                matched_taxid = None
+                for taxid_str in taxid_matches:
+                    try:
+                        taxid = int(taxid_str)
+                        
+                        # Check if this taxid matches target (with or without hierarchy)
+                        if parent_map is not None:
+                            # Use taxonomy hierarchy
+                            if is_descendant_of(taxid, target_taxids, parent_map):
+                                match_found = True
+                                matched_taxid = taxid
+                                break
+                        else:
+                            # Exact match only
+                            if taxid in target_taxids:
+                                match_found = True
+                                matched_taxid = taxid
+                                break
+                    except ValueError:
+                        continue
+                
+                if match_found and matched_taxid is not None:
+                    # Extract sequence ID (before last 3 colons)
+                    seq_id_part = parts[0].split(':')
+                    seq_id = ':'.join(seq_id_part[:-3])
+                    assigned_ids.add(seq_id.strip())
+                    
+                    # Count sequences for this taxid
+                    taxid_counts[matched_taxid] = taxid_counts.get(matched_taxid, 0) + 1
         
-        return Ok(assigned_ids)
+        logger.info(f"Found {len(assigned_ids)} sequences assigned to target taxa")
+        return Ok((assigned_ids, taxid_counts))
+        
     except Exception as e:
         return Err(f"Failed to parse LCA results: {e}")
 
@@ -1322,7 +1538,7 @@ def filter_taxonomy(
     max_edit: int = 2,
     keep_hits: int = 100,
     threads: int = 1,
-) -> Result[List[SNP], str]:
+) -> Result[Tuple[List[SNP], Dict[int, int]], str]:
     """
     Filter SNPs based on taxonomic assignment using ngsLCA.
     
@@ -1346,7 +1562,7 @@ def filter_taxonomy(
         threads: Number of threads
         
     Returns:
-        Result containing filtered SNP list
+        Result containing tuple of (filtered SNP list, taxid->count dict)
     """
     if not snps:
         return Ok([])
@@ -1412,13 +1628,20 @@ def filter_taxonomy(
         
         lca_path = lca_result.unwrap()
         
-        # Parse LCA results
+        # Parse LCA results with taxonomy hierarchy
         logger.info("Parsing taxonomic assignments")
-        parse_result = parse_lca_results(lca_path, target_taxids)
+        parse_result = parse_lca_results(lca_path, target_taxids, nodes_dmp)
         if parse_result.is_err():
             return Err(parse_result.unwrap_err())
         
-        assigned_ids = parse_result.unwrap()
+        assigned_ids, taxid_counts = parse_result.unwrap()
+    
+    # Log per-taxid statistics
+    if taxid_counts:
+        logger.info("Probes per taxonomy node:")
+        for taxid in sorted(taxid_counts.keys()):
+            count = taxid_counts[taxid]
+            logger.info(f"  taxid {taxid}: {count} probes")
     
     # Filter SNPs based on assignments
     filtered_snps = [snp for snp in snps if snp.id in assigned_ids]
@@ -1427,7 +1650,7 @@ def filter_taxonomy(
     logger.info(f"Taxonomy filter: {len(assigned_ids)} sequences assigned to target taxa")
     logger.info(f"Taxonomy filter: removed {removed} SNPs, {len(filtered_snps)} remaining")
     
-    return Ok(filtered_snps)
+    return Ok((filtered_snps, taxid_counts))
 
 
 # =============================================================================
@@ -1690,9 +1913,10 @@ def run_filter(
             if result.is_err():
                 return Err(result.unwrap_err())
             
-            snps = result.unwrap()
+            snps, taxid_counts = result.unwrap()
             stats["filters_applied"].append("TX")
             stats["tx_remaining"] = len(snps)
+            stats["tx_taxid_counts"] = taxid_counts
         
         # Apply Biophysical filter
         if "biophysical" in filters_normalized:
