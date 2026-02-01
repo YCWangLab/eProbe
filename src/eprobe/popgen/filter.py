@@ -24,6 +24,11 @@ import numpy as np
 from eprobe.core.result import Result, Ok, Err
 from eprobe.core.models import SNP, SNPDataFrame
 from eprobe.core.fasta import write_fasta
+from eprobe.utils.bam_utils import (
+    sam_to_bam,
+    merge_and_namesort_bams,
+    get_compressbam_path,
+)
 from eprobe.biophysics import (
     calculate_gc,
     calculate_tm,
@@ -268,7 +273,7 @@ def display_kraken_summary(kmer_match_counts: Dict[str, int], match_threshold: i
 def filter_background_noise(
     snps: List[SNP],
     db_path: Path,
-    fasta_path: Optional[Path] = None,
+    fasta_path: Path,
     threads: int = 1,
     kmer_threshold: int = 1,
 ) -> Result[List[SNP], str]:
@@ -281,7 +286,7 @@ def filter_background_noise(
     Args:
         snps: Input SNP list
         db_path: Kraken2 database path
-        fasta_path: Optional pre-computed FASTA file
+        fasta_path: Path to probe FASTA file (required)
         threads: Number of threads
         kmer_threshold: Remove sequences with >= this many matched kmers (default: 1)
         
@@ -291,23 +296,12 @@ def filter_background_noise(
     if not snps:
         return Ok([])
     
+    if not fasta_path.exists():
+        return Err(f"FASTA file not found: {fasta_path}")
+    
     logger.info(f"Running background noise filter (Kraken2 kmer matching)")
     logger.info(f"Filtering threshold: >= {kmer_threshold} matched kmers")
     logger.info(f"Processing {len(snps)} SNPs")
-    
-    # Use shared FASTA or create temporary one
-    cleanup_fasta = False
-    if fasta_path is None:
-        # Create temporary FASTA
-        import tempfile
-        temp_fasta = tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False)
-        fasta_path = Path(temp_fasta.name)
-        cleanup_fasta = True
-        
-        sequences = {snp.id: probe_sequences[snp.id] for snp in snps}
-        write_result = write_fasta(sequences, fasta_path)
-        if write_result.is_err():
-            return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
     
     # Create temporary output file
     import tempfile
@@ -341,10 +335,6 @@ def filter_background_noise(
     finally:
         # Clean up temporary files
         try:
-            if cleanup_fasta and fasta_path.exists():
-                fasta_path.unlink()
-                logger.debug(f"Cleaned up temp FASTA: {fasta_path}")
-            
             if kraken_output_path.exists():
                 kraken_output_path.unlink()
                 logger.debug(f"Cleaned up kraken output: {kraken_output_path}")
@@ -765,10 +755,8 @@ def filter_accessibility(
         work_dir.mkdir(parents=True, exist_ok=True)
         ac_temp_dir = work_dir / f"eprobe_ac_{int(time.time())}"
         ac_temp_dir.mkdir(parents=True, exist_ok=True)
-        keep_temp = True  # Keep temp files when work_dir is specified
     else:
         ac_temp_dir = Path(tf.mkdtemp(prefix="eprobe_ac_"))
-        keep_temp = False
     logger.info(f"Using temp directory: {ac_temp_dir}")
     
     # Use existing FASTA or create a temp file from probe_sequences
@@ -890,13 +878,13 @@ def filter_accessibility(
                         "mappable": False,
                     }
     finally:
-        # Clean up the dedicated temp directory only if not keeping
-        if not keep_temp:
-            import shutil
+        # Clean up the dedicated temp directory
+        import shutil
+        try:
             shutil.rmtree(ac_temp_dir, ignore_errors=True)
             logger.debug(f"Cleaned up temp directory: {ac_temp_dir}")
-        else:
-            logger.info(f"Temp files kept at: {ac_temp_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up temp directory {ac_temp_dir}: {e}")
     
     # Filter SNPs based on results across all genomes
     n_genomes = len(index_paths)
@@ -1181,7 +1169,10 @@ def process_sam_to_bam(
     threads: int = 1,
 ) -> Result[Path, str]:
     """
-    Convert SAM to sorted BAM file.
+    Convert SAM to BAM file using optimized compression.
+    
+    Uses compressbam for faster BGZF compression on Linux,
+    falls back to samtools on other platforms.
     
     Args:
         sam_path: Input SAM file
@@ -1190,96 +1181,47 @@ def process_sam_to_bam(
     Returns:
         Result containing path to output BAM file
     """
-    bam_path = sam_path.with_suffix(".bam")
+    # Log which compression method will be used
+    if get_compressbam_path() is not None:
+        logger.debug("Using compressbam for fast BAM compression")
+    else:
+        logger.debug("Using samtools for BAM compression")
     
-    # Check if SAM has alignments
-    check_cmd = f"samtools view {sam_path} | head -n 1"
-    result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True)
-    
-    if not result.stdout.strip():
-        logger.warning(f"No alignments found in {sam_path}")
-        return Err("No alignments found")
-    
-    # Convert to BAM
-    cmd = [
-        "samtools", "view",
-        "-@", str(threads),
-        "-b",
-        "-o", str(bam_path),
-        str(sam_path),
-    ]
-    
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-        sam_path.unlink()  # Remove SAM file
-        return Ok(bam_path)
-    except subprocess.CalledProcessError as e:
-        return Err(f"SAM to BAM conversion failed: {e.stderr}")
-    except FileNotFoundError:
-        return Err("samtools not found. Please install samtools and ensure it's in PATH.")
+    # Use the optimized sam_to_bam from bam_utils
+    return sam_to_bam(
+        sam_path=sam_path,
+        threads=threads,
+        use_compressbam=True,
+        remove_sam=True,
+    )
 
 
 def merge_and_sort_bams(
     bam_files: List[Path],
     output_path: Path,
     threads: int = 1,
+    cleanup: bool = True,
 ) -> Result[Path, str]:
     """
     Merge multiple BAM files and sort by name (required for ngsLCA).
+    
+    Uses optimized merge_and_namesort_bams from bam_utils.
     
     Args:
         bam_files: List of BAM files to merge
         output_path: Output sorted BAM path
         threads: Number of threads
+        cleanup: Whether to remove input BAM files after merging
         
     Returns:
         Result containing path to sorted BAM file
     """
-    if len(bam_files) == 0:
-        return Err("No BAM files to merge")
-    
-    if len(bam_files) == 1:
-        # Single file, just sort
-        sorted_bam = output_path
-        sort_cmd = [
-            "samtools", "sort",
-            "-n",  # Sort by read name (required for ngsLCA)
-            "-@", str(threads),
-            "-O", "bam",
-            "-o", str(sorted_bam),
-            str(bam_files[0]),
-        ]
-    else:
-        # Multiple files, merge then sort
-        merged_bam = output_path.with_suffix(".merged.bam")
-        merge_cmd = [
-            "samtools", "merge",
-            "-n",  # Assume input sorted by name
-            "-@", str(threads),
-            "-o", str(merged_bam),
-        ] + [str(f) for f in bam_files]
-        
-        try:
-            subprocess.run(merge_cmd, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as e:
-            return Err(f"BAM merge failed: {e.stderr}")
-        
-        sorted_bam = output_path
-        sort_cmd = [
-            "samtools", "sort",
-            "-n",
-            "-@", str(threads),
-            "-O", "bam",
-            "-o", str(sorted_bam),
-            str(merged_bam),
-        ]
-        merged_bam.unlink()  # Clean up merged file
-    
-    try:
-        subprocess.run(sort_cmd, capture_output=True, text=True, check=True)
-        return Ok(sorted_bam)
-    except subprocess.CalledProcessError as e:
-        return Err(f"BAM sort failed: {e.stderr}")
+    return merge_and_namesort_bams(
+        bam_files=bam_files,
+        output_path=output_path,
+        threads=threads,
+        cleanup=cleanup,
+    )
 
 
 def run_ngslca(
@@ -1375,7 +1317,7 @@ def filter_taxonomy(
     nodes_dmp: Path,
     acc2tax: Path,
     target_taxids: List[int],
-    fasta_path: Optional[Path] = None,
+    fasta_path: Path,
     min_edit: int = 0,
     max_edit: int = 2,
     keep_hits: int = 100,
@@ -1397,7 +1339,7 @@ def filter_taxonomy(
         nodes_dmp: NCBI taxonomy nodes.dmp file
         acc2tax: Accession to taxid mapping file
         target_taxids: List of target taxonomy IDs to keep
-        fasta_path: Optional pre-computed FASTA file (optimization)
+        fasta_path: Path to probe FASTA file (required)
         min_edit: Minimum edit distance for ngsLCA (default: 0)
         max_edit: Maximum edit distance for ngsLCA (default: 2)
         keep_hits: Number of alignments to report per sequence (default: 100)
@@ -1409,29 +1351,22 @@ def filter_taxonomy(
     if not snps:
         return Ok([])
     
+    if not fasta_path.exists():
+        return Err(f"FASTA file not found: {fasta_path}")
+    
     logger.info(f"Running taxonomic filter (ngsLCA) on {len(snps)} SNPs")
     logger.info(f"Target taxonomy IDs: {target_taxids}")
     logger.info(f"Using {len(index_paths)} database(s)")
     
+    # Log which compression method will be used
+    if get_compressbam_path() is not None:
+        logger.info("Using compressbam for fast BAM compression")
+    else:
+        logger.info("Using samtools for BAM compression")
+    
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
-        
-        # Use shared FASTA or create temporary one
-        if fasta_path is not None:
-            # Use shared FASTA (optimization)
-            working_fasta = fasta_path
-            logger.debug(f"Using shared FASTA: {fasta_path}")
-        else:
-            # Fallback: create temporary FASTA
-            working_fasta = tmpdir_path / "probes.fa"
-            sequences = {
-                snp.id: probe_sequences[snp.id]
-                for snp in snps
-            }
-            
-            write_result = write_fasta(sequences, working_fasta)
-            if write_result.is_err():
-                return Err(f"Failed to write temp FASTA: {write_result.unwrap_err()}")
+        working_fasta = fasta_path
         
         # Map to all databases
         bam_files = []
