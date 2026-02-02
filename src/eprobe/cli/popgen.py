@@ -378,6 +378,11 @@ def extract(
     is_flag=True,
     help="Skip biophysical filtering (GC, Tm, complexity, hairpin, dimer).",
 )
+@click.option(
+    "--keep-temp",
+    is_flag=True,
+    help="Keep temporary files for debugging (SAM, BAM, FASTA, etc.).",
+)
 @click.pass_context
 def filter(
     ctx: click.Context,
@@ -406,6 +411,7 @@ def filter(
     hairpin: float,
     dimer: float,
     no_biophysical: bool,
+    keep_temp: bool,
 ) -> None:
     """
     Apply multi-stage filtering to SNPs.
@@ -501,6 +507,7 @@ def filter(
         max_hairpin=hairpin,
         max_dimer=dimer,
         verbose=verbose,
+        keep_temp=keep_temp,
     )
     
     if result.is_err():

@@ -277,6 +277,7 @@ def filter_background_noise(
     threads: int = 1,
     kmer_threshold: int = 1,
     work_dir: Optional[Path] = None,
+    keep_temp: bool = False,
 ) -> Result[List[SNP], str]:
     """
     Filter SNPs using Kraken2 as simple kmer matcher (ignore taxonomy).
@@ -346,13 +347,16 @@ def filter_background_noise(
         return Ok(filtered_snps)
         
     finally:
-        # Clean up entire temp directory
-        try:
-            if bg_temp_dir.exists():
-                shutil.rmtree(bg_temp_dir)
-                logger.debug(f"Cleaned up temp directory: {bg_temp_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to clean up temporary directory: {e}")
+        # Clean up entire temp directory (unless keep_temp is True)
+        if not keep_temp:
+            try:
+                if bg_temp_dir.exists():
+                    shutil.rmtree(bg_temp_dir)
+                    logger.debug(f"Cleaned up temp directory: {bg_temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory: {e}")
+        else:
+            logger.info(f"Keeping temp directory for debugging: {bg_temp_dir}")
 
 
 # =============================================================================
@@ -689,6 +693,7 @@ def filter_accessibility(
     fasta_path: Optional[Path] = None,
     probe_sequences: Optional[Dict[str, str]] = None,
     work_dir: Optional[Path] = None,
+    keep_temp: bool = False,
 ) -> Result[List[SNP], str]:
     """
     Filter SNPs based on genomic accessibility across multiple genomes.
@@ -880,13 +885,16 @@ def filter_accessibility(
                         "mappable": False,
                     }
     finally:
-        # Clean up the dedicated temp directory
-        import shutil
-        try:
-            shutil.rmtree(ac_temp_dir, ignore_errors=True)
-            logger.debug(f"Cleaned up temp directory: {ac_temp_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to clean up temp directory {ac_temp_dir}: {e}")
+        # Clean up the dedicated temp directory (unless keep_temp is True)
+        if not keep_temp:
+            import shutil
+            try:
+                shutil.rmtree(ac_temp_dir, ignore_errors=True)
+                logger.debug(f"Cleaned up temp directory: {ac_temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temp directory {ac_temp_dir}: {e}")
+        else:
+            logger.info(f"Keeping temp directory for debugging: {ac_temp_dir}")
     
     # Filter SNPs based on results across all genomes
     n_genomes = len(index_paths)
@@ -1541,6 +1549,7 @@ def filter_taxonomy(
     keep_hits: int = 100,
     threads: int = 1,
     work_dir: Optional[Path] = None,
+    keep_temp: bool = False,
 ) -> Result[Tuple[List[SNP], Dict[int, int]], str]:
     """
     Filter SNPs based on taxonomic assignment using ngsLCA.
@@ -1593,10 +1602,10 @@ def filter_taxonomy(
         work_dir.mkdir(parents=True, exist_ok=True)
         tx_temp_dir = work_dir / f"eprobe_tx_{int(time.time())}"
         tx_temp_dir.mkdir(parents=True, exist_ok=True)
-        cleanup_temp = True
+        cleanup_temp = not keep_temp  # Respect keep_temp flag
     else:
         tx_temp_dir = Path(tempfile.mkdtemp(prefix="eprobe_tx_"))
-        cleanup_temp = True
+        cleanup_temp = not keep_temp  # Respect keep_temp flag
     
     logger.info(f"Using temp directory: {tx_temp_dir}")
     
@@ -1657,13 +1666,15 @@ def filter_taxonomy(
         assigned_ids, taxid_counts = parse_result.unwrap()
     
     finally:
-        # Cleanup temp directory
+        # Cleanup temp directory (unless keep_temp is True)
         if cleanup_temp and tx_temp_dir.exists():
             try:
                 shutil.rmtree(tx_temp_dir, ignore_errors=True)
                 logger.debug(f"Cleaned up temp directory: {tx_temp_dir}")
             except Exception as e:
                 logger.warning(f"Failed to clean up temp directory {tx_temp_dir}: {e}")
+        elif not cleanup_temp:
+            logger.info(f"Keeping temp directory for debugging: {tx_temp_dir}")
     
     # Log per-taxid statistics
     if taxid_counts:
@@ -1712,6 +1723,7 @@ def run_filter(
     probe_length: int = 100,
     threads: int = 1,
     verbose: bool = False,
+    keep_temp: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Run multi-stage SNP filtering pipeline.
@@ -1869,7 +1881,8 @@ def run_filter(
                 logger.info(f"Background filter {idx}/{len(bg_databases)}: {db_path.name}")
                 result = filter_background_noise(
                     snps, db_path, fasta_path, threads,
-                    work_dir=output_prefix.parent,  # Keep temp files in output directory
+                    work_dir=output_prefix.parent,
+                    keep_temp=keep_temp,
                 )
                 if result.is_err():
                     return Err(result.unwrap_err())
@@ -1900,7 +1913,8 @@ def run_filter(
                 score_diff_threshold=ac_score_diff,
                 min_genomes=ac_min_genomes,
                 fasta_path=fasta_path,
-                work_dir=output_prefix.parent,  # Keep temp files in output directory
+                work_dir=output_prefix.parent,
+                keep_temp=keep_temp,
             )
             if result.is_err():
                 return Err(result.unwrap_err())
@@ -1944,7 +1958,8 @@ def run_filter(
                 max_edit=tx_max_edit if tx_max_edit is not None else 2,
                 keep_hits=tx_keep_hits if tx_keep_hits is not None else 100,
                 threads=threads,
-                work_dir=output_prefix.parent,  # Keep temp files in output directory
+                work_dir=output_prefix.parent,
+                keep_temp=keep_temp,
             )
             if result.is_err():
                 return Err(result.unwrap_err())
