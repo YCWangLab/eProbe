@@ -191,8 +191,9 @@ def sam_to_bam(
     else:
         bam_path = Path(bam_path)
     
-    # Check if SAM has alignments
-    check_cmd = f"head -n 1000 {sam_path} | grep -v '^@' | head -n 1"
+    # Check if SAM has alignments (skip all headers first)
+    # Use awk to skip header lines and print first non-header line
+    check_cmd = f"awk '/^[^@]/{{print; exit}}' {sam_path}"
     result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True)
     
     if not result.stdout.strip():
