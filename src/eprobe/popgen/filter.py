@@ -1272,6 +1272,7 @@ def run_ngslca(
         "-editdistmax", str(max_edit),
         "-bam", str(bam_path),
         "-outnames", str(output_prefix) + f".min{min_edit}max{max_edit}",
+        "-fix_ncbi", "0",  # Disable NCBI merged name fixes for custom taxonomy DBs
     ]
     
     logger.debug(f"Running ngsLCA: {' '.join(cmd)}")
