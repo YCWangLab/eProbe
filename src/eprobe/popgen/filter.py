@@ -1676,6 +1676,17 @@ def filter_taxonomy(
                 logger.warning(f"Failed to clean up temp directory {tx_temp_dir}: {e}")
         elif not cleanup_temp:
             logger.info(f"Keeping temp directory for debugging: {tx_temp_dir}")
+        
+        # Cleanup ngsLCA cache files (created in current working directory)
+        # ngsLCA creates {acc2tax_basename}{bam_basename}.bin files
+        if cleanup_temp:
+            try:
+                ngslca_bin_pattern = f"{acc2tax.name}*.bin"
+                for bin_file in Path.cwd().glob(ngslca_bin_pattern):
+                    bin_file.unlink()
+                    logger.debug(f"Cleaned up ngsLCA cache file: {bin_file}")
+            except Exception as e:
+                logger.debug(f"Failed to clean up ngsLCA cache files: {e}")
     
     # Log per-taxid statistics
     if taxid_counts:
