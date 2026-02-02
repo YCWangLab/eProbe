@@ -276,6 +276,7 @@ def filter_background_noise(
     fasta_path: Path,
     threads: int = 1,
     kmer_threshold: int = 1,
+    work_dir: Optional[Path] = None,
 ) -> Result[List[SNP], str]:
     """
     Filter SNPs using Kraken2 as simple kmer matcher (ignore taxonomy).
@@ -289,6 +290,7 @@ def filter_background_noise(
         fasta_path: Path to probe FASTA file (required)
         threads: Number of threads
         kmer_threshold: Remove sequences with >= this many matched kmers (default: 1)
+        work_dir: Directory for temporary files (default: system temp)
         
     Returns:
         Result containing filtered SNP list
@@ -303,10 +305,21 @@ def filter_background_noise(
     logger.info(f"Filtering threshold: >= {kmer_threshold} matched kmers")
     logger.info(f"Processing {len(snps)} SNPs")
     
-    # Create temporary output file
+    # Create temporary directory for kraken output
     import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.kraken.out', delete=False) as temp_out:
-        kraken_output_path = Path(temp_out.name)
+    import time
+    import shutil
+    
+    if work_dir is not None:
+        work_dir = Path(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        bg_temp_dir = work_dir / f"eprobe_bg_{int(time.time())}"
+        bg_temp_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        bg_temp_dir = Path(tempfile.mkdtemp(prefix="eprobe_bg_"))
+    
+    logger.info(f"Using temp directory: {bg_temp_dir}")
+    kraken_output_path = bg_temp_dir / "kraken.out"
     
     try:
         # Run Kraken2
@@ -333,24 +346,13 @@ def filter_background_noise(
         return Ok(filtered_snps)
         
     finally:
-        # Clean up temporary files
+        # Clean up entire temp directory
         try:
-            if kraken_output_path.exists():
-                kraken_output_path.unlink()
-                logger.debug(f"Cleaned up kraken output: {kraken_output_path}")
-            
-            # Clean up additional kraken files
-            report_path = kraken_output_path.parent / "kraken2.report"
-            classified_path = kraken_output_path.parent / "kraken2.classified.fasta"
-            unclassified_path = kraken_output_path.parent / "kraken2.unclassified.fasta"
-            
-            for cleanup_file in [report_path, classified_path, unclassified_path]:
-                if cleanup_file.exists():
-                    cleanup_file.unlink()
-                    logger.debug(f"Cleaned up: {cleanup_file}")
-                    
+            if bg_temp_dir.exists():
+                shutil.rmtree(bg_temp_dir)
+                logger.debug(f"Cleaned up temp directory: {bg_temp_dir}")
         except Exception as e:
-            logger.warning(f"Failed to clean up temporary files: {e}")
+            logger.warning(f"Failed to clean up temporary directory: {e}")
 
 
 # =============================================================================
@@ -1538,6 +1540,7 @@ def filter_taxonomy(
     max_edit: int = 2,
     keep_hits: int = 100,
     threads: int = 1,
+    work_dir: Optional[Path] = None,
 ) -> Result[Tuple[List[SNP], Dict[int, int]], str]:
     """
     Filter SNPs based on taxonomic assignment using ngsLCA.
@@ -1560,6 +1563,7 @@ def filter_taxonomy(
         max_edit: Maximum edit distance for ngsLCA (default: 2)
         keep_hits: Number of alignments to report per sequence (default: 100)
         threads: Number of threads
+        work_dir: Directory for temporary files (default: system temp)
         
     Returns:
         Result containing tuple of (filtered SNP list, taxid->count dict)
@@ -1580,8 +1584,24 @@ def filter_taxonomy(
     else:
         logger.info("Using samtools for BAM compression")
     
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
+    # Create temp directory in work_dir or use system temp
+    import time
+    import shutil
+    
+    if work_dir is not None:
+        work_dir = Path(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        tx_temp_dir = work_dir / f"eprobe_tx_{int(time.time())}"
+        tx_temp_dir.mkdir(parents=True, exist_ok=True)
+        cleanup_temp = True
+    else:
+        tx_temp_dir = Path(tempfile.mkdtemp(prefix="eprobe_tx_"))
+        cleanup_temp = True
+    
+    logger.info(f"Using temp directory: {tx_temp_dir}")
+    
+    try:
+        tmpdir_path = tx_temp_dir
         working_fasta = fasta_path
         
         # Map to all databases
@@ -1635,6 +1655,15 @@ def filter_taxonomy(
             return Err(parse_result.unwrap_err())
         
         assigned_ids, taxid_counts = parse_result.unwrap()
+    
+    finally:
+        # Cleanup temp directory
+        if cleanup_temp and tx_temp_dir.exists():
+            try:
+                shutil.rmtree(tx_temp_dir, ignore_errors=True)
+                logger.debug(f"Cleaned up temp directory: {tx_temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temp directory {tx_temp_dir}: {e}")
     
     # Log per-taxid statistics
     if taxid_counts:
@@ -1788,6 +1817,10 @@ def run_filter(
     # Normalize filter names
     filters_normalized = [f.lower() for f in filters]
     
+    # Set up work directory in output path's parent
+    work_dir = output_prefix.parent
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
     # Write shared FASTA file for external filters (BG/AC/TX)
     # Only create if any external filter is enabled
     needs_fasta = any(f in filters_normalized for f in ["bg", "ac", "tx"])
@@ -1795,9 +1828,8 @@ def run_filter(
     
     if needs_fasta:
         logger.info("Writing probe sequences to temporary FASTA (shared by external filters)")
-        import tempfile
-        temp_fasta = tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False)
-        fasta_path = Path(temp_fasta.name)
+        # Create temp fasta in work_dir instead of system temp
+        fasta_path = work_dir / f"{output_prefix.name}.temp_probes.fa"
         
         write_result = write_fasta(probe_sequences, fasta_path)
         if write_result.is_err():
@@ -1835,7 +1867,10 @@ def run_filter(
             
             for idx, db_path in enumerate(bg_databases, 1):
                 logger.info(f"Background filter {idx}/{len(bg_databases)}: {db_path.name}")
-                result = filter_background_noise(snps, db_path, fasta_path, threads)
+                result = filter_background_noise(
+                    snps, db_path, fasta_path, threads,
+                    work_dir=output_prefix.parent,  # Keep temp files in output directory
+                )
                 if result.is_err():
                     return Err(result.unwrap_err())
                 snps = result.unwrap()
@@ -1909,6 +1944,7 @@ def run_filter(
                 max_edit=tx_max_edit if tx_max_edit is not None else 2,
                 keep_hits=tx_keep_hits if tx_keep_hits is not None else 100,
                 threads=threads,
+                work_dir=output_prefix.parent,  # Keep temp files in output directory
             )
             if result.is_err():
                 return Err(result.unwrap_err())
