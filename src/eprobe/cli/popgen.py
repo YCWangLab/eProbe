@@ -443,6 +443,19 @@ def extract(
     help="Skip biophysical filtering (GC, Tm, complexity, hairpin, dimer).",
 )
 @click.option(
+    "--max_ambiguous",
+    type=int,
+    default=0,
+    help="Max ambiguous bases (N, Y, R, W, etc.) per probe. "
+         "0 (default): remove all probes with any ambiguous base. "
+         ">0: replace ambiguous bases randomly if count <= N, else remove.",
+)
+@click.option(
+    "--no-prefilter",
+    is_flag=True,
+    help="Skip the ambiguous base prefilter step entirely.",
+)
+@click.option(
     "--keep-temp",
     is_flag=True,
     help="Keep temporary files for debugging (SAM, BAM, FASTA, etc.).",
@@ -484,6 +497,8 @@ def filter(
     nn_table: str,
     na_conc: float,
     no_biophysical: bool,
+    max_ambiguous: int,
+    no_prefilter: bool,
     keep_temp: bool,
 ) -> None:
     """
@@ -491,6 +506,7 @@ def filter(
     
     \b
     Filtering stages:
+      0. Prefilter: Remove/replace probes with ambiguous bases (N, Y, R, etc.)
       1. Background (--bg_db): Remove sequences matching background organisms
       2. Accessibility (--ac_db): Remove sequences in repetitive/inaccessible regions
       3. Taxonomic (--tx_db): Keep only sequences assignable to target taxon
@@ -642,6 +658,8 @@ def filter(
         na_conc=na_conc,
         verbose=verbose,
         keep_temp=keep_temp,
+        max_ambiguous=max_ambiguous,
+        no_prefilter=no_prefilter,
     )
     
     if result.is_err():
@@ -657,6 +675,15 @@ def filter(
     # Report with 3-step structure
     echo_success(f"\n→ Filtering Summary:")
     echo_info(f"  Input: {initial} SNPs")
+    
+    # Step 0: Prefilter
+    if 'prefilter' in stats['filters_applied'] and 'prefilter_details' in stats:
+        pf = stats['prefilter_details']
+        echo_success(f"\n  Step 0: Prefilter (ambiguous bases)")
+        echo_info(f"    ├─ Removed (ambiguous): {pf['removed']}")
+        if pf['replaced'] > 0:
+            echo_info(f"    ├─ Replaced: {pf['replaced']} probes ({pf['bases_replaced']} bases)")
+        echo_info(f"    └─ Remaining: {pf['remaining']} SNPs")
     
     # Step 1: External filters
     external_filters = [f for f in ['BG', 'AC', 'TX'] if f in stats['filters_applied']]

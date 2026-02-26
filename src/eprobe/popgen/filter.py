@@ -2,6 +2,7 @@
 SNP filtering module.
 
 Implements multi-stage filtering for SNP probe candidates:
+  - Prefilter: Ambiguous bases (N, Y, R, W, S, M, K, etc.) removal/replacement
   - Background noise filtering (Kraken2)
   - Accessibility filtering (Bowtie2)
   - Taxonomic filtering (NCBI taxonomy)
@@ -2247,6 +2248,88 @@ def filter_taxonomy_besthit(
 # Main Filter Pipeline
 # =============================================================================
 
+# =============================================================================
+# Prefilter: Ambiguous base handling
+# =============================================================================
+
+# IUPAC ambiguous bases and their possible replacements
+IUPAC_AMBIGUOUS = {
+    'N': 'ACGT', 'R': 'AG', 'Y': 'CT', 'S': 'GC', 'W': 'AT',
+    'K': 'GT', 'M': 'AC', 'B': 'CGT', 'D': 'AGT', 'H': 'ACT', 'V': 'ACG',
+}
+
+
+def filter_ambiguous_bases(
+    snps: List[SNP],
+    probe_sequences: Dict[str, str],
+    max_ambiguous: int = 0,
+) -> Tuple[List[SNP], Dict[str, str], Dict[str, Any]]:
+    """
+    Pre-filter probes containing ambiguous (non-ATCG) bases.
+    
+    Behaviour based on max_ambiguous:
+      - max_ambiguous == 0 (default): Remove any probe with ambiguous bases.
+      - max_ambiguous > 0:  If a probe has <= max_ambiguous ambiguous bases,
+            randomly replace each with a valid base from the IUPAC table.
+            If a probe has > max_ambiguous ambiguous bases, remove it.
+    
+    Args:
+        snps: Input SNP list
+        probe_sequences: SNP ID -> probe sequence map (will be modified in-place
+                         when replacing ambiguous bases)
+        max_ambiguous: Max number of ambiguous bases allowed before replacement.
+                       0 = strict mode (no ambiguous bases tolerated).
+    
+    Returns:
+        (filtered_snps, updated_probe_sequences, stats_dict)
+    """
+    import random
+    
+    valid_bases = set('ATCGatcg')
+    passed = []
+    removed_count = 0
+    replaced_count = 0
+    total_bases_replaced = 0
+    
+    for snp in snps:
+        seq = probe_sequences.get(snp.id, "")
+        seq_upper = seq.upper()
+        
+        # Count ambiguous bases
+        ambiguous_positions = [
+            i for i, base in enumerate(seq_upper)
+            if base not in 'ACGT'
+        ]
+        n_ambig = len(ambiguous_positions)
+        
+        if n_ambig == 0:
+            # Clean sequence, keep as-is
+            passed.append(snp)
+        elif max_ambiguous > 0 and n_ambig <= max_ambiguous:
+            # Replace ambiguous bases randomly
+            seq_list = list(seq_upper)
+            for pos in ambiguous_positions:
+                base = seq_list[pos]
+                candidates = IUPAC_AMBIGUOUS.get(base, 'ACGT')
+                seq_list[pos] = random.choice(candidates)
+            probe_sequences[snp.id] = ''.join(seq_list)
+            passed.append(snp)
+            replaced_count += 1
+            total_bases_replaced += n_ambig
+        else:
+            # Too many ambiguous bases, remove
+            removed_count += 1
+    
+    prefilter_stats = {
+        "removed": removed_count,
+        "replaced": replaced_count,
+        "bases_replaced": total_bases_replaced,
+        "remaining": len(passed),
+    }
+    
+    return passed, probe_sequences, prefilter_stats
+
+
 def run_filter(
     input_path: Path,
     reference_path: Path,
@@ -2282,11 +2365,14 @@ def run_filter(
     threads: int = 1,
     verbose: bool = False,
     keep_temp: bool = False,
+    max_ambiguous: int = 0,
+    no_prefilter: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Run multi-stage SNP filtering pipeline.
     
     Main entry point for the filter command. Applies filters in sequence:
+    0. Prefilter - Remove/replace ambiguous bases (N, Y, R, etc.)
     1. Background noise (BG) - if enabled
     2. Accessibility (AC) - if enabled
     3. Taxonomy (TX) - if enabled
@@ -2321,6 +2407,8 @@ def run_filter(
         probe_length: Length of probe sequences (for flanking calculation)
         threads: Number of threads
         verbose: Enable verbose logging
+        max_ambiguous: Max ambiguous bases to tolerate (0 = strict, >0 = replace)
+        no_prefilter: Skip the ambiguous base prefilter entirely
         
     Returns:
         Result containing filtering statistics
@@ -2386,6 +2474,22 @@ def run_filter(
         "initial_count": initial_count,
         "filters_applied": [],
     }
+    
+    # Step 0: Prefilter — remove or replace ambiguous bases
+    if not no_prefilter:
+        logger.info(f"Running prefilter: ambiguous base check (max_ambiguous={max_ambiguous})")
+        snps, probe_sequences, prefilter_stats = filter_ambiguous_bases(
+            snps, probe_sequences, max_ambiguous=max_ambiguous,
+        )
+        stats["filters_applied"].append("prefilter")
+        stats["prefilter_remaining"] = prefilter_stats["remaining"]
+        stats["prefilter_details"] = prefilter_stats
+        logger.info(
+            f"Prefilter: removed {prefilter_stats['removed']}, "
+            f"replaced {prefilter_stats['replaced']} "
+            f"({prefilter_stats['bases_replaced']} bases), "
+            f"{prefilter_stats['remaining']} remaining"
+        )
     
     # Normalize filter names
     filters_normalized = [f.lower() for f in filters]
