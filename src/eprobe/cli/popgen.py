@@ -713,13 +713,21 @@ def filter(
     "-i", "--input",
     required=True,
     type=click.Path(exists=True, path_type=Path),
-    help="Input filtered SNPs TSV file.",
+    multiple=True,
+    help="Input filtered SNPs TSV file(s). Can specify multiple: -i file1 -i file2 ...",
 )
 @click.option(
     "-o", "--output",
     required=True,
     type=click.Path(path_type=Path),
     help="Output prefix.",
+)
+@click.option(
+    "--merge_mode",
+    type=click.Choice(["intersection", "union", "difference", "symmetric_diff"]),
+    default="intersection",
+    help="Merge mode for multiple inputs: intersection (default, keep SNPs in ALL), "
+         "union (combine all), difference (only in 1st), symmetric_diff (in one only).",
 )
 @click.option(
     "--window_size",
@@ -747,7 +755,7 @@ def filter(
 @click.option(
     "--target_count",
     type=int,
-    help="Target number of SNPs to select. If not specified, keeps all SNPs.",
+    help="Target number of SNPs to select. If not specified, keeps all SNPs after merge.",
 )
 @click.option(
     "--seed",
@@ -764,8 +772,9 @@ def filter(
 @click.pass_context
 def select(
     ctx: click.Context,
-    input: Path,
+    input: tuple,
     output: Path,
+    merge_mode: str,
     window_size: int,
     strategy: str,
     weights: Optional[str],
@@ -777,8 +786,11 @@ def select(
     """
     Select optimal SNPs using window-based sampling.
     
-    Ensures even distribution of probes across the genome by selecting
-    SNPs with specified strategy.
+    Supports multiple input files with merge operations:
+    - intersection (default): Keep SNPs in ALL files
+    - union: Combine all SNPs
+    - difference: Only in first file
+    - symmetric_diff: In one file only
     
     \b
     Selection strategies:
@@ -791,9 +803,13 @@ def select(
     Output files:
       {output}.selected.tsv  - Selected SNPs
     """
-    from eprobe.popgen.select import run_select
+    from eprobe.popgen.select import run_select, merge_snp_files
     
     verbose = ctx.obj.get("verbose", False)
+    
+    if not input:
+        echo_error("At least one --input file is required")
+        raise SystemExit(1)
     
     # Parse weights if provided
     weight_values = None
@@ -803,13 +819,32 @@ def select(
             echo_error("Weights must have 5 values: gc,tm,complexity,hairpin,dimer")
             raise SystemExit(1)
     
-    echo_info(f"Selecting SNPs from {input}")
+    # Handle multiple input files
+    if len(input) > 1:
+        echo_info(f"Merging {len(input)} input files using {merge_mode} mode")
+        for i, f in enumerate(input, 1):
+            echo_info(f"  {i}. {f}")
+        
+        merge_result = merge_snp_files(list(input), merge_mode)
+        if merge_result.is_err():
+            echo_error(f"Failed to merge inputs: {merge_result.unwrap_err()}")
+            raise SystemExit(1)
+        
+        merged_snps = merge_result.unwrap()
+        echo_info(f"After merge ({merge_mode}): {len(merged_snps)} SNPs")
+        input_path = input[0]  # Use first file path as reference
+        merged_data = merged_snps
+    else:
+        input_path = input[0]
+        merged_data = None
+    
+    echo_info(f"Selecting SNPs from {input_path}")
     echo_info(f"Window size: {window_size}bp, Strategy: {strategy}")
     if target_count:
         echo_info(f"Target count: {target_count}")
     
     result = run_select(
-        input_path=input,
+        input_path=input_path,
         output_prefix=output,
         window_size=window_size,
         strategy=strategy,
@@ -818,6 +853,7 @@ def select(
         target_count=target_count,
         seed=seed,
         keep_biophysical=keep_biophysical,
+        merged_snps=merged_data,
         verbose=verbose,
     )
     

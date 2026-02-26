@@ -39,6 +39,91 @@ class SelectionStrategy(Enum):
 BIOPHYSICAL_COLUMNS = ['gc', 'tm', 'complexity', 'hairpin', 'dimer']
 
 
+def merge_snp_files(
+    input_paths: List[Path],
+    merge_mode: str = "intersection",
+) -> Result[List[SNP], str]:
+    """
+    Merge SNPs from multiple input TSV files.
+    
+    Args:
+        input_paths: List of SNP TSV file paths
+        merge_mode: Merge operation ("intersection", "union", "difference", "symmetric_diff")
+        
+    Returns:
+        Result containing merged SNP list
+        
+    Merge modes:
+        - intersection: Keep SNPs present in ALL files
+        - union: Combine all unique SNPs
+        - difference: Keep SNPs in first file but NOT in others
+        - symmetric_diff: Keep SNPs present in exactly one file
+    """
+    if not input_paths:
+        return Err("No input files provided")
+    
+    if len(input_paths) == 1:
+        # Single input, just load and return
+        snp_df_result = SNPDataFrame.from_tsv(input_paths[0])
+        if snp_df_result.is_err():
+            return Err(f"Failed to load {input_paths[0]}: {snp_df_result.unwrap_err()}")
+        return Ok(snp_df_result.unwrap().to_snps())
+    
+    # Load all input files
+    all_snp_sets = []
+    all_snps_list = []
+    
+    for path in input_paths:
+        snp_df_result = SNPDataFrame.from_tsv(path)
+        if snp_df_result.is_err():
+            return Err(f"Failed to load {path}: {snp_df_result.unwrap_err()}")
+        
+        snp_list = snp_df_result.unwrap().to_snps()
+        all_snps_list.append(snp_list)
+        
+        # Create SNP ID set for comparison (using chr:pos_ref_alt format)
+        snp_set = set(f"{snp.chrom}:{snp.pos}_{snp.ref}_{snp.alt}" for snp in snp_list)
+        all_snp_sets.append(snp_set)
+        
+        logger.info(f"Loaded {len(snp_list)} SNPs from {path.name}")
+    
+    # Perform merge operation
+    if merge_mode == "intersection":
+        # Keep SNPs in ALL files
+        result_set = all_snp_sets[0]
+        for snp_set in all_snp_sets[1:]:
+            result_set = result_set.intersection(snp_set)
+    elif merge_mode == "union":
+        # Combine all unique SNPs
+        result_set = set()
+        for snp_set in all_snp_sets:
+            result_set = result_set.union(snp_set)
+    elif merge_mode == "difference":
+        # Only in first file
+        result_set = all_snp_sets[0]
+        for snp_set in all_snp_sets[1:]:
+            result_set = result_set.difference(snp_set)
+    elif merge_mode == "symmetric_diff":
+        # In exactly one file
+        result_set = all_snp_sets[0]
+        for snp_set in all_snp_sets[1:]:
+            result_set = result_set.symmetric_difference(snp_set)
+    else:
+        return Err(f"Unknown merge mode: {merge_mode}")
+    
+    # Filter original SNPs to keep only those in result_set
+    result_snps = []
+    for snps in all_snps_list:
+        for snp in snps:
+            snp_id = f"{snp.chrom}:{snp.pos}_{snp.ref}_{snp.alt}"
+            if snp_id in result_set:
+                result_snps.append(snp)
+                result_set.discard(snp_id)  # Avoid duplicates
+    
+    logger.info(f"After {merge_mode} merge: {len(result_snps)} SNPs")
+    return Ok(result_snps)
+
+
 @dataclass
 class SelectionConfig:
     """Configuration for SNP selection."""
@@ -615,6 +700,7 @@ def run_select(
     chromosomes: Optional[List[str]] = None,
     seed: int = 42,
     keep_biophysical: bool = False,
+    merged_snps: Optional[List[SNP]] = None,
     verbose: bool = False,
     **kwargs,  # Accept extra kwargs for CLI compatibility
 ) -> Result[Dict[str, Any], str]:
@@ -625,7 +711,7 @@ def run_select(
     to reduce SNP count to target while maintaining desired distribution.
     
     Args:
-        input_path: Input SNP TSV file
+        input_path: Input SNP TSV file (used for reference format and biophysical data)
         output_prefix: Output file prefix
         strategy: Selection strategy (uniform, random, weighted, priority)
         target_count: Target number of SNPs to select (None = keep all)
@@ -635,6 +721,7 @@ def run_select(
         chromosomes: Optional list of chromosomes to include
         seed: Random seed for reproducibility
         keep_biophysical: Keep biophysical columns in output (default: False)
+        merged_snps: Pre-merged SNP list (if None, load from input_path)
         verbose: Enable verbose logging
         
     Returns:
@@ -654,13 +741,23 @@ def run_select(
     logger.info(f"Starting SNP selection from {input_path}")
     logger.info(f"Strategy: {strategy}, Window size: {window_size}")
     
-    # Load input SNPs
-    snp_df_result = SNPDataFrame.from_tsv(input_path)
-    if snp_df_result.is_err():
-        return Err(f"Failed to load input: {snp_df_result.unwrap_err()}")
-    
-    snp_df_obj = snp_df_result.unwrap()
-    snps = snp_df_obj.to_snps()
+    # Load input SNPs (or use pre-merged SNPs)
+    if merged_snps is not None:
+        # Use pre-merged SNPs
+        snps = merged_snps
+        snp_df_result = SNPDataFrame.from_tsv(input_path)
+        if snp_df_result.is_err():
+            return Err(f"Failed to load input for reference: {snp_df_result.unwrap_err()}")
+        snp_df_obj = snp_df_result.unwrap()
+        logger.info(f"Using pre-merged SNPs: {len(snps)} total")
+    else:
+        # Load from input file
+        snp_df_result = SNPDataFrame.from_tsv(input_path)
+        if snp_df_result.is_err():
+            return Err(f"Failed to load input: {snp_df_result.unwrap_err()}")
+        
+        snp_df_obj = snp_df_result.unwrap()
+        snps = snp_df_obj.to_snps()
     initial_count = len(snps)
     logger.info(f"Loaded {initial_count} SNPs")
     
