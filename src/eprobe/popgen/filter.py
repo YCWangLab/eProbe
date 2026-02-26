@@ -1392,6 +1392,9 @@ def parse_taxonomy_names_to_taxids(
     Convert taxonomy names to taxonomy IDs using names.dmp.
     
     Searches for scientific names matching the target names.
+    Detects and warns about duplicate names (same name mapping to
+    multiple taxids). In that case ALL matching taxids are returned.
+    
     Format: taxid | name | unique_name | name_class |
     Example: 9606 | Homo sapiens | | scientific name |
     
@@ -1400,12 +1403,14 @@ def parse_taxonomy_names_to_taxids(
         target_names: List of taxonomy names to search for
         
     Returns:
-        Result containing list of taxonomy IDs (in same order as target_names)
+        Result containing list of ALL matched taxonomy IDs
+        (may be longer than target_names if duplicates exist)
     """
-    name_to_taxid = {}
+    from collections import defaultdict
+    name_to_taxids: Dict[str, List[int]] = defaultdict(list)
     
     try:
-        # Build a map of scientific names to taxids
+        # Build a map of scientific names to ALL matching taxids
         with open(names_dmp, 'r') as f:
             for line in f:
                 parts = [p.strip() for p in line.split('|')]
@@ -1414,24 +1419,49 @@ def parse_taxonomy_names_to_taxids(
                     name = parts[1]
                     name_class = parts[3]
                     
-                    # Only use scientific names for matching
+                    # Use scientific names for matching
                     if name_class == 'scientific name':
-                        name_to_taxid[name] = taxid
+                        name_to_taxids[name].append(taxid)
         
-        # Convert target names to taxids
+        # Convert target names to taxids, collecting ALL matches
         taxids = []
         not_found = []
+        duplicates = {}  # name -> [taxid, ...]
         
         for target in target_names:
-            if target in name_to_taxid:
-                taxids.append(name_to_taxid[target])
-            else:
+            matched = name_to_taxids.get(target, [])
+            if not matched:
                 not_found.append(target)
+            elif len(matched) > 1:
+                duplicates[target] = matched
+                taxids.extend(matched)
+            else:
+                taxids.append(matched[0])
         
         if not_found:
             return Err(f"Taxonomy names not found: {', '.join(not_found)}")
         
-        return Ok(taxids)
+        # Warn about duplicate names
+        if duplicates:
+            dup_msgs = []
+            for name, tids in duplicates.items():
+                dup_msgs.append(f"  '{name}' → {tids}")
+            logger.warning(
+                f"Ambiguous taxonomy names detected (same name, multiple taxids):\n"
+                + "\n".join(dup_msgs) + "\n"
+                f"All {sum(len(v) for v in duplicates.values())} matching taxids are included. "
+                f"For precise control, use --tx_taxid or --tx_outgroup_ids with explicit taxids."
+            )
+        
+        # Deduplicate while preserving order
+        seen = set()
+        unique_taxids = []
+        for tid in taxids:
+            if tid not in seen:
+                seen.add(tid)
+                unique_taxids.append(tid)
+        
+        return Ok(unique_taxids)
         
     except Exception as e:
         return Err(f"Failed to parse names.dmp: {e}")

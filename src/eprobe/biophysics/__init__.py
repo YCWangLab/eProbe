@@ -10,9 +10,15 @@ Available calculators:
 - Complexity (DUST): Low-complexity region detection
 - Hairpin: Self-complementarity score
 - Dimer: Inter-probe complementarity score
-- Entropy: Shannon entropy (placeholder for future implementation)
+- Entropy: Shannon entropy (optional, for advanced use)
 
 All functions are designed to be pure (no side effects) and thread-safe.
+
+Fast versions (recommended for large datasets):
+- calculate_gc_fast, calculate_tm_fast, calculate_dust_fast
+- calculate_hairpin_fast, calculate_hairpin_batch_fast
+- DimerCalculatorFast, calculate_dimer_batch_fast
+- calculate_all_stats_fast (unified batch calculation)
 """
 
 from eprobe.biophysics.gc import calculate_gc, calculate_gc_batch
@@ -29,6 +35,24 @@ from eprobe.biophysics.thermo_entropy import (
     NNTable,
 )
 
+# Fast optimized versions
+from eprobe.biophysics.fast_biophysics import (
+    calculate_gc_fast,
+    calculate_gc_batch_fast,
+    calculate_tm_fast,
+    calculate_tm_batch_fast,
+    NN_TABLE_OPTIONS,  # Available NN tables for Tm calculation
+    calculate_dust_fast,
+    calculate_dust_batch_fast,
+    calculate_hairpin_fast,
+    calculate_hairpin_batch_fast,
+    DimerCalculatorFast,
+    calculate_dimer_batch_fast,
+    calculate_all_stats_fast,
+    calculate_percentile_threshold,
+    BiophysicalStats,
+)
+
 # Aliases for convenience
 calculate_complexity = calculate_dust_score
 calculate_complexity_batch = calculate_dust_batch
@@ -37,29 +61,44 @@ __all__ = [
     # GC content
     "calculate_gc",
     "calculate_gc_batch",
+    "calculate_gc_fast",
+    "calculate_gc_batch_fast",
     # Melting temperature
     "calculate_tm",
     "calculate_tm_batch",
+    "calculate_tm_fast",
+    "calculate_tm_batch_fast",
     "TmMethod",
     "TmTable",
+    "NN_TABLE_OPTIONS",  # Available NN tables: DNA_NN1-4, R_DNA_NN1-4
     # Complexity (DUST algorithm)
     "calculate_dust_score",
     "calculate_dust_batch",
+    "calculate_dust_fast",
+    "calculate_dust_batch_fast",
     "calculate_complexity",  # alias
     "calculate_complexity_batch",  # alias
     # Hairpin
     "calculate_hairpin_score",
     "calculate_hairpin_batch",
+    "calculate_hairpin_fast",
+    "calculate_hairpin_batch_fast",
     # Dimer
     "calculate_dimer_score",
     "DimerCalculator",
-    # Shannon entropy
+    "DimerCalculatorFast",
+    "calculate_dimer_batch_fast",
+    # Shannon entropy (optional)
     "calculate_entropy",
     "calculate_entropy_batch",
-    # Thermodynamic entropy (ΔS°, ΔH°, ΔG°)
+    # Thermodynamic entropy (ΔS°, ΔH°, ΔG°) - optional
     "calculate_thermo_entropy",
     "calculate_thermo_entropy_batch",
     "calculate_thermo_enthalpy",
     "calculate_gibbs_energy",
     "NNTable",
+    # Unified fast calculation
+    "calculate_all_stats_fast",
+    "calculate_percentile_threshold",
+    "BiophysicalStats",
 ]

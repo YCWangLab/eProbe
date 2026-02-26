@@ -1,0 +1,25 @@
+##fileformat=VCFv4.2
+##source=test
+##contig=<ID=chr1,length=10000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	Sample1	Sample2	Sample3	Sample4	Sample5	Sample6	Sample7	Sample8	Sample9	Sample10
+chr1	100	.	A	G	100	PASS	.	GT	0/0	0/1	1/1	0/0	0/1	0/0	1/1	0/1	0/0	0/1
+chr1	200	.	C	T	100	PASS	.	GT	0/1	0/1	0/0	1/1	0/1	0/0	0/1	1/1	0/1	0/0
+chr1	300	.	G	A	100	PASS	.	GT	1/1	0/1	0/0	0/1	1/1	0/1	0/0	0/1	1/1	0/0
+chr1	400	.	T	C	100	PASS	.	GT	0/0	1/1	0/1	0/0	0/1	1/1	0/1	0/0	0/1	1/1
+chr1	500	.	A	T	100	PASS	.	GT	0/1	0/0	1/1	0/1	0/0	0/1	1/1	0/1	0/0	0/1
+chr1	600	.	C	G	100	PASS	.	GT	1/1	0/1	0/0	1/1	0/1	0/0	0/1	0/0	1/1	0/1
+chr1	700	.	G	C	100	PASS	.	GT	0/0	0/1	0/1	0/0	1/1	0/1	0/0	1/1	0/1	0/0
+chr1	800	.	T	A	100	PASS	.	GT	0/1	0/0	1/1	0/1	0/0	1/1	0/1	0/0	0/1	1/1
+chr1	900	.	A	C	100	PASS	.	GT	0/0	1/1	0/1	0/0	0/1	0/1	1/1	0/1	0/0	0/1
+chr1	1000	.	G	T	100	PASS	.	GT	1/1	0/1	0/0	1/1	0/1	0/0	0/1	1/1	0/1	0/0
+chr1	1100	.	C	A	100	PASS	.	GT	0/1	0/0	0/1	0/0	1/1	0/1	0/0	0/1	1/1	0/1
+chr1	1200	.	T	G	100	PASS	.	GT	0/0	0/1	1/1	0/1	0/0	1/1	0/1	0/0	0/1	0/0
+chr1	1300	.	A	G	100	PASS	.	GT	0/1	1/1	0/0	0/1	0/1	0/0	1/1	0/1	0/0	1/1
+chr1	1400	.	C	T	100	PASS	.	GT	1/1	0/1	0/1	0/0	1/1	0/1	0/0	0/1	1/1	0/1
+chr1	1500	.	G	A	100	PASS	.	GT	0/0	0/0	1/1	0/1	0/0	1/1	0/1	0/0	0/1	0/0
+chr1	1600	.	T	C	100	PASS	.	GT	0/1	0/1	0/0	1/1	0/1	0/0	1/1	0/1	0/0	0/1
+chr1	1700	.	A	T	100	PASS	.	GT	0/0	1/1	0/1	0/0	0/1	0/1	0/0	1/1	0/1	1/1
+chr1	1800	.	C	G	100	PASS	.	GT	0/1	0/0	1/1	0/1	0/0	0/1	0/1	0/0	1/1	0/1
+chr1	1900	.	G	C	100	PASS	.	GT	1/1	0/1	0/0	0/0	1/1	0/0	1/1	0/1	0/0	0/0
+chr1	2000	.	T	A	100	PASS	.	GT	0/0	0/1	0/1	1/1	0/1	1/1	0/0	0/1	0/1	0/1

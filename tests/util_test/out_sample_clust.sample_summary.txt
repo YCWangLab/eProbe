@@ -1,0 +1,9 @@
+Cluster Sampling Summary
+========================================
+
+Input probes: 50
+CD-HIT identity: 0.8
+CD-HIT coverage: 0.9
+Total families: 50
+Families kept: 50
+Selected representatives: 50

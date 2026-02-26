@@ -530,15 +530,21 @@ def filter(
             raise SystemExit(1)
         
         name_taxids = name_result.unwrap()
-        echo_info(f"Converted taxonomy names to IDs: {dict(zip(target_name_list, name_taxids))}")
+        # Show resolved mapping (may be more taxids than names if duplicates exist)
+        echo_info(f"Resolved target names → taxids: {name_taxids}")
+        if len(name_taxids) != len(target_name_list):
+            echo_warning(
+                f"Note: {len(target_name_list)} name(s) resolved to {len(name_taxids)} taxid(s). "
+                f"Use --tx_taxid with explicit IDs for precise control."
+            )
         
         # Merge with taxids from --tx_taxid
         if tx_ids is None:
             tx_ids = name_taxids
         else:
             tx_ids.extend(name_taxids)
-            tx_ids = list(set(tx_ids))  # Remove duplicates
-    
+            tx_ids = list(dict.fromkeys(tx_ids))  # Deduplicate preserving order
+            
     # Parse outgroup IDs for best-hit mode
     parsed_outgroup_ids = None
     if tx_outgroup_ids:
@@ -558,13 +564,18 @@ def filter(
             raise SystemExit(1)
         
         og_taxids = og_result.unwrap()
-        echo_info(f"Converted outgroup names to IDs: {dict(zip(outgroup_name_list, og_taxids))}")
+        echo_info(f"Resolved outgroup names → taxids: {og_taxids}")
+        if len(og_taxids) != len(outgroup_name_list):
+            echo_warning(
+                f"Note: {len(outgroup_name_list)} outgroup name(s) resolved to {len(og_taxids)} taxid(s). "
+                f"Use --tx_outgroup_ids with explicit IDs for precise control."
+            )
         
         if parsed_outgroup_ids is None:
             parsed_outgroup_ids = og_taxids
         else:
             parsed_outgroup_ids.extend(og_taxids)
-            parsed_outgroup_ids = list(set(parsed_outgroup_ids))
+            parsed_outgroup_ids = list(dict.fromkeys(parsed_outgroup_ids))
     
     # Validate best-hit mode requirements
     if tx_mode == "besthit" and tx_db:

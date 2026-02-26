@@ -4,7 +4,8 @@ SNP selection module.
 Implements strategies for selecting SNPs from filtered candidates:
   - Uniform distribution: equal spacing across genome
   - Random sampling: random selection with optional stratification
-  - Priority-based: selection based on quality scores
+  - Weighted: selection based on biophysical scores
+  - Priority: prioritize SNPs in specific genomic regions (BED)
 
 This module corresponds to the original SNP_subsampler.py functionality.
 """
@@ -12,12 +13,13 @@ This module corresponds to the original SNP_subsampler.py functionality.
 import logging
 import random
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
-from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple, Set, Union
+from dataclasses import dataclass, field
 from collections import defaultdict
 from enum import Enum
 
 import numpy as np
+import pandas as pd
 
 from eprobe.core.result import Result, Ok, Err
 from eprobe.core.models import SNP, SNPDataFrame
@@ -29,19 +31,153 @@ class SelectionStrategy(Enum):
     """SNP selection strategies."""
     UNIFORM = "uniform"
     RANDOM = "random"
+    WEIGHTED = "weighted"
     PRIORITY = "priority"
 
 
+# Biophysical columns that can be used for weighted selection
+BIOPHYSICAL_COLUMNS = ['gc', 'tm', 'complexity', 'hairpin', 'dimer']
+
+
 @dataclass
-class WindowConfig:
-    """Configuration for window-based selection."""
-    size: int = 100000  # Window size in bp
-    per_window: int = 1  # SNPs to select per window
+class SelectionConfig:
+    """Configuration for SNP selection."""
+    target_count: int = 10000
+    window_size: int = 10000
+    strategy: str = "random"
+    seed: int = 42
+    # Weights for biophysical features (gc, tm, complexity, hairpin, dimer)
+    weights: Optional[List[float]] = None
+    # Priority regions from BED file
+    priority_regions: Optional[Set[Tuple[str, int, int]]] = None
+    # Chromosomes to include (None = all)
+    chromosomes: Optional[List[str]] = None
 
 
 def calculate_window_index(pos: int, window_size: int) -> int:
     """Calculate window index for a genomic position."""
     return pos // window_size
+
+
+def parse_bed_file(bed_path: Path) -> Result[Set[Tuple[str, int, int]], str]:
+    """
+    Parse BED file to extract priority regions.
+    
+    Args:
+        bed_path: Path to BED file
+        
+    Returns:
+        Set of (chrom, start, end) tuples
+    """
+    if not bed_path.exists():
+        return Err(f"BED file not found: {bed_path}")
+    
+    regions = set()
+    try:
+        with open(bed_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#') or line.startswith('track'):
+                    continue
+                
+                parts = line.split('\t')
+                if len(parts) < 3:
+                    continue
+                
+                try:
+                    chrom = parts[0]
+                    start = int(parts[1])
+                    end = int(parts[2])
+                    regions.add((chrom, start, end))
+                except ValueError:
+                    logger.warning(f"Invalid BED line {line_num}: {line[:50]}")
+                    continue
+        
+        logger.info(f"Loaded {len(regions)} priority regions from BED file")
+        return Ok(regions)
+    
+    except Exception as e:
+        return Err(f"Failed to parse BED file: {e}")
+
+
+def snp_in_priority_region(
+    snp: SNP, 
+    regions: Set[Tuple[str, int, int]]
+) -> bool:
+    """Check if SNP falls within any priority region."""
+    for chrom, start, end in regions:
+        if snp.chrom == chrom and start <= snp.pos <= end:
+            return True
+    return False
+
+
+def calculate_snp_score(
+    snp: SNP,
+    weights: List[float],
+    probe_sequences: Optional[Dict[str, str]] = None,
+) -> float:
+    """
+    Calculate weighted biophysical score for a SNP.
+    
+    Uses tags from SNP if available, or uses default values.
+    For actual biophysical scoring, tags should be added during filtering.
+    
+    Args:
+        snp: SNP object
+        weights: [gc_weight, tm_weight, complexity_weight, hairpin_weight, dimer_weight]
+        probe_sequences: Optional dict of SNP ID -> probe sequence
+        
+    Returns:
+        Weighted score (higher = better)
+    """
+    # Default weights if not provided
+    if weights is None or len(weights) != 5:
+        weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+    
+    # Get biophysical values from SNP tags if available
+    # SNP is frozen dataclass, so we use getattr to check for tags
+    tags = getattr(snp, 'tags', None)
+    
+    if tags and isinstance(tags, dict):
+        gc = tags.get('gc', 50.0)
+        tm = tags.get('tm', 70.0)
+        complexity = tags.get('complexity', 1.0)
+        hairpin = tags.get('hairpin', 0.0)
+        dimer = tags.get('dimer', 0.0)
+    else:
+        # Use defaults if no tags
+        gc = 50.0
+        tm = 70.0
+        complexity = 1.0
+        hairpin = 0.0
+        dimer = 0.0
+    
+    # Normalize scores (higher = better for selection)
+    # GC: optimal around 50, penalty for deviation
+    gc_score = 1.0 - abs(gc - 50.0) / 50.0
+    
+    # Tm: optimal around 70, penalty for deviation  
+    tm_score = 1.0 - abs(tm - 70.0) / 30.0
+    
+    # Complexity: lower is better (less repetitive)
+    complexity_score = max(0, 1.0 - complexity / 5.0)
+    
+    # Hairpin: lower is better
+    hairpin_score = max(0, 1.0 - hairpin)
+    
+    # Dimer: lower is better
+    dimer_score = max(0, 1.0 - dimer)
+    
+    # Weighted sum
+    total_score = (
+        weights[0] * gc_score +
+        weights[1] * tm_score +
+        weights[2] * complexity_score +
+        weights[3] * hairpin_score +
+        weights[4] * dimer_score
+    )
+    
+    return total_score
 
 
 def select_uniform(
@@ -169,35 +305,277 @@ def select_random(
 def select_by_priority(
     snps: List[SNP],
     target_count: int,
-    priority_column: str = "score",
-    ascending: bool = False,
-) -> Result[List[SNP], str]:
+    priority_regions: Set[Tuple[str, int, int]],
+    window_size: int = 10000,
+    seed: int = 42,
+    weights: Optional[List[float]] = None,
+    snp_df: Optional[pd.DataFrame] = None,
+) -> Result[Union[List[SNP], Tuple[List[SNP], pd.DataFrame]], str]:
     """
-    Select SNPs based on priority score.
+    Select SNPs with priority for specific genomic regions.
     
-    Selects top-scoring SNPs based on a priority metric.
-    Higher scores are selected by default.
+    Prioritizes SNPs that fall within priority regions (e.g., exons).
+    Uses window-based selection to maintain uniform distribution.
+    If weights are provided and snp_df has biophysical columns, uses
+    weighted selection within priority regions.
     
     Args:
-        snps: Input SNP list with scores
+        snps: Input SNP list
         target_count: Target number of SNPs to select
-        priority_column: Column name containing scores
-        ascending: If True, select lowest scores instead
+        priority_regions: Set of (chrom, start, end) priority regions
+        window_size: Window size for distribution
+        seed: Random seed for reproducibility
+        weights: Optional biophysical weights [gc, tm, complexity, hairpin, dimer]
+        snp_df: Optional DataFrame with biophysical columns for weighted selection
         
     Returns:
-        Result containing selected SNP list
+        Result containing selected SNP list (or tuple with DataFrame if weighted)
     """
     if not snps:
         return Ok([])
     
-    logger.info(f"Priority selection: {len(snps)} → {target_count} SNPs")
-    logger.info(f"Priority column: {priority_column}, ascending: {ascending}")
+    random.seed(seed)
     
-    # Check if SNPs have the priority attribute
-    # Note: This would require SNP metadata support
-    # For now, use random as fallback
-    logger.warning(f"Priority selection not yet implemented, falling back to random")
-    return select_random(snps, target_count)
+    logger.info(f"Priority selection: {len(snps)} → {target_count} SNPs")
+    logger.info(f"Priority regions: {len(priority_regions)}")
+    
+    # Check if we can use weighted selection
+    use_weighted = False
+    if weights is not None and snp_df is not None:
+        missing_cols = [col for col in BIOPHYSICAL_COLUMNS if col not in snp_df.columns]
+        if not missing_cols:
+            use_weighted = True
+            logger.info("Using weighted selection within priority regions")
+        else:
+            logger.warning(f"Cannot use weighted selection: missing columns {missing_cols}")
+    
+    # Separate SNPs into priority and non-priority
+    priority_snps = []
+    other_snps = []
+    priority_indices = []
+    other_indices = []
+    
+    for i, snp in enumerate(snps):
+        if snp_in_priority_region(snp, priority_regions):
+            priority_snps.append(snp)
+            priority_indices.append(i)
+        else:
+            other_snps.append(snp)
+            other_indices.append(i)
+    
+    logger.info(f"SNPs in priority regions: {len(priority_snps)}")
+    logger.info(f"SNPs outside priority regions: {len(other_snps)}")
+    
+    # Select from priority regions first
+    selected = []
+    selected_df = None
+    
+    if len(priority_snps) >= target_count:
+        # All from priority regions
+        if use_weighted:
+            # Filter DataFrame to priority SNPs only
+            priority_df = snp_df.iloc[priority_indices].copy()
+            result = select_weighted(priority_snps, target_count, weights, window_size, seed, snp_df=priority_df)
+            if result.is_err():
+                return result
+            selected, selected_df = result.unwrap()
+        else:
+            result = select_uniform(priority_snps, target_count, window_size, seed)
+            if result.is_err():
+                return result
+            selected = result.unwrap()
+    else:
+        # All priority + selection from others
+        if use_weighted:
+            # Use all priority SNPs with weighted selection
+            priority_df = snp_df.iloc[priority_indices].copy()
+            if len(priority_snps) > 0:
+                # Select best from priority using weights
+                result = select_weighted(priority_snps, len(priority_snps), weights, window_size, seed, snp_df=priority_df)
+                if result.is_err():
+                    return result
+                selected, selected_df = result.unwrap()
+            
+            remaining = target_count - len(selected)
+            
+            if remaining > 0 and other_snps:
+                # Also use weighted for remaining from other regions
+                other_df = snp_df.iloc[other_indices].copy()
+                result = select_weighted(other_snps, remaining, weights, window_size, seed, snp_df=other_df)
+                if result.is_err():
+                    return result
+                other_selected, other_df_selected = result.unwrap()
+                selected.extend(other_selected)
+                if selected_df is not None:
+                    selected_df = pd.concat([selected_df, other_df_selected], ignore_index=True)
+                else:
+                    selected_df = other_df_selected
+        else:
+            selected.extend(priority_snps)
+            remaining = target_count - len(priority_snps)
+            
+            if remaining > 0 and other_snps:
+                result = select_uniform(other_snps, remaining, window_size, seed)
+                if result.is_err():
+                    return result
+                selected.extend(result.unwrap())
+    
+    # Sort by chromosome and position
+    selected.sort(key=lambda s: (s.chrom, s.pos))
+    if selected_df is not None:
+        selected_df = selected_df.sort_values(['chr', 'pos']).reset_index(drop=True)
+    
+    logger.info(f"Selected {len(selected)} SNPs ({len([s for s in selected if snp_in_priority_region(s, priority_regions)])} in priority regions)")
+    
+    if use_weighted and selected_df is not None:
+        return Ok((selected, selected_df))
+    return Ok(selected)
+
+
+def select_weighted(
+    snps: List[SNP],
+    target_count: int,
+    weights: List[float],
+    window_size: int = 10000,
+    seed: int = 42,
+    snp_df: Optional[pd.DataFrame] = None,
+) -> Result[List[SNP], str]:
+    """
+    Select SNPs based on weighted biophysical scores within windows.
+    
+    REQUIRES biophysical tags (gc, tm, complexity, hairpin, dimer) in the DataFrame.
+    Divides genome into windows and selects SNPs with best biophysical scores.
+    
+    Algorithm:
+    1. Validate biophysical columns exist
+    2. Calculate weighted composite score for each SNP
+    3. Group by window (chrom + pos // window_size)
+    4. Select top-scoring SNP(s) from each window
+    
+    Args:
+        snps: Input SNP list (for output compatibility)
+        target_count: Target number of SNPs to select
+        weights: [gc_weight, tm_weight, complexity_weight, hairpin_weight, dimer_weight]
+        window_size: Window size for selection (default: 10kb)
+        seed: Random seed for tie-breaking
+        snp_df: DataFrame with biophysical columns (required for weighted selection)
+        
+    Returns:
+        Result containing selected SNP list, or error if biophysical columns missing
+    """
+    if not snps:
+        return Ok([])
+    
+    if snp_df is None or snp_df.empty:
+        return Err("Weighted selection requires DataFrame with biophysical columns")
+    
+    # Validate required biophysical columns
+    missing_cols = [col for col in BIOPHYSICAL_COLUMNS if col not in snp_df.columns]
+    if missing_cols:
+        return Err(f"Weighted selection requires biophysical columns: {missing_cols}. "
+                   f"Run filter with biophysical filtering first.")
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    logger.info(f"Weighted selection: {len(snp_df)} → {target_count} SNPs")
+    logger.info(f"Weights: gc={weights[0]}, tm={weights[1]}, complexity={weights[2]}, "
+                f"hairpin={weights[3]}, dimer={weights[4]}")
+    
+    df = snp_df.copy()
+    
+    # === VECTORIZED SCORE CALCULATION (FAST) ===
+    # Normalize each metric to 0-1 scale (higher = better)
+    
+    # GC: optimal around 50%, penalty for deviation
+    df['gc_score'] = 1.0 - np.abs(df['gc'] - 50.0) / 50.0
+    
+    # Tm: optimal around 70°C, penalty for deviation
+    df['tm_score'] = 1.0 - np.abs(df['tm'] - 70.0) / 30.0
+    df['tm_score'] = df['tm_score'].clip(lower=0)
+    
+    # Complexity: lower is better (less repetitive)
+    df['complexity_score'] = (1.0 - df['complexity'] / 5.0).clip(lower=0)
+    
+    # Hairpin: lower is better (use percentile or raw score)
+    # Assume hairpin is normalized 0-1 or use max normalization
+    max_hairpin = df['hairpin'].max()
+    if max_hairpin > 0:
+        df['hairpin_score'] = 1.0 - df['hairpin'] / max_hairpin
+    else:
+        df['hairpin_score'] = 1.0
+    
+    # Dimer: lower is better
+    max_dimer = df['dimer'].max()
+    if max_dimer > 0:
+        df['dimer_score'] = 1.0 - df['dimer'] / max_dimer
+    else:
+        df['dimer_score'] = 1.0
+    
+    # Weighted composite score
+    df['weighted_score'] = (
+        weights[0] * df['gc_score'] +
+        weights[1] * df['tm_score'] +
+        weights[2] * df['complexity_score'] +
+        weights[3] * df['hairpin_score'] +
+        weights[4] * df['dimer_score']
+    )
+    
+    # === WINDOW-BASED SELECTION ===
+    # Calculate window index
+    df['window'] = df['pos'] // window_size
+    
+    # Group by chromosome and window
+    df['window_key'] = df['chr'].astype(str) + '_' + df['window'].astype(str)
+    
+    total_windows = df['window_key'].nunique()
+    logger.info(f"Total windows with SNPs: {total_windows}")
+    
+    if total_windows == 0:
+        return Ok([])
+    
+    # Calculate SNPs per window
+    base_per_window = max(1, target_count // total_windows)
+    
+    # Select top N from each window based on weighted score
+    # Use efficient selection approach (compatible with pandas < 2.1)
+    selected_indices = []
+    for _, group in df.groupby('window_key'):
+        # Sort by weighted score descending
+        sorted_group = group.nlargest(base_per_window, 'weighted_score')
+        selected_indices.extend(sorted_group.index.tolist())
+    
+    selected_df = df.loc[selected_indices]
+    
+    # If we have more than target, randomly sample
+    if len(selected_df) > target_count:
+        selected_df = selected_df.sample(n=target_count, random_state=seed)
+    
+    # Sort by chromosome and position
+    selected_df = selected_df.sort_values(['chr', 'pos'])
+    
+    # Remove temporary columns, keep biophysical columns
+    cols_to_drop = ['gc_score', 'tm_score', 'complexity_score', 'hairpin_score', 
+                    'dimer_score', 'weighted_score', 'window', 'window_key']
+    selected_df = selected_df.drop(columns=cols_to_drop, errors='ignore')
+    
+    # Convert back to SNP list
+    selected_snps = []
+    for _, row in selected_df.iterrows():
+        snp = SNP(
+            chrom=row['chr'],
+            pos=int(row['pos']),
+            ref=row['ref'],
+            alt=row['alt'],
+            mutation_type=row['type']
+        )
+        selected_snps.append(snp)
+    
+    logger.info(f"Selected {len(selected_snps)} SNPs by weighted score")
+    logger.info(f"Score range: {df['weighted_score'].min():.3f} - {df['weighted_score'].max():.3f}")
+    
+    # Return tuple: (SNPs, DataFrame with biophysical cols)
+    return Ok((selected_snps, selected_df))
 
 
 def select_chromosomes(
@@ -229,12 +607,16 @@ def select_chromosomes(
 def run_select(
     input_path: Path,
     output_prefix: Path,
-    strategy: str = "uniform",
-    probe_number: int = 10000,
-    window_size: int = 100000,
+    strategy: str = "random",
+    target_count: Optional[int] = None,
+    window_size: int = 10000,
+    weights: Optional[List[float]] = None,
+    priority_bed: Optional[Path] = None,
     chromosomes: Optional[List[str]] = None,
     seed: int = 42,
+    keep_biophysical: bool = False,
     verbose: bool = False,
+    **kwargs,  # Accept extra kwargs for CLI compatibility
 ) -> Result[Dict[str, Any], str]:
     """
     Run SNP selection pipeline.
@@ -245,30 +627,45 @@ def run_select(
     Args:
         input_path: Input SNP TSV file
         output_prefix: Output file prefix
-        strategy: Selection strategy (uniform, random, priority)
-        probe_number: Target number of SNPs to select
-        window_size: Window size for uniform strategy
+        strategy: Selection strategy (uniform, random, weighted, priority)
+        target_count: Target number of SNPs to select (None = keep all)
+        window_size: Window size for selection
+        weights: Biophysical weights [gc, tm, complexity, hairpin, dimer]
+        priority_bed: BED file with priority regions
         chromosomes: Optional list of chromosomes to include
         seed: Random seed for reproducibility
+        keep_biophysical: Keep biophysical columns in output (default: False)
         verbose: Enable verbose logging
         
     Returns:
         Result containing selection statistics
     """
+    # Configure logging
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+        logger.addHandler(handler)
+    
     if verbose:
         logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
     
     logger.info(f"Starting SNP selection from {input_path}")
-    logger.info(f"Strategy: {strategy}, Target: {probe_number}")
+    logger.info(f"Strategy: {strategy}, Window size: {window_size}")
     
     # Load input SNPs
-    snp_df = SNPDataFrame.from_tsv(input_path)
-    if snp_df.is_err():
-        return Err(f"Failed to load input: {snp_df.unwrap_err()}")
+    snp_df_result = SNPDataFrame.from_tsv(input_path)
+    if snp_df_result.is_err():
+        return Err(f"Failed to load input: {snp_df_result.unwrap_err()}")
     
-    snps = snp_df.unwrap().to_snps()
+    snp_df_obj = snp_df_result.unwrap()
+    snps = snp_df_obj.to_snps()
     initial_count = len(snps)
     logger.info(f"Loaded {initial_count} SNPs")
+    
+    # Keep the raw DataFrame for weighted selection
+    raw_df = snp_df_obj.df.copy()
     
     # Filter by chromosomes if specified
     if chromosomes:
@@ -276,11 +673,20 @@ def run_select(
         if chrom_result.is_err():
             return Err(chrom_result.unwrap_err())
         snps = chrom_result.unwrap()
+        # Also filter the DataFrame for weighted selection
+        raw_df = raw_df[raw_df['chr'].isin(chromosomes)]
         logger.info(f"After chromosome filter: {len(snps)} SNPs")
+    
+    # Determine target count
+    probe_number = target_count if target_count else len(snps)
+    logger.info(f"Target count: {probe_number}")
+    
+    # Variable to hold DataFrame with biophysical columns (for weighted selection)
+    selected_with_biophysical: Optional[pd.DataFrame] = None
     
     # Check if we already have fewer SNPs than target
     if len(snps) <= probe_number:
-        logger.warning(f"Input count ({len(snps)}) <= target ({probe_number})")
+        logger.warning(f"Input count ({len(snps)}) <= target ({probe_number}), keeping all")
         selected = snps
     else:
         # Apply selection strategy
@@ -290,15 +696,119 @@ def run_select(
             result = select_uniform(snps, probe_number, window_size, seed)
         elif strategy_lower == "random":
             result = select_random(snps, probe_number, seed)
+        elif strategy_lower == "weighted":
+            if weights is None:
+                weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+            result = select_weighted(snps, probe_number, weights, window_size, seed, snp_df=raw_df)
+            # Weighted returns (snps, df_with_biophysical)
+            if result.is_ok():
+                selected_snps, selected_with_biophysical = result.unwrap()
+                selected = selected_snps
+                # Calculate coverage statistics
+                coverage_stats = calculate_coverage_stats(selected, window_size)
+                
+                # Save output
+                output_path = Path(str(output_prefix) + ".selected.tsv")
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                if keep_biophysical:
+                    # Use the DataFrame directly to preserve biophysical columns
+                    selected_with_biophysical.to_csv(output_path, sep='\t', index=False)
+                else:
+                    # Remove biophysical columns from output
+                    output_df = selected_with_biophysical.drop(
+                        columns=BIOPHYSICAL_COLUMNS, errors='ignore'
+                    )
+                    output_df.to_csv(output_path, sep='\t', index=False)
+                
+                stats = {
+                    "initial_count": initial_count,
+                    "selected": len(selected),
+                    "final_count": len(selected),
+                    "target_count": probe_number,
+                    "strategy": strategy,
+                    "window_size": window_size,
+                    "windows": coverage_stats["windows_covered"],
+                    "coverage": coverage_stats,
+                    "output_file": str(output_path),
+                }
+                
+                logger.info(f"Selection complete: {len(selected)} SNPs selected")
+                logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
+                logger.info(f"Output saved to {output_path}")
+                
+                return Ok(stats)
+            else:
+                return Err(result.unwrap_err())
         elif strategy_lower == "priority":
-            result = select_by_priority(snps, probe_number)
+            if priority_bed is None:
+                return Err("Priority strategy requires --priority_bed")
+            
+            bed_result = parse_bed_file(priority_bed)
+            if bed_result.is_err():
+                return Err(bed_result.unwrap_err())
+            
+            priority_regions = bed_result.unwrap()
+            
+            # Priority strategy can optionally use weights for biophysical scoring
+            result = select_by_priority(
+                snps, probe_number, priority_regions, window_size, seed,
+                weights=weights, snp_df=raw_df
+            )
+            
+            # Check if result is tuple (weighted was used) or just list
+            if result.is_ok():
+                unwrapped = result.unwrap()
+                if isinstance(unwrapped, tuple):
+                    # Weighted selection was used within priority
+                    selected_snps, selected_with_biophysical = unwrapped
+                    selected = selected_snps
+                    
+                    # Calculate coverage statistics
+                    coverage_stats = calculate_coverage_stats(selected, window_size)
+                    
+                    # Save output
+                    output_path = Path(str(output_prefix) + ".selected.tsv")
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    if keep_biophysical:
+                        selected_with_biophysical.to_csv(output_path, sep='\t', index=False)
+                    else:
+                        output_df = selected_with_biophysical.drop(
+                            columns=BIOPHYSICAL_COLUMNS, errors='ignore'
+                        )
+                        output_df.to_csv(output_path, sep='\t', index=False)
+                    
+                    stats = {
+                        "initial_count": initial_count,
+                        "selected": len(selected),
+                        "final_count": len(selected),
+                        "target_count": probe_number,
+                        "strategy": f"{strategy}+weighted",
+                        "window_size": window_size,
+                        "windows": coverage_stats["windows_covered"],
+                        "coverage": coverage_stats,
+                        "output_file": str(output_path),
+                    }
+                    
+                    logger.info(f"Selection complete: {len(selected)} SNPs selected")
+                    logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
+                    logger.info(f"Output saved to {output_path}")
+                    
+                    return Ok(stats)
+                else:
+                    selected = unwrapped
+            else:
+                return Err(result.unwrap_err())
         else:
-            return Err(f"Unknown selection strategy: {strategy}")
+            return Err(f"Unknown selection strategy: {strategy}. Use: uniform, random, weighted, priority")
         
-        if result.is_err():
-            return Err(result.unwrap_err())
-        
-        selected = result.unwrap()
+        # For non-weighted strategies (uniform, random, priority without weights)
+        # We need to unwrap the result and set selected
+        if strategy_lower in ["uniform", "random"]:
+            if result.is_err():
+                return Err(result.unwrap_err())
+            selected = result.unwrap()
     
     # Calculate coverage statistics
     coverage_stats = calculate_coverage_stats(selected, window_size)
@@ -314,15 +824,18 @@ def run_select(
     
     stats = {
         "initial_count": initial_count,
+        "selected": len(selected),
         "final_count": len(selected),
         "target_count": probe_number,
         "strategy": strategy,
         "window_size": window_size,
+        "windows": coverage_stats["windows_covered"],
         "coverage": coverage_stats,
         "output_file": str(output_path),
     }
     
     logger.info(f"Selection complete: {len(selected)} SNPs selected")
+    logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
     logger.info(f"Output saved to {output_path}")
     
     return Ok(stats)

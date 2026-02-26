@@ -1,91 +1,100 @@
 """
-Probe generation from GFF annotations.
+Probe generation from GFF/GTF annotations.
 
-Extracts features from GFF files, retrieves sequences from reference,
-and generates tiled probes.
+Workflow:
+  1. Parse GFF/GTF, filter by feature type (CDS, exon, gene, mRNA, etc.)
+  2. Optionally filter by gene IDs
+  3. Merge overlapping features by gene into BedRegion objects
+  4. Delegate to from_bed's process_regions() for probe generation
+     (including optional VCF haplotyping)
+
+Legacy equivalent: no direct legacy counterpart (new functionality)
 """
 
 import logging
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Set
-from dataclasses import dataclass
 import re
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
-from eprobe.core.result import Result, Ok, Err
-from eprobe.core.fasta import read_fasta, write_fasta
-from eprobe.core.models import Probe
-from eprobe.funcgen.from_fasta import tile_sequence, TilingConfig
-from eprobe.funcgen.from_bed import BedRegion, extract_region_sequence
+from eprobe.core.result import Err, Ok, Result
+from eprobe.funcgen.from_bed import BedRegion, process_regions
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# GFF data model
+# ---------------------------------------------------------------------------
+
 @dataclass
 class GffFeature:
-    """Representation of a GFF feature."""
+    """Representation of a GFF/GTF feature line."""
     seqid: str
     source: str
     feature_type: str
-    start: int  # 1-based
-    end: int    # 1-based, inclusive
+    start: int          # 1-based inclusive
+    end: int            # 1-based inclusive
     score: Optional[float]
     strand: str
     phase: Optional[int]
     attributes: Dict[str, str]
-    
+
     @property
     def length(self) -> int:
         return self.end - self.start + 1
-    
+
     def get_id(self) -> Optional[str]:
-        """Get feature ID from attributes."""
+        """Get feature ID from attributes (tries multiple conventions)."""
         return (
-            self.attributes.get('ID') or 
-            self.attributes.get('gene_id') or
-            self.attributes.get('Name') or
-            self.attributes.get('transcript_id')
+            self.attributes.get("ID")
+            or self.attributes.get("gene_id")
+            or self.attributes.get("Name")
+            or self.attributes.get("transcript_id")
         )
-    
+
     def get_parent(self) -> Optional[str]:
-        """Get parent ID from attributes."""
-        return self.attributes.get('Parent')
-    
+        return self.attributes.get("Parent")
+
     def get_gene_name(self) -> Optional[str]:
-        """Get gene name from attributes."""
         return (
-            self.attributes.get('gene_name') or
-            self.attributes.get('gene') or
-            self.attributes.get('Name')
+            self.attributes.get("gene_name")
+            or self.attributes.get("gene")
+            or self.attributes.get("Name")
         )
 
 
-def parse_gff_attributes(attr_string: str) -> Dict[str, str]:
+# ---------------------------------------------------------------------------
+# GFF parsing
+# ---------------------------------------------------------------------------
+
+def _parse_gff_attributes(attr_string: str) -> Dict[str, str]:
     """
     Parse GFF attribute string into dictionary.
-    
+
     Handles both GFF3 (key=value;) and GTF (key "value";) formats.
     """
-    attributes = {}
-    
-    if not attr_string or attr_string == '.':
+    attributes: Dict[str, str] = {}
+
+    if not attr_string or attr_string == ".":
         return attributes
-    
-    # Try GFF3 format first (key=value)
-    for part in attr_string.split(';'):
+
+    for part in attr_string.split(";"):
         part = part.strip()
         if not part:
             continue
-        
-        if '=' in part:
-            # GFF3 format
-            key, value = part.split('=', 1)
+
+        if "=" in part:
+            # GFF3: key=value
+            key, value = part.split("=", 1)
             attributes[key.strip()] = value.strip()
-        elif ' ' in part:
-            # GTF format
+        elif " " in part:
+            # GTF: key "value"
             match = re.match(r'(\S+)\s+"?([^"]+)"?', part)
             if match:
                 attributes[match.group(1)] = match.group(2)
-    
+
     return attributes
 
 
@@ -94,58 +103,50 @@ def parse_gff_file(
     feature_types: Optional[Set[str]] = None,
 ) -> Result[List[GffFeature], str]:
     """
-    Parse GFF/GFF3/GTF file into list of GffFeature objects.
-    
+    Parse GFF/GFF3/GTF file.
+
     Args:
         gff_path: Path to GFF file
-        feature_types: Set of feature types to extract (None = all)
-        
+        feature_types: Set of feature types to keep (None = all)
+
     Returns:
-        Result containing list of GffFeature objects
+        Ok(list of GffFeature), Err(message) on failure
     """
-    features = []
-    
+    features: List[GffFeature] = []
+
     try:
         with open(gff_path) as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
-                
-                # Skip empty lines and comments
-                if not line or line.startswith('#'):
+                if not line or line.startswith("#"):
                     continue
-                
-                parts = line.split('\t')
-                
+
+                parts = line.split("\t")
                 if len(parts) < 9:
-                    logger.debug(f"Line {line_num}: insufficient columns, skipping")
                     continue
-                
+
                 try:
                     feature_type = parts[2]
-                    
-                    # Filter by feature type
+
                     if feature_types and feature_type not in feature_types:
                         continue
-                    
-                    feature = GffFeature(
+
+                    features.append(GffFeature(
                         seqid=parts[0],
                         source=parts[1],
                         feature_type=feature_type,
                         start=int(parts[3]),
                         end=int(parts[4]),
-                        score=float(parts[5]) if parts[5] != '.' else None,
+                        score=float(parts[5]) if parts[5] != "." else None,
                         strand=parts[6],
-                        phase=int(parts[7]) if parts[7] != '.' else None,
-                        attributes=parse_gff_attributes(parts[8]),
-                    )
-                    features.append(feature)
-                    
+                        phase=int(parts[7]) if parts[7] != "." else None,
+                        attributes=_parse_gff_attributes(parts[8]),
+                    ))
                 except (ValueError, IndexError) as e:
-                    logger.debug(f"Line {line_num}: parse error ({e}), skipping")
-                    continue
-        
+                    logger.debug(f"GFF line {line_num}: parse error ({e})")
+
         return Ok(features)
-        
+
     except Exception as e:
         return Err(f"Failed to parse GFF file: {e}")
 
@@ -154,103 +155,39 @@ def filter_features_by_gene_ids(
     features: List[GffFeature],
     gene_ids: Set[str],
 ) -> List[GffFeature]:
-    """
-    Filter features to only those matching specified gene IDs.
-    
-    Args:
-        features: List of GFF features
-        gene_ids: Set of gene IDs to keep
-        
-    Returns:
-        Filtered list of features
-    """
+    """Filter features matching specified gene IDs."""
     filtered = []
-    
-    for feature in features:
-        feature_id = feature.get_id()
-        gene_name = feature.get_gene_name()
-        parent = feature.get_parent()
-        
-        # Check if any identifier matches
-        if (feature_id in gene_ids or 
-            gene_name in gene_ids or
-            parent in gene_ids):
-            filtered.append(feature)
-    
+    for f in features:
+        fid = f.get_id()
+        gname = f.get_gene_name()
+        parent = f.get_parent()
+        if fid in gene_ids or gname in gene_ids or parent in gene_ids:
+            filtered.append(f)
     return filtered
 
 
-def merge_overlapping_features(
+def features_to_bed_regions(
     features: List[GffFeature],
-    by_gene: bool = True,
+    merge_by_gene: bool = True,
 ) -> List[BedRegion]:
     """
-    Merge overlapping features into regions.
-    
-    For CDS features of the same gene, merges into continuous regions.
-    
+    Convert GFF features to BedRegion objects.
+
+    When merge_by_gene=True, overlapping/adjacent features of the same gene
+    are merged into continuous regions.
+
     Args:
         features: List of GFF features
-        by_gene: Group and merge by gene ID
-        
+        merge_by_gene: Group and merge by gene identifier
+
     Returns:
-        List of merged BED regions
+        List of BedRegion objects (0-based half-open coordinates)
     """
-    from collections import defaultdict
-    
-    if by_gene:
-        # Group by gene
-        gene_features: Dict[str, List[GffFeature]] = defaultdict(list)
-        
-        for f in features:
-            gene_id = f.get_id() or f.get_gene_name() or f.get_parent() or f"{f.seqid}:{f.start}"
-            gene_features[gene_id].append(f)
-        
-        regions = []
-        for gene_id, gene_feats in gene_features.items():
-            # Sort by start position
-            gene_feats.sort(key=lambda x: x.start)
-            
-            # Get chromosome and strand from first feature
-            chrom = gene_feats[0].seqid
-            strand = gene_feats[0].strand
-            
-            # Merge overlapping ranges
-            merged_start = gene_feats[0].start - 1  # Convert to 0-based
-            merged_end = gene_feats[0].end
-            
-            for f in gene_feats[1:]:
-                if f.start - 1 <= merged_end:
-                    # Overlapping or adjacent - extend
-                    merged_end = max(merged_end, f.end)
-                else:
-                    # Non-overlapping - save current and start new
-                    regions.append(BedRegion(
-                        chrom=chrom,
-                        start=merged_start,
-                        end=merged_end,
-                        name=gene_id,
-                        strand=strand,
-                    ))
-                    merged_start = f.start - 1
-                    merged_end = f.end
-            
-            # Save last region
-            regions.append(BedRegion(
-                chrom=chrom,
-                start=merged_start,
-                end=merged_end,
-                name=gene_id,
-                strand=strand,
-            ))
-        
-        return regions
-    else:
-        # No merging - convert each feature to region
+    if not merge_by_gene:
         return [
             BedRegion(
                 chrom=f.seqid,
-                start=f.start - 1,  # Convert to 0-based
+                start=f.start - 1,  # GFF 1-based → BED 0-based
                 end=f.end,
                 name=f.get_id() or f"{f.seqid}:{f.start}",
                 strand=f.strand,
@@ -258,6 +195,55 @@ def merge_overlapping_features(
             for f in features
         ]
 
+    # Group by gene — prioritize Parent for sub-features (CDS, exon, mRNA)
+    gene_features: Dict[str, List[GffFeature]] = defaultdict(list)
+    for f in features:
+        # For sub-features (CDS, exon, mRNA), use Parent gene ID
+        # For top-level features (gene), use own ID
+        gene_id = (
+            f.get_parent() or f.get_gene_name() or f.get_id()
+            or f"{f.seqid}:{f.start}"
+        )
+        gene_features[gene_id].append(f)
+
+    regions: List[BedRegion] = []
+
+    for gene_id, feats in gene_features.items():
+        feats.sort(key=lambda x: x.start)
+
+        chrom = feats[0].seqid
+        strand = feats[0].strand
+
+        # Merge overlapping/adjacent intervals
+        merged_start = feats[0].start - 1  # 0-based
+        merged_end = feats[0].end
+
+        for f in feats[1:]:
+            f_start = f.start - 1
+            if f_start <= merged_end:
+                # Overlapping or adjacent
+                merged_end = max(merged_end, f.end)
+            else:
+                # Gap — save current, start new
+                regions.append(BedRegion(
+                    chrom=chrom, start=merged_start, end=merged_end,
+                    name=gene_id, strand=strand,
+                ))
+                merged_start = f_start
+                merged_end = f.end
+
+        # Save last interval
+        regions.append(BedRegion(
+            chrom=chrom, start=merged_start, end=merged_end,
+            name=gene_id, strand=strand,
+        ))
+
+    return regions
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def run_from_gff(
     gff_path: Path,
@@ -267,130 +253,101 @@ def run_from_gff(
     step_size: int = 30,
     feature_type: str = "CDS",
     gene_ids: Optional[List[str]] = None,
+    vcf_path: Optional[Path] = None,
+    phase: bool = False,
+    min_freq: float = 0.05,
+    variant_only: bool = False,
+    aligner: str = "muscle",
     threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Generate probes from GFF annotations.
-    
-    Main entry point for the from_gff command. Extracts features
-    from GFF, retrieves sequences, and tiles probes.
-    
+
+    Workflow:
+      1. Parse GFF, filter by feature_type (and optionally gene_ids)
+      2. Merge overlapping features by gene → BedRegion list
+      3. Delegate to process_regions() (shared with from_bed)
+         - Simple: extract ref sequences, tile
+         - Haplotype: phase VCF, extract haplotypes, variant-aware probes
+
     Args:
         gff_path: Input GFF/GFF3/GTF file
-        reference_path: Reference genome FASTA
+        reference_path: Reference genome FASTA (with .fai)
         output_prefix: Output file prefix
-        probe_length: Probe length
-        step_size: Sliding window step
-        feature_type: GFF feature type to extract
-        gene_ids: Optional list of gene IDs to extract
+        probe_length: Probe length (bp)
+        step_size: Sliding window step (bp)
+        feature_type: GFF feature type to extract (e.g., "CDS", "exon")
+        gene_ids: Optional list of gene IDs to restrict to
+        vcf_path: VCF for haplotype inference (optional)
+        phase: Phase VCF with shapeit5 first
+        min_freq: Minimum haplotype frequency
+        variant_only: Only probes at variant positions
+        aligner: MSA aligner
         threads: Number of threads
         verbose: Enable verbose logging
-        
+
     Returns:
-        Result containing generation statistics
+        Ok(stats dict) on success, Err(message) on failure
+
+    Output files:
+        {output_prefix}.probes.fa   - Probe sequences
+        {output_prefix}.probes.tsv  - Probe metadata
     """
     if verbose:
         logger.setLevel(logging.DEBUG)
-    
+
     logger.info(f"Starting probe generation from {gff_path}")
     logger.info(f"Feature type: {feature_type}")
     logger.info(f"Probe length: {probe_length}, Step: {step_size}")
-    
-    # Parse GFF file
-    gff_result = parse_gff_file(gff_path, feature_types={feature_type})
+
+    # Parse GFF
+    # Support comma-separated feature types (e.g., "CDS,exon")
+    feature_type_set = {ft.strip() for ft in feature_type.split(",")}
+    gff_result = parse_gff_file(gff_path, feature_types=feature_type_set)
     if gff_result.is_err():
         return Err(gff_result.unwrap_err())
-    
+
     features = gff_result.unwrap()
-    logger.info(f"Loaded {len(features)} {feature_type} features")
-    
+    logger.info(f"Loaded {len(features)} {feature_type} features from GFF")
+
     if not features:
         return Err(f"No {feature_type} features found in GFF file")
-    
-    # Filter by gene IDs if specified
+
+    # Filter by gene IDs
     if gene_ids:
         gene_id_set = set(gene_ids)
         features = filter_features_by_gene_ids(features, gene_id_set)
         logger.info(f"Filtered to {len(features)} features for {len(gene_ids)} genes")
-        
         if not features:
-            return Err(f"No features found for specified gene IDs")
-    
-    # Merge features into regions
-    regions = merge_overlapping_features(features, by_gene=True)
+            return Err("No features found for specified gene IDs")
+
+    # Convert to BED regions (merge overlapping by gene)
+    regions = features_to_bed_regions(features, merge_by_gene=True)
     logger.info(f"Merged into {len(regions)} regions")
-    
-    # Load reference genome
-    logger.info("Loading reference genome...")
-    ref_result = read_fasta(reference_path)
-    if ref_result.is_err():
-        return Err(f"Failed to read reference: {ref_result.unwrap_err()}")
-    
-    reference_sequences = ref_result.unwrap()
-    logger.info(f"Loaded {len(reference_sequences)} chromosomes")
-    
-    # Configure tiling
-    tiling_config = TilingConfig(
+
+    # Delegate to shared region processor
+    result = process_regions(
+        regions=regions,
+        reference_path=reference_path,
+        output_prefix=output_prefix,
         probe_length=probe_length,
         step_size=step_size,
+        vcf_path=vcf_path,
+        phase=phase,
+        min_freq=min_freq,
+        variant_only=variant_only,
+        aligner=aligner,
+        threads=threads,
+        verbose=verbose,
     )
-    
-    # Extract sequences and generate probes
-    all_probes: List[Probe] = []
-    extraction_errors = 0
-    
-    for region in regions:
-        # Extract sequence
-        seq_result = extract_region_sequence(region, reference_sequences)
-        
-        if seq_result.is_err():
-            logger.warning(f"Failed to extract {region.name}: {seq_result.unwrap_err()}")
-            extraction_errors += 1
-            continue
-        
-        sequence = seq_result.unwrap()
-        
-        # Tile probes
-        probes = tile_sequence(region.name, sequence, tiling_config)
-        
-        # Update coordinates
-        for probe in probes:
-            if region.strand != '-':
-                probe.start = region.start + probe.start
-                probe.end = region.start + probe.end
-            probe.chrom = region.chrom
-        
-        all_probes.extend(probes)
-    
-    logger.info(f"Generated {len(all_probes)} probes from {len(regions) - extraction_errors} genes")
-    
-    # Save outputs
-    fasta_output = Path(str(output_prefix) + ".probes.fa")
-    fasta_output.parent.mkdir(parents=True, exist_ok=True)
-    
-    probe_sequences = {p.probe_id: p.sequence for p in all_probes}
-    write_result = write_fasta(probe_sequences, fasta_output)
-    if write_result.is_err():
-        return Err(f"Failed to save FASTA: {write_result.unwrap_err()}")
-    
-    # Save TSV
-    tsv_output = Path(str(output_prefix) + ".probes.tsv")
-    with open(tsv_output, 'w') as f:
-        f.write("probe_id\tsequence\tchrom\tstart\tend\tgene\tlength\n")
-        for p in all_probes:
-            f.write(f"{p.probe_id}\t{p.sequence}\t{p.chrom}\t{p.start}\t{p.end}\t{p.snp_id}\t{len(p.sequence)}\n")
-    
-    stats = {
-        "gene_count": len(regions) - extraction_errors,
-        "feature_count": len(features),
-        "probe_count": len(all_probes),
-        "extraction_errors": extraction_errors,
-        "feature_type": feature_type,
-        "probe_length": probe_length,
-        "step_size": step_size,
-        "fasta_file": str(fasta_output),
-        "tsv_file": str(tsv_output),
-    }
-    
-    return Ok(stats)
+
+    # Enrich stats with GFF-specific info
+    if result.is_ok():
+        stats = result.unwrap()
+        stats["feature_type"] = feature_type
+        stats["feature_count"] = len(features)
+        stats["gene_count"] = len(regions)
+        return Ok(stats)
+
+    return result

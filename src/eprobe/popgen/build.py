@@ -3,15 +3,21 @@ Probe sequence generation module.
 
 Generates final probe sequences from selected SNPs:
   - Extracts sequences with configurable length and offset
-  - Supports alternate allele probe generation
+  - Supports SNP replacement (third-base) to reduce allele capture bias
+  - Supports mutation type filtering (transition/transversion)
   - Handles edge cases near chromosome boundaries
 
 This module corresponds to the original SNP_generator.py functionality.
+
+FASTA header format (legacy-compatible):
+  >{chrom}:{start}-{end}_{pos}_{type}_{ref}_{alt}
 """
 
 import logging
+import random
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from eprobe.core.result import Result, Ok, Err
@@ -21,132 +27,192 @@ from eprobe.core.fasta import read_fasta, write_fasta
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Configuration
+# =============================================================================
+
 @dataclass
 class ProbeConfig:
     """Configuration for probe generation."""
     length: int = 81
-    shift: int = 0  # SNP offset from center (0 = centered)
-    replace_mode: bool = True  # Generate alternate allele probes
-    include_ref: bool = True   # Include reference allele probes
-    include_alt: bool = True   # Include alternate allele probes
+    shift: int = 0        # SNP offset from center (0 = centered)
+    replace_snp: bool = False  # Replace SNP with third base (neither REF nor ALT)
+    mutation_type: Optional[str] = None  # Filter: "ts", "tv", or None (both)
+    tiling: bool = False   # Generate 3 probes per SNP (center + left + right)
+    tiling_shift: int = 15 # Offset for tiling left/right probes
 
+
+# =============================================================================
+# Coordinate Calculation
+# =============================================================================
 
 def calculate_probe_coordinates(
     snp_pos: int,
     probe_length: int,
     shift: int = 0,
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int, int, int]:
     """
     Calculate probe start, end, and SNP offset within probe.
+    
+    For odd-length probes (recommended), left_flank == right_flank.
+    For even-length probes, right_flank = left_flank + 1.
+    
+    Shift follows the legacy convention:
+      - Positive shift: probe slides right (SNP moves toward 5' end)
+      - Negative shift: probe slides left (SNP moves toward 3' end)
     
     Args:
         snp_pos: 1-based SNP position
         probe_length: Desired probe length
-        shift: Offset from center (positive = shift right, SNP moves left in probe)
+        shift: Offset from center
         
     Returns:
-        Tuple of (start_pos, end_pos, snp_offset)
-        - start_pos: 1-based start position
-        - end_pos: 1-based end position (exclusive)
+        Tuple of (start_pos, end_pos, snp_offset, actual_length)
+        - start_pos: 0-based start position (for Python slicing)
+        - end_pos: 0-based end position (exclusive, for Python slicing)
         - snp_offset: 0-based offset of SNP within probe
+        - actual_length: actual probe length
     """
-    # Center position in probe (0-based)
-    center_offset = (probe_length - 1) // 2
+    if probe_length % 2 == 1:
+        left_flank = right_flank = probe_length // 2
+    else:
+        left_flank = (probe_length // 2) - 1
+        right_flank = left_flank + 1
     
-    # Apply shift: positive shift moves SNP left (toward start)
-    snp_offset = center_offset - shift
+    # 1-based to 0-based; apply shift (positive = slide right)
+    start = snp_pos - left_flank - 1 + shift
+    end = snp_pos + right_flank - 1 + shift
     
-    # Ensure SNP offset is within probe
-    snp_offset = max(0, min(probe_length - 1, snp_offset))
+    snp_offset = snp_pos - 1 - start  # 0-based offset within probe
     
-    # Calculate genomic positions (1-based)
-    start_pos = snp_pos - snp_offset
-    end_pos = start_pos + probe_length
-    
-    return start_pos, end_pos, snp_offset
+    return start, end + 1, snp_offset, end - start + 1
 
 
-def generate_probe_sequence(
+def validate_shift(shift: int, probe_length: int) -> Result[None, str]:
+    """
+    Validate that shift does not move SNP outside the probe.
+    
+    Legacy rule: abs(shift) must be < min(left_flank, right_flank).
+    """
+    if probe_length % 2 == 1:
+        max_shift = probe_length // 2
+    else:
+        max_shift = (probe_length // 2) - 1
+    
+    if abs(shift) >= max_shift:
+        return Err(
+            f"Shift {shift} is too large for probe length {probe_length}. "
+            f"Maximum allowed: {max_shift - 1} (to keep SNP inside probe)."
+        )
+    return Ok(None)
+
+
+# =============================================================================
+# Probe Generation
+# =============================================================================
+
+def make_probe_id(snp: SNP, start_1based: int, end_1based: int) -> str:
+    """
+    Generate legacy-compatible FASTA header / probe ID.
+    
+    Format: {chrom}:{start}-{end}_{pos}_{type}_{ref}_{alt}
+    """
+    return (
+        f"{snp.chrom}:{start_1based}-{end_1based}"
+        f"_{snp.pos}_{snp.mutation_type}_{snp.ref}_{snp.alt}"
+    )
+
+
+def replace_with_third_base(ref: str, alt: str, seed: Optional[int] = None) -> str:
+    """
+    Pick a random base that is neither REF nor ALT.
+    
+    Used to reduce allele capture bias in hybridization.
+    """
+    bases = {"A", "T", "C", "G"}
+    candidates = list(bases - {ref.upper(), alt.upper()})
+    if seed is not None:
+        rng = random.Random(seed)
+        return rng.choice(candidates)
+    return random.choice(candidates)
+
+
+def generate_probe_for_snp(
     snp: SNP,
     reference_seq: str,
     chrom_length: int,
     config: ProbeConfig,
-) -> Result[List[Probe], str]:
+) -> Result[Probe, str]:
     """
-    Generate probe sequences for a single SNP.
+    Generate one probe for a single SNP.
     
     Args:
-        snp: SNP with position and alleles
-        reference_seq: Reference chromosome sequence
+        snp: SNP object
+        reference_seq: Full chromosome sequence (0-based indexing)
         chrom_length: Length of chromosome
         config: Probe generation configuration
         
     Returns:
-        Result containing list of Probe objects
+        Result containing a Probe object
     """
-    start, end, snp_offset = calculate_probe_coordinates(
+    start_0, end_0, snp_offset, length = calculate_probe_coordinates(
         snp.pos, config.length, config.shift
     )
     
-    # Check boundaries
-    if start < 1:
-        return Err(f"Probe start ({start}) before chromosome start for {snp.snp_id}")
-    if end > chrom_length + 1:
-        return Err(f"Probe end ({end}) beyond chromosome end for {snp.snp_id}")
-    
-    # Extract reference sequence (convert to 0-based for Python string)
-    probe_ref_seq = reference_seq[start - 1:end - 1]
-    
-    # Validate sequence length
-    if len(probe_ref_seq) != config.length:
-        return Err(f"Extracted sequence length mismatch for {snp.snp_id}")
-    
-    # Validate SNP position matches reference
-    ref_at_snp = probe_ref_seq[snp_offset]
-    if ref_at_snp.upper() != snp.ref.upper():
+    # Boundary check
+    if start_0 < 0:
         return Err(
-            f"Reference mismatch at {snp.snp_id}: "
-            f"expected {snp.ref}, found {ref_at_snp}"
+            f"Probe extends before chromosome start for "
+            f"{snp.chrom}:{snp.pos} (start={start_0})"
+        )
+    if end_0 > chrom_length:
+        return Err(
+            f"Probe extends beyond chromosome end for "
+            f"{snp.chrom}:{snp.pos} (end={end_0}, chrom_len={chrom_length})"
         )
     
-    probes: List[Probe] = []
+    # Extract sequence
+    probe_seq = reference_seq[start_0:end_0].upper()
     
-    # Generate reference allele probe
-    if config.include_ref:
-        ref_probe = Probe(
-            probe_id=f"{snp.snp_id}_REF",
-            sequence=probe_ref_seq.upper(),
-            snp_id=snp.snp_id,
-            chrom=snp.chrom,
-            start=start,
-            end=end - 1,
-            snp_offset=snp_offset,
-            allele=snp.ref,
-            is_ref=True,
+    if len(probe_seq) != config.length:
+        return Err(
+            f"Extracted sequence length {len(probe_seq)} != "
+            f"expected {config.length} for {snp.chrom}:{snp.pos}"
         )
-        probes.append(ref_probe)
     
-    # Generate alternate allele probe
-    if config.include_alt and config.replace_mode:
-        # Replace reference allele with alternate
-        seq_list = list(probe_ref_seq.upper())
-        seq_list[snp_offset] = snp.alt.upper()
-        probe_alt_seq = "".join(seq_list)
-        
-        alt_probe = Probe(
-            probe_id=f"{snp.snp_id}_ALT",
-            sequence=probe_alt_seq,
-            snp_id=snp.snp_id,
-            chrom=snp.chrom,
-            start=start,
-            end=end - 1,
-            snp_offset=snp_offset,
-            allele=snp.alt,
-            is_ref=False,
+    # Validate REF base matches reference genome
+    ref_at_snp = probe_seq[snp_offset]
+    if ref_at_snp != snp.ref.upper():
+        return Err(
+            f"Reference mismatch at {snp.chrom}:{snp.pos}: "
+            f"expected '{snp.ref}', found '{ref_at_snp}' in genome"
         )
-        probes.append(alt_probe)
     
-    return Ok(probes)
+    # Apply SNP replacement if requested
+    if config.replace_snp:
+        new_base = replace_with_third_base(snp.ref, snp.alt)
+        seq_list = list(probe_seq)
+        seq_list[snp_offset] = new_base
+        probe_seq = "".join(seq_list)
+    
+    # Build probe ID (legacy format: chr:start-end_pos_type_ref_alt)
+    start_1based = start_0 + 1
+    end_1based = end_0  # end_0 is exclusive in 0-based, so equals 1-based end
+    probe_id = make_probe_id(snp, start_1based, end_1based)
+    
+    probe = Probe(
+        id=probe_id,
+        sequence=probe_seq,
+        source_chrom=snp.chrom,
+        source_start=start_1based,
+        source_end=end_1based,
+        snp_pos=snp.pos,
+        snp_ref=snp.ref,
+        snp_alt=snp.alt,
+        mutation_type=snp.mutation_type,
+    )
+    
+    return Ok(probe)
 
 
 def generate_probes_batch(
@@ -157,50 +223,105 @@ def generate_probes_batch(
     """
     Generate probes for a batch of SNPs.
     
+    In tiling mode, generates 3 probes per SNP:
+      - Center probe (shift=0)
+      - Left probe (shift=+tiling_shift, SNP toward 5' end)
+      - Right probe (shift=-tiling_shift, SNP toward 3' end)
+    
     Args:
         snps: List of SNPs
         reference_sequences: Reference sequences by chromosome
         config: Probe generation configuration
         
     Returns:
-        Result containing ProbeSet with all generated probes
+        Result containing ProbeSet
     """
-    all_probes: List[Probe] = []
+    probe_set = ProbeSet(name="popgen_probes")
     errors: List[str] = []
     
-    for snp in snps:
-        ref_seq = reference_sequences.get(snp.chrom)
-        if ref_seq is None:
-            errors.append(f"Chromosome {snp.chrom} not in reference")
-            continue
-        
-        result = generate_probe_sequence(snp, ref_seq, len(ref_seq), config)
-        
-        if result.is_err():
-            errors.append(result.unwrap_err())
-            logger.debug(f"Failed to generate probe: {result.unwrap_err()}")
-            continue
-        
-        all_probes.extend(result.unwrap())
+    if config.tiling:
+        # Tiling mode: 3 probes per SNP
+        shifts = [
+            (0, "C"),                        # center
+            (config.tiling_shift, "L"),       # left-shifted (SNP toward 5')
+            (-config.tiling_shift, "R"),      # right-shifted (SNP toward 3')
+        ]
+        for snp in snps:
+            ref_seq = reference_sequences.get(snp.chrom)
+            if ref_seq is None:
+                errors.append(f"Chromosome '{snp.chrom}' not in reference")
+                continue
+            
+            for shift_val, tag in shifts:
+                tile_config = ProbeConfig(
+                    length=config.length,
+                    shift=shift_val,
+                    replace_snp=config.replace_snp,
+                    mutation_type=config.mutation_type,
+                )
+                result = generate_probe_for_snp(
+                    snp, ref_seq, len(ref_seq), tile_config
+                )
+                if result.is_err():
+                    errors.append(f"{tag}:{result.unwrap_err()}")
+                    logger.debug(f"Skipped tiling {tag}: {result.unwrap_err()}")
+                    continue
+                
+                probe = result.unwrap()
+                # Append tiling tag to probe ID for uniqueness
+                tagged_probe = Probe(
+                    id=f"{probe.id}_{tag}",
+                    sequence=probe.sequence,
+                    source_chrom=probe.source_chrom,
+                    source_start=probe.source_start,
+                    source_end=probe.source_end,
+                    snp_pos=probe.snp_pos,
+                    snp_ref=probe.snp_ref,
+                    snp_alt=probe.snp_alt,
+                    mutation_type=probe.mutation_type,
+                )
+                probe_set.add(tagged_probe)
+    else:
+        # Standard mode: 1 probe per SNP
+        for snp in snps:
+            ref_seq = reference_sequences.get(snp.chrom)
+            if ref_seq is None:
+                errors.append(f"Chromosome '{snp.chrom}' not in reference")
+                continue
+            
+            result = generate_probe_for_snp(snp, ref_seq, len(ref_seq), config)
+            
+            if result.is_err():
+                errors.append(result.unwrap_err())
+                logger.debug(f"Skipped: {result.unwrap_err()}")
+                continue
+            
+            probe_set.add(result.unwrap())
     
     if errors:
         logger.warning(f"Failed to generate {len(errors)} probes")
-        for err in errors[:5]:  # Show first 5 errors
-            logger.debug(f"  {err}")
+        for err in errors[:5]:
+            logger.warning(f"  {err}")
         if len(errors) > 5:
-            logger.debug(f"  ... and {len(errors) - 5} more")
+            logger.warning(f"  ... and {len(errors) - 5} more")
     
-    probe_set = ProbeSet(probes=all_probes)
     return Ok(probe_set)
 
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 def run_build(
     input_path: Path,
     reference_path: Path,
     output_prefix: Path,
-    length: int = 81,
-    shift: int = 0,
-    replace_mode: bool = True,
+    probe_length: int = 81,
+    snp_position: str = "center",
+    offset: int = 0,
+    replace_snp: bool = False,
+    mutation_type: Optional[str] = None,
+    tiling_offset: int = 15,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -213,9 +334,12 @@ def run_build(
         input_path: Input SNP TSV file
         reference_path: Reference genome FASTA
         output_prefix: Output file prefix
-        length: Probe length
-        shift: SNP position offset from center
-        replace_mode: Generate alternate allele probes
+        probe_length: Probe length (odd number recommended)
+        snp_position: "center", "left", "right", or "tiling"
+        offset: Additional offset from center position
+        replace_snp: Replace SNP with third base (neither REF nor ALT)
+        mutation_type: Filter by "ts" or "tv", None = keep both
+        tiling_offset: Shift for tiling left/right probes (default: 15)
         verbose: Enable verbose logging
         
     Returns:
@@ -224,15 +348,59 @@ def run_build(
     if verbose:
         logger.setLevel(logging.DEBUG)
     
+    # Tiling mode: 3 probes per SNP (center, left, right)
+    use_tiling = snp_position == "tiling"
+    
+    if use_tiling:
+        shift = 0  # center probe is at 0
+        # Validate tiling_offset
+        shift_check = validate_shift(tiling_offset, probe_length)
+        if shift_check.is_err():
+            return Err(
+                f"Tiling offset {tiling_offset} is too large. "
+                f"{shift_check.unwrap_err()}"
+            )
+    else:
+        # Convert snp_position to shift value
+        # Legacy convention: positive shift slides probe right
+        if snp_position == "center":
+            shift = offset
+        elif snp_position == "left":
+            # SNP toward left (5') end → probe slides right → positive shift
+            shift = abs(offset) if offset != 0 else probe_length // 4
+        elif snp_position == "right":
+            # SNP toward right (3') end → probe slides left → negative shift
+            shift = -(abs(offset) if offset != 0 else probe_length // 4)
+        else:
+            return Err(f"Invalid snp_position: {snp_position}")
+        
+        # Validate shift range
+        shift_check = validate_shift(shift, probe_length)
+        if shift_check.is_err():
+            return Err(shift_check.unwrap_err())
+    
     logger.info(f"Starting probe generation from {input_path}")
-    logger.info(f"Probe length: {length}, Shift: {shift}, Replace mode: {replace_mode}")
+    logger.info(f"Probe length: {probe_length}, SNP position: {snp_position}, "
+                f"Shift: {shift}, Replace SNP: {replace_snp}")
     
     # Load input SNPs
-    snp_df = SNPDataFrame.from_tsv(input_path)
-    if snp_df.is_err():
-        return Err(f"Failed to load input: {snp_df.unwrap_err()}")
+    snp_df_result = SNPDataFrame.from_tsv(input_path)
+    if snp_df_result.is_err():
+        return Err(f"Failed to load input: {snp_df_result.unwrap_err()}")
     
-    snps = snp_df.unwrap().to_snps()
+    snp_df = snp_df_result.unwrap()
+    
+    # Filter by mutation type if specified
+    if mutation_type in ("ts", "tv"):
+        before = len(snp_df)
+        snp_df = snp_df.filter_by_mutation_type(mutation_type)
+        logger.info(f"Filtered by mutation type '{mutation_type}': "
+                    f"{before} → {len(snp_df)} SNPs")
+    
+    snps = snp_df.to_snps()
+    if not snps:
+        return Err("No SNPs remaining after filtering")
+    
     logger.info(f"Loaded {len(snps)} SNPs")
     
     # Load reference genome
@@ -244,14 +412,16 @@ def run_build(
     reference_sequences = ref_result.unwrap()
     logger.info(f"Loaded {len(reference_sequences)} chromosomes")
     
-    # Configure probe generation
+    # Configure and generate
     config = ProbeConfig(
-        length=length,
+        length=probe_length,
         shift=shift,
-        replace_mode=replace_mode,
+        replace_snp=replace_snp,
+        mutation_type=mutation_type,
+        tiling=use_tiling,
+        tiling_shift=tiling_offset,
     )
     
-    # Generate probes
     logger.info("Generating probe sequences...")
     probe_result = generate_probes_batch(snps, reference_sequences, config)
     if probe_result.is_err():
@@ -259,36 +429,51 @@ def run_build(
     
     probe_set = probe_result.unwrap()
     
+    if len(probe_set) == 0:
+        return Err("No probes were generated. Check reference genome and SNP coordinates.")
+    
     # Save FASTA output
     fasta_path = Path(str(output_prefix) + ".probes.fa")
-    fasta_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    sequences = {probe.probe_id: probe.sequence for probe in probe_set.probes}
-    write_result = write_fasta(sequences, fasta_path)
+    write_result = probe_set.to_fasta(fasta_path)
     if write_result.is_err():
         return Err(f"Failed to save FASTA: {write_result.unwrap_err()}")
     
-    logger.info(f"Saved {len(sequences)} probes to {fasta_path}")
+    logger.info(f"Saved {len(probe_set)} probes to {fasta_path}")
     
-    # Save TSV metadata
-    tsv_path = Path(str(output_prefix) + ".probes.tsv")
-    probe_set.to_tsv(tsv_path)
+    # Save summary
+    summary_path = Path(str(output_prefix) + ".build_summary.txt")
+    ts_count = sum(1 for p in probe_set if p.mutation_type == "ts")
+    tv_count = sum(1 for p in probe_set if p.mutation_type == "tv")
     
-    # Calculate statistics
-    ref_probes = sum(1 for p in probe_set.probes if p.is_ref)
-    alt_probes = sum(1 for p in probe_set.probes if not p.is_ref)
+    with open(summary_path, "w") as f:
+        f.write(f"Probe Generation Summary\n")
+        f.write(f"========================\n")
+        f.write(f"Input SNPs: {len(snps)}\n")
+        f.write(f"Probes generated: {len(probe_set)}\n")
+        f.write(f"Probe length: {probe_length}\n")
+        f.write(f"SNP position: {snp_position} (shift={shift})\n")
+        if use_tiling:
+            f.write(f"Tiling mode: 3 probes per SNP (center, L±{tiling_offset}, R±{tiling_offset})\n")
+        f.write(f"Replace SNP (3rd base): {replace_snp}\n")
+        if mutation_type:
+            f.write(f"Mutation type filter: {mutation_type}\n")
+        f.write(f"Transitions (ts): {ts_count}\n")
+        f.write(f"Transversions (tv): {tv_count}\n")
+        f.write(f"\nOutput: {fasta_path}\n")
     
     stats = {
         "snp_count": len(snps),
-        "probe_count": len(probe_set.probes),
-        "ref_probes": ref_probes,
-        "alt_probes": alt_probes,
-        "probe_length": length,
+        "probe_count": len(probe_set),
+        "ts_count": ts_count,
+        "tv_count": tv_count,
+        "probe_length": probe_length,
         "shift": shift,
+        "replace_snp": replace_snp,
         "fasta_file": str(fasta_path),
-        "tsv_file": str(tsv_path),
+        "summary_file": str(summary_path),
     }
     
-    logger.info(f"Probe generation complete: {stats['probe_count']} probes from {stats['snp_count']} SNPs")
+    logger.info(f"Probe generation complete: {len(probe_set)} probes "
+                f"from {len(snps)} SNPs (ts={ts_count}, tv={tv_count})")
     
     return Ok(stats)

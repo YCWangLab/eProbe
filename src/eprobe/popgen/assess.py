@@ -4,29 +4,37 @@ Probe quality assessment module.
 Calculates and reports quality metrics for probe sets:
   - Biophysical properties (GC, Tm, complexity, hairpin, dimer)
   - Genomic coverage statistics
+  - IBS distance comparison between full VCF and probe-covered SNPs
+  - Site Frequency Spectrum comparison using easySFS
   - Distribution plots
 
 This module corresponds to the original SNP_assessor.py functionality.
 """
 
 import logging
+import re
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple, Set
 from dataclasses import dataclass
+from collections import defaultdict
 
 import pandas as pd
 import numpy as np
+from scipy import stats
+from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.spatial.distance import squareform
 
 from eprobe.core.result import Result, Ok, Err
 from eprobe.core.models import SNPDataFrame, ProbeSet
 from eprobe.core.fasta import read_fasta
-from eprobe.biophysics import (
-    calculate_gc,
-    calculate_tm,
-    calculate_complexity,
-    calculate_hairpin_score,
+# Use fast biophysical calculators (same as filter.py)
+from eprobe.biophysics.fast_biophysics import (
+    calculate_gc_fast,
+    calculate_tm_fast,
+    calculate_dust_fast,
+    calculate_hairpin_fast,
+    DimerCalculatorFast,
 )
-from eprobe.biophysics.dimer import DimerCalculator
 from eprobe.biophysics.entropy import calculate_entropy
 
 logger = logging.getLogger(__name__)
@@ -64,6 +72,8 @@ def assess_single_probe(
     """
     Calculate assessment metrics for a single probe.
     
+    Uses the same fast biophysics functions as the filter step.
+    
     Args:
         probe_id: Probe identifier
         sequence: Probe sequence
@@ -75,16 +85,16 @@ def assess_single_probe(
     result = AssessmentResult(probe_id=probe_id, sequence=sequence)
     
     if "gc" in tags:
-        result.gc = calculate_gc(sequence)
+        result.gc = calculate_gc_fast(sequence)
     
     if "tm" in tags:
-        result.tm = calculate_tm(sequence)
+        result.tm = calculate_tm_fast(sequence)
     
     if "complexity" in tags:
-        result.complexity = calculate_complexity(sequence)
+        result.complexity = calculate_dust_fast(sequence)
     
     if "hairpin" in tags:
-        result.hairpin = calculate_hairpin_score(sequence)
+        result.hairpin = calculate_hairpin_fast(sequence, method="kmer")
     
     if "entropy" in tags:
         result.entropy = calculate_entropy(sequence)
@@ -120,45 +130,38 @@ def calculate_dimer_scores(
     sample_size: int = 1000,
 ) -> Dict[str, float]:
     """
-    Calculate dimer scores by sampling pairs.
+    Calculate dimer scores for probe sequences.
     
-    For large probe sets, calculating all pairwise dimer scores
-    is computationally expensive. This function samples pairs
-    to estimate dimer propensity.
+    Uses the same DimerCalculatorFast as the filter step.
+    Higher scores indicate more shared k-mers with other probes.
     
     Args:
         sequences: Dictionary of probe_id -> sequence
-        sample_size: Number of pairs to sample
+        sample_size: Not used (kept for API compatibility)
         
     Returns:
-        Dictionary of probe_id -> max dimer score
+        Dictionary of probe_id -> dimer score
     """
-    calculator = DimerCalculator()
+    if len(sequences) <= 1:
+        return {pid: 0.0 for pid in sequences.keys()}
+    
+    # Use same dimer calculator as filter.py
+    dimer_calc = DimerCalculatorFast(k=11, include_revcomp=True)
+    
+    # Build k-mer index from all probes
+    seq_list = list(sequences.values())
+    n_kmers = dimer_calc.build_index(seq_list)
+    
+    if n_kmers == 0:
+        logger.warning("No k-mers found for dimer calculation")
+        return {pid: 0.0 for pid in sequences.keys()}
+    
+    # Calculate scores for all probes
+    scores = dimer_calc.calculate_all_scores()
+    
+    # Map scores back to probe IDs
     probe_ids = list(sequences.keys())
-    n_probes = len(probe_ids)
-    
-    if n_probes <= 1:
-        return {pid: 0.0 for pid in probe_ids}
-    
-    # Initialize scores
-    max_scores: Dict[str, float] = {pid: 0.0 for pid in probe_ids}
-    
-    # Sample pairs
-    n_pairs = min(sample_size, n_probes * (n_probes - 1) // 2)
-    
-    for _ in range(n_pairs):
-        # Random pair selection
-        i, j = np.random.choice(n_probes, 2, replace=False)
-        
-        seq1 = sequences[probe_ids[i]]
-        seq2 = sequences[probe_ids[j]]
-        
-        score = calculator.calculate(seq1, seq2)
-        
-        max_scores[probe_ids[i]] = max(max_scores[probe_ids[i]], score)
-        max_scores[probe_ids[j]] = max(max_scores[probe_ids[j]], score)
-    
-    return max_scores
+    return {pid: scores[i] for i, pid in enumerate(probe_ids)}
 
 
 def calculate_summary_statistics(
@@ -195,6 +198,2048 @@ def calculate_summary_statistics(
     return summary
 
 
+# =============================================================================
+# IBS Distance Analysis Functions
+# =============================================================================
+
+def parse_vcf_genotypes(
+    vcf_path: Path,
+    positions: Optional[Set[Tuple[str, int]]] = None,
+    max_sites: Optional[int] = None,
+) -> Result[Tuple[List[str], np.ndarray, List[Tuple[str, int]]], str]:
+    """
+    Parse VCF file and extract genotype matrix.
+    
+    Args:
+        vcf_path: Path to VCF file (can be .vcf or .vcf.gz)
+        positions: Optional set of (chrom, pos) to filter to
+        max_sites: Maximum number of sites to load (for memory)
+        
+    Returns:
+        Result containing (sample_names, genotype_matrix, site_positions)
+        Genotype matrix: 0=homref, 1=het, 2=homalt, -1=missing
+    """
+    import gzip
+    
+    # Determine if compressed
+    open_func = gzip.open if str(vcf_path).endswith('.gz') else open
+    mode = 'rt' if str(vcf_path).endswith('.gz') else 'r'
+    
+    samples = []
+    genotypes = []
+    site_pos = []
+    
+    try:
+        with open_func(vcf_path, mode) as f:
+            for line in f:
+                if line.startswith('##'):
+                    continue
+                
+                if line.startswith('#CHROM'):
+                    # Header line with sample names
+                    parts = line.strip().split('\t')
+                    samples = parts[9:]  # Sample names start at column 9
+                    continue
+                
+                # Data line
+                parts = line.strip().split('\t')
+                chrom = parts[0]
+                pos = int(parts[1])
+                
+                # Filter by positions if specified
+                if positions is not None and (chrom, pos) not in positions:
+                    continue
+                
+                # Parse genotypes
+                gt_idx = None
+                format_fields = parts[8].split(':')
+                for i, field in enumerate(format_fields):
+                    if field == 'GT':
+                        gt_idx = i
+                        break
+                
+                if gt_idx is None:
+                    continue
+                
+                site_gts = []
+                for sample_data in parts[9:]:
+                    gt_field = sample_data.split(':')[gt_idx] if ':' in sample_data else sample_data
+                    
+                    # Parse genotype
+                    if gt_field in ['.', './.', '.|.']:
+                        site_gts.append(-1)  # Missing
+                    elif '/' in gt_field:
+                        alleles = gt_field.split('/')
+                        try:
+                            a1, a2 = int(alleles[0]), int(alleles[1])
+                            site_gts.append(a1 + a2)  # 0+0=0, 0+1=1, 1+1=2
+                        except ValueError:
+                            site_gts.append(-1)
+                    elif '|' in gt_field:
+                        alleles = gt_field.split('|')
+                        try:
+                            a1, a2 = int(alleles[0]), int(alleles[1])
+                            site_gts.append(a1 + a2)
+                        except ValueError:
+                            site_gts.append(-1)
+                    else:
+                        site_gts.append(-1)
+                
+                genotypes.append(site_gts)
+                site_pos.append((chrom, pos))
+                
+                # Check max sites
+                if max_sites and len(genotypes) >= max_sites:
+                    break
+        
+        if not samples:
+            return Err("No samples found in VCF")
+        
+        if not genotypes:
+            return Err("No valid genotypes found in VCF")
+        
+        gt_matrix = np.array(genotypes, dtype=np.int8).T  # Shape: (n_samples, n_sites)
+        
+        return Ok((samples, gt_matrix, site_pos))
+        
+    except Exception as e:
+        return Err(f"Error parsing VCF: {str(e)}")
+
+
+def calculate_ibs_distance_matrix(
+    genotype_matrix: np.ndarray,
+) -> np.ndarray:
+    """
+    Calculate pairwise 1-IBS distance matrix.
+    
+    1-IBS (one minus Identity By State) measures genetic distance:
+    Distance = 1 - IBS_similarity, where IBS_similarity is the proportion
+    of alleles shared identical by state.
+    
+    - IBS2 (same genotype): distance = 0
+    - IBS1 (one shared allele): distance = 0.5  
+    - IBS0 (no shared alleles): distance = 1
+    
+    Args:
+        genotype_matrix: Shape (n_samples, n_sites), values 0/1/2/-1
+        
+    Returns:
+        Distance matrix of shape (n_samples, n_samples), values in [0, 1]
+    """
+    n_samples, n_sites = genotype_matrix.shape
+    dist_matrix = np.zeros((n_samples, n_samples))
+    
+    for i in range(n_samples):
+        for j in range(i + 1, n_samples):
+            # Get genotypes for this pair
+            gt_i = genotype_matrix[i]
+            gt_j = genotype_matrix[j]
+            
+            # Mask missing data
+            valid = (gt_i >= 0) & (gt_j >= 0)
+            n_valid = np.sum(valid)
+            
+            if n_valid == 0:
+                dist_matrix[i, j] = np.nan
+                dist_matrix[j, i] = np.nan
+                continue
+            
+            gt_i_valid = gt_i[valid]
+            gt_j_valid = gt_j[valid]
+            
+            # Calculate 1-IBS distance
+            diff = np.abs(gt_i_valid - gt_j_valid)
+            # diff=0 -> IBS2 (1-IBS=0), diff=1 -> IBS1 (1-IBS=0.5), diff=2 -> IBS0 (1-IBS=1)
+            ibs_dist = np.sum(diff) / (2 * n_valid)
+            
+            dist_matrix[i, j] = ibs_dist
+            dist_matrix[j, i] = ibs_dist
+    
+    return dist_matrix
+
+
+def calculate_distance_correlation(
+    dist1: np.ndarray,
+    dist2: np.ndarray,
+) -> Dict[str, float]:
+    """
+    Calculate correlation and Manhattan distance between two distance matrices.
+    
+    Args:
+        dist1: First distance matrix
+        dist2: Second distance matrix
+        
+    Returns:
+        Dictionary with pearson_r, spearman_r, manhattan_distance
+    """
+    # Get upper triangle (excluding diagonal)
+    n = dist1.shape[0]
+    triu_idx = np.triu_indices(n, k=1)
+    
+    vec1 = dist1[triu_idx]
+    vec2 = dist2[triu_idx]
+    
+    # Remove NaN pairs
+    valid = ~(np.isnan(vec1) | np.isnan(vec2))
+    vec1_valid = vec1[valid]
+    vec2_valid = vec2[valid]
+    
+    if len(vec1_valid) < 3:
+        return {
+            "pearson_r": np.nan,
+            "pearson_p": np.nan,
+            "spearman_r": np.nan,
+            "spearman_p": np.nan,
+            "manhattan_distance": np.nan,
+            "n_pairs": len(vec1_valid),
+        }
+    
+    # Pearson correlation
+    pearson_r, pearson_p = stats.pearsonr(vec1_valid, vec2_valid)
+    
+    # Spearman correlation
+    spearman_r, spearman_p = stats.spearmanr(vec1_valid, vec2_valid)
+    
+    # Manhattan distance (normalized)
+    manhattan = np.sum(np.abs(vec1_valid - vec2_valid)) / len(vec1_valid)
+    
+    return {
+        "pearson_r": float(pearson_r),
+        "pearson_p": float(pearson_p),
+        "spearman_r": float(spearman_r),
+        "spearman_p": float(spearman_p),
+        "manhattan_distance": float(manhattan),
+        "n_pairs": len(vec1_valid),
+    }
+
+
+def generate_combined_heatmap(
+    dist_full: np.ndarray,
+    dist_probe: np.ndarray,
+    sample_names: List[str],
+    output_path: Path,
+    correlation_stats: Dict[str, float],
+) -> Result[Path, str]:
+    """
+    Generate combined heatmap with full VCF (upper triangle) and probe set (lower triangle).
+    
+    Clustering is performed on probe set distances, and the same sample order
+    is applied to both triangles for fair comparison.
+    
+    Args:
+        dist_full: Distance matrix from full VCF
+        dist_probe: Distance matrix from probe-covered SNPs
+        sample_names: List of sample names
+        output_path: Output file path
+        correlation_stats: Correlation statistics to display
+        
+    Returns:
+        Result containing output path
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap
+        from matplotlib.gridspec import GridSpec
+    except ImportError:
+        return Err("Plotting requires matplotlib. Install with: pip install matplotlib")
+    
+    n = dist_full.shape[0]
+    
+    # Hierarchical clustering on PROBE SET only
+    dist_probe_clean = np.nan_to_num(dist_probe, nan=np.nanmean(dist_probe))
+    np.fill_diagonal(dist_probe_clean, 0)
+    
+    try:
+        condensed = squareform(dist_probe_clean)
+        linkage_matrix = linkage(condensed, method='average')
+        dendro = dendrogram(linkage_matrix, no_plot=True)
+        order = dendro['leaves']
+    except Exception:
+        # If clustering fails, use original order
+        order = list(range(n))
+    
+    # Reorder both matrices using probe set clustering order
+    dist_probe_ordered = dist_probe[np.ix_(order, order)]
+    dist_full_ordered = dist_full[np.ix_(order, order)]
+    sample_names_ordered = [sample_names[i] for i in order]
+    
+    # Create combined matrix with gap on diagonal
+    # Lower triangle = probe (i > j), Upper triangle = full (i < j)
+    # Diagonal = 1 (max distance to create visual separation)
+    combined = np.ones_like(dist_full_ordered)  # Fill with 1 (max distance)
+    for i in range(n):
+        for j in range(n):
+            if i > j:  # Lower triangle - probe set
+                combined[i, j] = dist_probe_ordered[i, j]
+            elif i < j:  # Upper triangle - full VCF
+                combined[i, j] = dist_full_ordered[i, j]
+            # Diagonal stays as 1 to create visual gap
+    
+    # Create figure: 9x8, with 8x8 heatmap and narrow colorbar on upper right
+    fig = plt.figure(figsize=(9, 8))
+    gs = GridSpec(3, 2, width_ratios=[16, 1], height_ratios=[1, 2, 1], 
+                  wspace=0.02, hspace=0.02)
+    
+    # Heatmap axis spans all rows on the left
+    ax = fig.add_subplot(gs[:, 0])
+    
+    # Colorbar axis in upper right (smaller, only top 1/4)
+    cax = fig.add_subplot(gs[0, 1])
+    
+    # Custom colormap
+    cmap = plt.cm.YlOrRd
+    
+    # Plot heatmap
+    vmin = 0
+    vmax = 1.0  # 1-IBS ranges from 0 to 1
+    
+    im = ax.imshow(combined, cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal')
+    
+    # Add colorbar in the upper right area
+    cbar = plt.colorbar(im, cax=cax)
+    cbar.set_label('1-IBS', fontsize=11)
+    
+    # Add sample labels
+    if n <= 50:
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(sample_names_ordered, rotation=90, fontsize=8)
+        ax.set_yticklabels(sample_names_ordered, fontsize=8)
+    else:
+        # Too many samples, don't show labels
+        ax.set_xticks([])
+        ax.set_yticks([])
+    
+    # Title with correlation stats
+    title = f"1-IBS Distance: Upper triangle Full VCF | Lower triangle Probe Set\n"
+    title += f"Pearson = {correlation_stats['pearson_r']:.3f}, Spearman = {correlation_stats['spearman_r']:.3f}, Manhattan = {correlation_stats['manhattan_distance']:.3f}"
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    return Ok(output_path)
+
+
+def generate_scatter_comparison(
+    dist_full: np.ndarray,
+    dist_probe: np.ndarray,
+    output_path: Path,
+    correlation_stats: Dict[str, float],
+) -> Result[Path, str]:
+    """
+    Generate scatter plot comparing pairwise distances.
+    
+    Args:
+        dist_full: Distance matrix from full VCF
+        dist_probe: Distance matrix from probe-covered SNPs
+        output_path: Output file path
+        correlation_stats: Correlation statistics
+        
+    Returns:
+        Result containing output path
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return Err("Plotting requires matplotlib")
+    
+    n = dist_full.shape[0]
+    triu_idx = np.triu_indices(n, k=1)
+    
+    vec_full = dist_full[triu_idx]
+    vec_probe = dist_probe[triu_idx]
+    
+    # Remove NaN
+    valid = ~(np.isnan(vec_full) | np.isnan(vec_probe))
+    vec_full_valid = vec_full[valid]
+    vec_probe_valid = vec_probe[valid]
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    ax.scatter(vec_full_valid, vec_probe_valid, alpha=0.5, s=10, c='steelblue')
+    
+    # Add diagonal line (perfect correlation)
+    lims = [
+        min(ax.get_xlim()[0], ax.get_ylim()[0]),
+        max(ax.get_xlim()[1], ax.get_ylim()[1]),
+    ]
+    ax.plot(lims, lims, 'r--', alpha=0.75, zorder=0, label='y = x')
+    
+    # Add regression line
+    if len(vec_full_valid) > 2:
+        slope, intercept, _, _, _ = stats.linregress(vec_full_valid, vec_probe_valid)
+        x_line = np.array(lims)
+        y_line = slope * x_line + intercept
+        ax.plot(x_line, y_line, 'g-', alpha=0.75, label=f'Regression (slope={slope:.3f})')
+    
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.set_aspect('equal')
+    
+    ax.set_xlabel('1-IBS (Full VCF)', fontsize=12)
+    ax.set_ylabel('1-IBS (Probe Set)', fontsize=12)
+    
+    title = f"Pairwise 1-IBS Distance Comparison\n"
+    title += f"r = {correlation_stats['pearson_r']:.4f}, ρ = {correlation_stats['spearman_r']:.4f}\n"
+    title += f"n = {correlation_stats['n_pairs']} pairs"
+    ax.set_title(title, fontsize=11)
+    
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    return Ok(output_path)
+
+
+# =============================================================================
+# PLINK-based Analysis Functions (IBS Distance, PCA)
+# =============================================================================
+
+def check_plink_available() -> Result[str, str]:
+    """
+    Check if plink is available in PATH.
+    
+    Returns:
+        Result containing path to plink executable
+    """
+    import shutil
+    
+    plink_cmd = shutil.which("plink")
+    if plink_cmd is None:
+        return Err("plink not found in PATH. Install with: conda install -c bioconda plink")
+    return Ok(plink_cmd)
+
+
+def run_plink_ibs_distance(
+    vcf_path: Path,
+    output_prefix: Path,
+) -> Result[Tuple[np.ndarray, List[str]], str]:
+    """
+    Calculate 1-IBS distance matrix using PLINK.
+    
+    Args:
+        vcf_path: Path to VCF file
+        output_prefix: Output prefix for plink files
+        
+    Returns:
+        Result containing (distance_matrix, sample_names)
+    """
+    import subprocess
+    import tempfile
+    
+    plink_check = check_plink_available()
+    if plink_check.is_err():
+        return Err(plink_check.unwrap_err())
+    
+    plink_cmd = plink_check.unwrap()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        tmp_prefix = tmpdir / "plink_ibs"
+        
+        # Run plink to calculate 1-IBS distance
+        # --double-id: treats sample IDs as both FID and IID (avoids ID parsing issues)
+        cmd = [
+            plink_cmd,
+            "--allow-extra-chr",
+            "--double-id",
+            "--vcf", str(vcf_path),
+            "--distance", "square", "1-ibs",
+            "--out", str(tmp_prefix)
+        ]
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            
+            if result.returncode != 0:
+                return Err(f"PLINK failed: {result.stderr}")
+            
+            # Read distance matrix - plink outputs .mdist and .mdist.id for 1-ibs
+            dist_file = tmp_prefix.with_suffix(".mdist")
+            id_file = Path(str(tmp_prefix) + ".mdist.id")
+            
+            if not dist_file.exists():
+                return Err(f"PLINK distance file not found: {dist_file}")
+            
+            # Read sample IDs
+            sample_ids = []
+            with open(id_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        sample_ids.append(parts[1])  # IID is second column
+                    elif len(parts) == 1:
+                        sample_ids.append(parts[0])
+            
+            # Read distance matrix
+            dist_matrix = np.loadtxt(dist_file)
+            
+            return Ok((dist_matrix, sample_ids))
+            
+        except Exception as e:
+            return Err(f"Failed to run PLINK IBS: {e}")
+
+
+def run_plink_pca(
+    vcf_path: Path,
+    output_prefix: Path,
+    n_pcs: int = 10,
+) -> Result[Tuple[pd.DataFrame, Dict[str, float], List[str]], str]:
+    """
+    Run PCA using PLINK.
+    
+    Args:
+        vcf_path: Path to VCF file
+        output_prefix: Output prefix for plink files
+        n_pcs: Number of principal components to calculate
+        
+    Returns:
+        Result containing (eigenvectors_df, variance_explained_dict, sample_names)
+    """
+    import subprocess
+    import tempfile
+    
+    plink_check = check_plink_available()
+    if plink_check.is_err():
+        return Err(plink_check.unwrap_err())
+    
+    plink_cmd = plink_check.unwrap()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        bed_prefix = tmpdir / "plink_bed"
+        pca_prefix = tmpdir / "plink_pca"
+        
+        # Step 1: Convert VCF to bed format
+        # --double-id: treats sample IDs as both FID and IID (avoids ID parsing issues)
+        cmd_bed = [
+            plink_cmd,
+            "--allow-extra-chr",
+            "--double-id",
+            "--vcf", str(vcf_path),
+            "--make-bed",
+            "--out", str(bed_prefix)
+        ]
+        
+        # Step 2: Run PCA
+        cmd_pca = [
+            plink_cmd,
+            "--allow-extra-chr",
+            "--bfile", str(bed_prefix),
+            "--pca", str(n_pcs),
+            "--out", str(pca_prefix)
+        ]
+        
+        try:
+            # Run bed conversion
+            result = subprocess.run(cmd_bed, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                return Err(f"PLINK bed conversion failed: {result.stderr}")
+            
+            # Run PCA
+            result = subprocess.run(cmd_pca, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                return Err(f"PLINK PCA failed: {result.stderr}")
+            
+            # Read eigenvectors
+            eigenvec_file = pca_prefix.with_suffix(".eigenvec")
+            eigenval_file = pca_prefix.with_suffix(".eigenval")
+            
+            if not eigenvec_file.exists():
+                return Err(f"PLINK eigenvec file not found: {eigenvec_file}")
+            
+            # Parse eigenvectors
+            eigenvec_df = pd.read_csv(eigenvec_file, sep=r'\s+', header=None)
+            sample_ids = eigenvec_df.iloc[:, 1].tolist()  # IID is second column
+            
+            # Set column names
+            n_cols = eigenvec_df.shape[1]
+            col_names = ['FID', 'IID'] + [f'PC{i}' for i in range(1, n_cols - 1)]
+            eigenvec_df.columns = col_names
+            eigenvec_df = eigenvec_df.drop(columns=['FID'])
+            eigenvec_df = eigenvec_df.rename(columns={'IID': 'ID'})
+            
+            # Parse eigenvalues and calculate variance explained
+            variance_dict = {}
+            if eigenval_file.exists():
+                eigenvalues = pd.read_csv(eigenval_file, header=None)[0].values
+                total_var = np.sum(eigenvalues)
+                for i, val in enumerate(eigenvalues):
+                    variance_dict[f'PC{i+1}'] = (val / total_var) * 100
+            
+            return Ok((eigenvec_df, variance_dict, sample_ids))
+            
+        except Exception as e:
+            return Err(f"Failed to run PLINK PCA: {e}")
+
+
+def generate_pca_comparison_plot(
+    pca_full: pd.DataFrame,
+    pca_probe: pd.DataFrame,
+    var_full: Dict[str, float],
+    var_probe: Dict[str, float],
+    output_path: Path,
+    pop_file: Optional[Path] = None,
+    pc_x: int = 1,
+    pc_y: int = 2,
+) -> Result[Path, str]:
+    """
+    Generate side-by-side PCA comparison plots.
+    
+    Args:
+        pca_full: Eigenvectors from full VCF
+        pca_probe: Eigenvectors from probe VCF
+        var_full: Variance explained for full VCF
+        var_probe: Variance explained for probe VCF
+        output_path: Output file path
+        pop_file: Optional population file for coloring
+        pc_x: X-axis PC number
+        pc_y: Y-axis PC number
+        
+    Returns:
+        Result containing output path
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return Err("Plotting requires matplotlib")
+    
+    # Load population info if provided
+    pop_dict = {}
+    if pop_file is not None and pop_file.exists():
+        try:
+            with open(pop_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split('\t') if '\t' in line else line.split()
+                    if len(parts) >= 2:
+                        pop_dict[parts[0]] = parts[1]
+        except Exception as e:
+            logger.warning(f"Could not load pop file: {e}")
+    
+    # Create figure with 2 subplots
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    pc_x_col = f'PC{pc_x}'
+    pc_y_col = f'PC{pc_y}'
+    
+    # Plot function
+    def plot_pca(ax, pca_df, var_dict, title):
+        if pop_dict:
+            # Add population column
+            pca_df = pca_df.copy()
+            pca_df['Population'] = pca_df['ID'].map(pop_dict)
+            populations = pca_df['Population'].dropna().unique()
+            
+            # Color map
+            cmap = plt.get_cmap('tab10')
+            colors = {pop: cmap(i % 10) for i, pop in enumerate(sorted(populations))}
+            
+            for pop in sorted(populations):
+                subset = pca_df[pca_df['Population'] == pop]
+                ax.scatter(
+                    subset[pc_x_col], subset[pc_y_col],
+                    c=[colors[pop]], label=pop,
+                    alpha=0.8, s=50, edgecolors='black', linewidths=0.5
+                )
+            
+            # Handle samples without population
+            no_pop = pca_df[pca_df['Population'].isna()]
+            if len(no_pop) > 0:
+                ax.scatter(
+                    no_pop[pc_x_col], no_pop[pc_y_col],
+                    c='gray', label='Unknown',
+                    alpha=0.5, s=50, edgecolors='black', linewidths=0.5
+                )
+            
+            ax.legend(title='Population', loc='best', fontsize=9, frameon=True)
+        else:
+            ax.scatter(
+                pca_df[pc_x_col], pca_df[pc_y_col],
+                c='steelblue', alpha=0.8, s=50, edgecolors='black', linewidths=0.5
+            )
+        
+        # Labels
+        var_x = var_dict.get(pc_x_col, 0)
+        var_y = var_dict.get(pc_y_col, 0)
+        ax.set_xlabel(f'{pc_x_col} ({var_x:.1f}%)', fontsize=12)
+        ax.set_ylabel(f'{pc_y_col} ({var_y:.1f}%)', fontsize=12)
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.tick_params(labelsize=10)
+    
+    # Plot both
+    plot_pca(axes[0], pca_full, var_full, 'Full VCF')
+    plot_pca(axes[1], pca_probe, var_probe, 'Probe Set')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    
+    return Ok(output_path)
+
+
+def run_pca_assessment(
+    snp_tsv_path: Path,
+    vcf_path: Path,
+    output_prefix: Path,
+    pop_file: Optional[Path] = None,
+    n_pcs: int = 10,
+    verbose: bool = False,
+) -> Result[Dict[str, Any], str]:
+    """
+    Compare PCA between full VCF and probe-covered SNPs using PLINK.
+    
+    Args:
+        snp_tsv_path: Path to selected SNPs TSV file
+        vcf_path: Path to original VCF file
+        output_prefix: Output file prefix
+        pop_file: Optional population file for coloring
+        n_pcs: Number of principal components
+        verbose: Enable verbose logging
+        
+    Returns:
+        Result containing PCA assessment statistics
+    """
+    import tempfile
+    import shutil
+    
+    logger.info("Starting PCA assessment using PLINK")
+    logger.info(f"SNP TSV: {snp_tsv_path}")
+    logger.info(f"VCF: {vcf_path}")
+    
+    # Check plink and bcftools
+    plink_check = check_plink_available()
+    if plink_check.is_err():
+        return Err(plink_check.unwrap_err())
+    
+    if shutil.which("bcftools") is None:
+        return Err("bcftools not found in PATH")
+    
+    # Validate input files
+    if not snp_tsv_path.exists():
+        return Err(f"SNP TSV file not found: {snp_tsv_path}")
+    if not vcf_path.exists():
+        return Err(f"VCF file not found: {vcf_path}")
+    
+    # Create output directory
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load probe positions from TSV (only requires chr and pos columns)
+    try:
+        snp_df_pandas = pd.read_csv(snp_tsv_path, sep='\t')
+        if 'chr' not in snp_df_pandas.columns or 'pos' not in snp_df_pandas.columns:
+            return Err(f"SNP TSV must have 'chr' and 'pos' columns. Found: {list(snp_df_pandas.columns)}")
+        
+        probe_positions = set()
+        for _, row in snp_df_pandas.iterrows():
+            probe_positions.add((str(row['chr']), int(row['pos'])))
+    except Exception as e:
+        return Err(f"Failed to load SNP TSV: {e}")
+    
+    logger.info(f"Loaded {len(probe_positions)} probe positions")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        
+        # === Run PCA on full VCF ===
+        logger.info("Running PCA on full VCF...")
+        full_pca_result = run_plink_pca(vcf_path, tmpdir / "full", n_pcs=n_pcs)
+        
+        if full_pca_result.is_err():
+            return Err(f"PCA on full VCF failed: {full_pca_result.unwrap_err()}")
+        
+        pca_full, var_full, samples_full = full_pca_result.unwrap()
+        logger.info(f"Full VCF PCA: {len(samples_full)} samples, {n_pcs} PCs")
+        
+        # === Create probe subset VCF ===
+        logger.info("Creating probe-subset VCF...")
+        probe_vcf = tmpdir / "probe_subset.vcf.gz"
+        subset_result = subset_vcf_by_positions(vcf_path, probe_positions, probe_vcf)
+        
+        if subset_result.is_err():
+            return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
+        
+        # === Run PCA on probe VCF ===
+        logger.info("Running PCA on probe-subset VCF...")
+        probe_pca_result = run_plink_pca(probe_vcf, tmpdir / "probe", n_pcs=n_pcs)
+        
+        if probe_pca_result.is_err():
+            return Err(f"PCA on probe VCF failed: {probe_pca_result.unwrap_err()}")
+        
+        pca_probe, var_probe, samples_probe = probe_pca_result.unwrap()
+        logger.info(f"Probe VCF PCA: {len(samples_probe)} samples, {n_pcs} PCs")
+    
+    # === Generate comparison plots ===
+    logger.info("Generating PCA comparison plots...")
+    
+    # PC1 vs PC2
+    pca_plot_12 = Path(str(output_prefix) + ".pca_PC1_PC2.png")
+    plot_result = generate_pca_comparison_plot(
+        pca_full, pca_probe, var_full, var_probe,
+        pca_plot_12, pop_file=pop_file, pc_x=1, pc_y=2
+    )
+    if plot_result.is_err():
+        logger.warning(f"PCA plot failed: {plot_result.unwrap_err()}")
+    
+    # Calculate Procrustes similarity between PCAs
+    procrustes_similarity = None
+    try:
+        from scipy.spatial import procrustes
+        
+        # Align on common samples
+        common_samples = set(pca_full['ID']) & set(pca_probe['ID'])
+        if len(common_samples) > 2:
+            full_aligned = pca_full[pca_full['ID'].isin(common_samples)].sort_values('ID')
+            probe_aligned = pca_probe[pca_probe['ID'].isin(common_samples)].sort_values('ID')
+            
+            # Use first 3 PCs for comparison
+            n_compare = min(3, n_pcs)
+            pc_cols = [f'PC{i}' for i in range(1, n_compare + 1)]
+            
+            mtx1 = full_aligned[pc_cols].values
+            mtx2 = probe_aligned[pc_cols].values
+            
+            mtx1_std, mtx2_std, disparity = procrustes(mtx1, mtx2)
+            procrustes_similarity = 1 - disparity  # Convert disparity to similarity
+            logger.info(f"Procrustes similarity (PC1-{n_compare}): {procrustes_similarity:.4f}")
+    except ImportError:
+        logger.warning("scipy not available, skipping Procrustes analysis")
+    except Exception as e:
+        logger.warning(f"Procrustes analysis failed: {e}")
+    
+    # Save eigenvectors
+    pca_full_path = Path(str(output_prefix) + ".pca_full.tsv")
+    pca_probe_path = Path(str(output_prefix) + ".pca_probe.tsv")
+    
+    pca_full.to_csv(pca_full_path, sep='\t', index=False)
+    pca_probe.to_csv(pca_probe_path, sep='\t', index=False)
+    logger.info(f"Saved PCA results to {pca_full_path} and {pca_probe_path}")
+    
+    # Save summary
+    summary_path = Path(str(output_prefix) + ".pca_summary.txt")
+    with open(summary_path, 'w') as f:
+        f.write("PCA Assessment Summary\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Full VCF: {vcf_path}\n")
+        f.write(f"Probe SNPs: {snp_tsv_path}\n")
+        if pop_file:
+            f.write(f"Pop file: {pop_file}\n")
+        f.write(f"\nSamples: {len(samples_full)}\n")
+        f.write(f"Probe positions: {len(probe_positions)}\n\n")
+        
+        f.write("Variance Explained (Full VCF):\n")
+        f.write("-" * 30 + "\n")
+        for pc, var in sorted(var_full.items(), key=lambda x: int(x[0][2:])):
+            f.write(f"  {pc}: {var:.2f}%\n")
+        
+        f.write("\nVariance Explained (Probe Set):\n")
+        f.write("-" * 30 + "\n")
+        for pc, var in sorted(var_probe.items(), key=lambda x: int(x[0][2:])):
+            f.write(f"  {pc}: {var:.2f}%\n")
+        
+        if procrustes_similarity is not None:
+            f.write(f"\nProcrustes Similarity: {procrustes_similarity:.4f}\n")
+            f.write("(1.0 = identical, 0.0 = completely different)\n")
+    
+    logger.info(f"Saved summary to {summary_path}")
+    
+    stats_dict = {
+        "n_samples": len(samples_full),
+        "n_probe_positions": len(probe_positions),
+        "variance_full": var_full,
+        "variance_probe": var_probe,
+        "procrustes_similarity": float(procrustes_similarity) if procrustes_similarity is not None else None,
+        "pca_full_file": str(pca_full_path),
+        "pca_probe_file": str(pca_probe_path),
+        "plot_pc12": str(pca_plot_12),
+        "summary_file": str(summary_path),
+    }
+    
+    return Ok(stats_dict)
+
+
+# =============================================================================
+# SFS (Site Frequency Spectrum) Analysis Functions using easySFS
+# =============================================================================
+
+def check_easysfs_available() -> Result[str, str]:
+    """
+    Check if easySFS is available.
+    
+    Looks for easySFS in the following order:
+    1. Bundled easySFS in eprobe.external (preferred)
+    2. EASYSFS_PATH environment variable
+    3. easySFS.py in PATH
+    4. easySFS in PATH
+    
+    Returns:
+        Result containing path to easySFS executable
+    """
+    import shutil
+    import os
+    
+    # Check bundled easySFS first (preferred)
+    try:
+        from eprobe.external import get_easysfs_path
+        bundled_path = get_easysfs_path()
+        if bundled_path.exists():
+            return Ok(str(bundled_path))
+    except ImportError:
+        pass
+    
+    # Check environment variable
+    env_path = os.environ.get("EASYSFS_PATH")
+    if env_path and Path(env_path).exists():
+        return Ok(env_path)
+    
+    # Check PATH
+    easysfs_cmd = shutil.which("easySFS.py") or shutil.which("easySFS")
+    if easysfs_cmd is not None:
+        return Ok(easysfs_cmd)
+    
+    return Err("easySFS not found. This should not happen as easySFS is bundled with eProbe.")
+
+
+def load_pop_file(
+    pop_file: Path,
+) -> Result[Dict[str, List[str]], str]:
+    """
+    Load population assignment file.
+    
+    Args:
+        pop_file: Path to pop file (sample_id<tab>pop_id)
+        
+    Returns:
+        Result containing dict mapping pop_id -> list of sample_ids
+    """
+    # Validate file exists
+    if not pop_file.exists():
+        return Err(f"Population file not found: {pop_file}")
+    
+    try:
+        pop_dict = defaultdict(list)
+        line_num = 0
+        with open(pop_file, 'r') as f:
+            for line in f:
+                line_num += 1
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                # Support both tab and space delimiters
+                parts = line.split('\t') if '\t' in line else line.split()
+                if len(parts) >= 2:
+                    sample_id, pop_id = parts[0].strip(), parts[1].strip()
+                    if sample_id and pop_id:
+                        pop_dict[pop_id].append(sample_id)
+                elif len(parts) == 1:
+                    logger.warning(f"Line {line_num} in pop file has only one field, skipping: {line}")
+        
+        if not pop_dict:
+            return Err("No valid population assignments found in pop file. "
+                       "Expected format: sample_id<tab>pop_id")
+        
+        # Check for duplicate samples
+        all_samples = []
+        for samples in pop_dict.values():
+            all_samples.extend(samples)
+        if len(all_samples) != len(set(all_samples)):
+            logger.warning("Duplicate sample IDs found in pop file")
+        
+        return Ok(dict(pop_dict))
+        
+    except Exception as e:
+        return Err(f"Failed to load pop file: {e}")
+
+
+def subsample_populations(
+    pop_dict: Dict[str, List[str]],
+    n_samples_per_pop: int,
+    specified_samples: Optional[List[str]] = None,
+    seed: int = 42,
+) -> Result[Dict[str, List[str]], str]:
+    """
+    Subsample populations to equal size.
+    
+    Args:
+        pop_dict: Dict mapping pop_id -> list of sample_ids
+        n_samples_per_pop: Number of samples to select per population
+        specified_samples: Optional list of specific samples to use (overrides random)
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Result containing subsampled pop dict
+    """
+    import random
+    random.seed(seed)
+    
+    # Validate inputs
+    if not pop_dict:
+        return Err("Empty population dictionary")
+    
+    if n_samples_per_pop < 1:
+        return Err(f"n_samples_per_pop must be >= 1, got {n_samples_per_pop}")
+    
+    if specified_samples is not None:
+        # Use specified samples, assign to their populations
+        specified_set = set(specified_samples)
+        subsampled = defaultdict(list)
+        
+        for pop_id, samples in pop_dict.items():
+            for s in samples:
+                if s in specified_set:
+                    subsampled[pop_id].append(s)
+        
+        if not subsampled:
+            all_samples = set()
+            for samples in pop_dict.values():
+                all_samples.update(samples)
+            return Err(f"None of the specified samples found in pop file. "
+                       f"Available samples: {sorted(all_samples)[:10]}...")
+        
+        # Check if any populations have no samples
+        empty_pops = [p for p in pop_dict.keys() if p not in subsampled]
+        if empty_pops:
+            logger.warning(f"Populations with no specified samples: {empty_pops}")
+        
+        return Ok(dict(subsampled))
+    
+    # Random subsampling
+    subsampled = {}
+    min_pop_size = min(len(samples) for samples in pop_dict.values())
+    
+    if n_samples_per_pop > min_pop_size:
+        logger.warning(f"Requested {n_samples_per_pop} samples per pop, "
+                       f"but smallest pop has {min_pop_size}. Using {min_pop_size}.")
+        n_samples_per_pop = min_pop_size
+    
+    for pop_id, samples in pop_dict.items():
+        subsampled[pop_id] = random.sample(samples, n_samples_per_pop)
+    
+    return Ok(subsampled)
+
+
+def create_subsampled_pop_file(
+    pop_dict: Dict[str, List[str]],
+    output_path: Path,
+) -> Result[Path, str]:
+    """
+    Create a population file for easySFS from subsampled populations.
+    
+    Args:
+        pop_dict: Dict mapping pop_id -> list of sample_ids
+        output_path: Output path for pops file
+        
+    Returns:
+        Result containing path to pops file
+    """
+    try:
+        with open(output_path, 'w') as f:
+            for pop_id, samples in pop_dict.items():
+                for sample in samples:
+                    f.write(f"{sample}\t{pop_id}\n")
+        return Ok(output_path)
+    except Exception as e:
+        return Err(f"Failed to create pop file: {e}")
+
+
+def run_easysfs(
+    vcf_path: Path,
+    pops_file: Path,
+    output_dir: Path,
+    projection: Optional[str] = None,
+    preview_only: bool = False,
+) -> Result[Path, str]:
+    """
+    Run easySFS to calculate Site Frequency Spectrum from VCF.
+    
+    Args:
+        vcf_path: Path to VCF file
+        pops_file: Population assignment file (sample<tab>pop)
+        output_dir: Output directory for SFS files
+        projection: Projection values (e.g., "10,10,10" for 3 pops)
+        preview_only: If True, only run preview mode
+        
+    Returns:
+        Result containing path to output directory
+    """
+    import subprocess
+    
+    easysfs_result = check_easysfs_available()
+    if easysfs_result.is_err():
+        return Err(easysfs_result.unwrap_err())
+    
+    easysfs_cmd = easysfs_result.unwrap()
+    
+    # Build command
+    cmd = [easysfs_cmd, "-i", str(vcf_path), "-p", str(pops_file)]
+    
+    if preview_only:
+        cmd.append("--preview")
+    else:
+        cmd.extend(["-o", str(output_dir)])
+        if projection is not None:
+            cmd.extend(["--proj", projection])
+        cmd.extend(["-a", "-f", "-y"])  # -a: all SNPs, -f: force overwrite, -y: no prompt
+    
+    logger.info(f"Running easySFS: {' '.join(cmd)}")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        
+        if result.returncode != 0:
+            return Err(f"easySFS failed: {result.stderr}\n{result.stdout}")
+        
+        if preview_only:
+            # Return preview output as text
+            logger.info(f"easySFS preview:\n{result.stdout}")
+            return Ok(output_dir)  # Return dir path even for preview
+        
+        return Ok(output_dir)
+        
+    except Exception as e:
+        return Err(f"Failed to run easySFS: {e}")
+
+
+def parse_easysfs_preview(
+    vcf_path: Path,
+    pops_file: Path,
+) -> Result[Dict[str, List[Tuple[int, int]]], str]:
+    """
+    Run easySFS preview to get optimal projection values.
+    
+    Args:
+        vcf_path: Path to VCF file
+        pops_file: Population assignment file
+        
+    Returns:
+        Result containing dict of pop_id -> [(projection, n_segregating_sites), ...]
+    """
+    import subprocess
+    
+    easysfs_result = check_easysfs_available()
+    if easysfs_result.is_err():
+        return Err(easysfs_result.unwrap_err())
+    
+    easysfs_cmd = easysfs_result.unwrap()
+    
+    cmd = [easysfs_cmd, "-i", str(vcf_path), "-p", str(pops_file), "--preview", "-a"]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        
+        if result.returncode != 0:
+            return Err(f"easySFS preview failed: {result.stderr}")
+        
+        # Parse preview output
+        # Format: pop_name\n(proj, n_sites) (proj, n_sites) ...
+        preview_dict = {}
+        current_pop = None
+        
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            if line.startswith('('):
+                # This is projection data
+                if current_pop:
+                    projections = []
+                    for match in re.findall(r'\((\d+),\s*([\d.]+)\)', line):
+                        proj, n_sites = int(match[0]), int(float(match[1]))
+                        projections.append((proj, n_sites))
+                    preview_dict[current_pop] = projections
+            else:
+                # This is a population name
+                current_pop = line
+        
+        return Ok(preview_dict)
+        
+    except Exception as e:
+        return Err(f"Failed to parse easySFS preview: {e}")
+
+
+def find_optimal_projection(
+    preview_dict: Dict[str, List[Tuple[int, int]]],
+    max_projection: Optional[int] = None,
+) -> Dict[str, int]:
+    """
+    Find optimal projection values that maximize segregating sites.
+    
+    Args:
+        preview_dict: Dict from parse_easysfs_preview
+        max_projection: Optional maximum projection value to consider
+        
+    Returns:
+        Dict mapping pop_id -> optimal projection value
+    """
+    optimal = {}
+    
+    for pop_id, projections in preview_dict.items():
+        if not projections:
+            continue
+        
+        # Filter by max_projection if specified
+        if max_projection is not None:
+            projections = [(p, n) for p, n in projections if p <= max_projection]
+        
+        if projections:
+            # Find projection that maximizes segregating sites
+            best = max(projections, key=lambda x: x[1])
+            optimal[pop_id] = best[0]
+    
+    return optimal
+
+
+def subset_vcf_by_positions(
+    vcf_path: Path,
+    positions: Set[Tuple[str, int]],
+    output_path: Path,
+) -> Result[Path, str]:
+    """
+    Create a subset VCF containing only specified positions using bcftools.
+    
+    Args:
+        vcf_path: Input VCF path
+        positions: Set of (chrom, pos) tuples to include
+        output_path: Output VCF path
+        
+    Returns:
+        Result containing output path
+    """
+    import subprocess
+    import shutil
+    import tempfile
+    
+    if shutil.which("bcftools") is None:
+        return Err("bcftools not found in PATH")
+    
+    try:
+        # Create regions file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            regions_file = f.name
+            for chrom, pos in sorted(positions):
+                f.write(f"{chrom}\t{pos}\n")
+        
+        # Run bcftools view with regions
+        cmd = [
+            "bcftools", "view",
+            "-T", regions_file,
+            "-O", "z",
+            "-o", str(output_path),
+            str(vcf_path)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        
+        # Clean up
+        Path(regions_file).unlink()
+        
+        if result.returncode != 0:
+            return Err(f"bcftools failed: {result.stderr}")
+        
+        # Index the output
+        subprocess.run(["bcftools", "index", "-f", str(output_path)], check=False)
+        
+        return Ok(output_path)
+        
+    except Exception as e:
+        return Err(f"Failed to subset VCF: {e}")
+
+
+def parse_dadi_1d_sfs(sfs_dir: Path, pop_id: str) -> Result[np.ndarray, str]:
+    """
+    Parse 1D SFS from easySFS dadi output.
+    
+    Args:
+        sfs_dir: easySFS output directory
+        pop_id: Population ID
+        
+    Returns:
+        Result containing 1D SFS array (counts)
+    """
+    dadi_dir = sfs_dir / "dadi"
+    
+    # Find the 1D SFS file for this population
+    # Format: {pop_id}-{projection}.sfs  (e.g., Pop_A-6.sfs)
+    # Exclude joint SFS files which have format {pop1}-{pop2}.sfs
+    sfs_files = []
+    if dadi_dir.exists():
+        for f in dadi_dir.glob(f"{pop_id}-*.sfs"):
+            # Check if it's a 1D SFS (ends with number) not a 2D SFS (ends with pop name)
+            name = f.stem  # e.g., "Pop_A-6" or "Pop_A-Pop_B"
+            suffix = name.split('-')[-1]
+            if suffix.isdigit():  # 1D SFS has projection number
+                sfs_files.append(f)
+    
+    if not sfs_files:
+        return Err(f"No SFS file found for population {pop_id}")
+    
+    sfs_path = sfs_files[0]
+    
+    try:
+        with open(sfs_path, 'r') as f:
+            lines = f.readlines()
+        
+        # Skip header line, parse counts
+        data_lines = [l.strip() for l in lines if l.strip() and not l.startswith('#')]
+        
+        if len(data_lines) < 2:
+            return Err(f"Invalid SFS format in {sfs_path}")
+        
+        # First data line (line 1) = header with size
+        # Second line (line 2) = SFS counts  
+        # Third line (line 3) = mask (if present)
+        header = data_lines[0].split()
+        n_bins = int(header[0])
+        
+        counts_str = data_lines[1]
+        counts = np.array([float(x) for x in counts_str.split()])
+        
+        # Validate length
+        if len(counts) != n_bins:
+            return Err(f"SFS length mismatch: expected {n_bins}, got {len(counts)}")
+        
+        return Ok(counts)
+        
+    except Exception as e:
+        return Err(f"Failed to parse SFS: {e}")
+
+
+def parse_dadi_2d_sfs(sfs_dir: Path, pop1: str, pop2: str) -> Result[np.ndarray, str]:
+    """
+    Parse 2D joint SFS from easySFS dadi output.
+    
+    Args:
+        sfs_dir: easySFS output directory
+        pop1: First population ID
+        pop2: Second population ID
+        
+    Returns:
+        Result containing 2D SFS array (counts)
+    """
+    dadi_dir = sfs_dir / "dadi"
+    
+    # Try both orderings
+    patterns = [f"{pop1}-{pop2}.sfs", f"{pop2}-{pop1}.sfs"]
+    sfs_path = None
+    swapped = False
+    
+    for i, pattern in enumerate(patterns):
+        candidate = dadi_dir / pattern
+        if candidate.exists():
+            sfs_path = candidate
+            swapped = (i == 1)
+            break
+    
+    if sfs_path is None:
+        return Err(f"No joint SFS file found for {pop1}-{pop2}")
+    
+    try:
+        with open(sfs_path, 'r') as f:
+            content = f.read()
+        
+        # Parse dadi 2D SFS format
+        # First line format: "n1 n2 folded|unfolded \"Pop1\" \"Pop2\""
+        # Then a flattened array of n1*n2 values
+        lines = content.strip().split('\n')
+        if not lines:
+            return Err(f"Empty SFS file: {sfs_path}")
+        
+        # Parse header - extract dimensions (first two integers)
+        header = lines[0].split()
+        dim1, dim2 = int(header[0]), int(header[1])
+        
+        # Collect all values from remaining content
+        values_str = ' '.join(lines[1:])
+        all_values = [float(x) for x in values_str.split()]
+        
+        # dadi format contains counts + mask (2 * n1 * n2 values)
+        expected = dim1 * dim2
+        if len(all_values) == 2 * expected:
+            # Data + mask format: take only counts (first half)
+            counts_flat = all_values[:expected]
+        elif len(all_values) == expected:
+            # Just counts
+            counts_flat = all_values
+        else:
+            return Err(f"SFS shape mismatch: expected {expected} or {2*expected} values, got {len(all_values)}")
+        
+        counts = np.array(counts_flat).reshape(dim1, dim2)
+        
+        if swapped:
+            counts = counts.T
+        
+        return Ok(counts)
+        
+    except Exception as e:
+        return Err(f"Failed to parse 2D SFS: {e}")
+
+
+def generate_multipop_sfs_heatmap(
+    sfs_dir: Path,
+    pop_ids: List[str],
+    output_path: Path,
+    title: str = "Site Frequency Spectrum",
+    projection_values: Optional[Dict[str, int]] = None,
+) -> Result[Path, str]:
+    """
+    Generate multi-population SFS heatmap like the reference image.
+    
+    Diagonal blocks show 1D SFS for each population.
+    Off-diagonal blocks show pairwise joint 2D SFS.
+    
+    Args:
+        sfs_dir: easySFS output directory
+        pop_ids: List of population IDs
+        output_path: Output image path
+        title: Plot title
+        projection_values: Dict of pop_id -> projection value for axis labels
+        
+    Returns:
+        Result containing output path
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap
+        import matplotlib.gridspec as gridspec
+    except ImportError:
+        return Err("Plotting requires matplotlib")
+    
+    # Validate inputs
+    if not pop_ids:
+        return Err("No populations provided")
+    
+    n_pops = len(pop_ids)
+    
+    # Load all 1D and 2D SFS
+    sfs_1d = {}
+    sfs_2d = {}
+    
+    for pop in pop_ids:
+        result = parse_dadi_1d_sfs(sfs_dir, pop)
+        if result.is_ok():
+            sfs_1d[pop] = result.unwrap()
+        else:
+            logger.warning(f"Could not load 1D SFS for {pop}: {result.unwrap_err()}")
+    
+    for i, pop1 in enumerate(pop_ids):
+        for j, pop2 in enumerate(pop_ids):
+            if i < j:
+                result = parse_dadi_2d_sfs(sfs_dir, pop1, pop2)
+                if result.is_ok():
+                    sfs_2d[(pop1, pop2)] = result.unwrap()
+                else:
+                    logger.warning(f"Could not load 2D SFS for {pop1}-{pop2}")
+    
+    # Check if we have any data
+    if not sfs_1d and not sfs_2d:
+        return Err("No SFS data could be loaded. Check easySFS output.")
+    
+    # Custom colormap: dark red -> red -> orange -> yellow -> white
+    colors = ['#8B0000', '#FF0000', '#FF4500', '#FFA500', '#FFD700', '#FFFF00', '#FFFACD', '#FFFFFF']
+    cmap = LinearSegmentedColormap.from_list('sfs_cmap', colors[::-1])  # Reverse for high=red
+
+    # Find global max for consistent colorscale
+    all_values = []
+    for arr in sfs_1d.values():
+        all_values.extend(arr.flatten())
+    for arr in sfs_2d.values():
+        all_values.extend(arr.flatten())
+    
+    vmax = max(all_values) if all_values else 100
+    
+    # Create figure with custom layout
+    # Main grid for heatmaps + space for colorbar
+    fig_width = 2.5 * n_pops + 1.0  # Extra space for colorbar
+    fig_height = 2.5 * n_pops + 0.8  # Extra space for title
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    
+    # Create gridspec: n_pops rows x (n_pops + 1) cols (last col for colorbar)
+    gs = gridspec.GridSpec(
+        n_pops, n_pops + 1,
+        figure=fig,
+        width_ratios=[1] * n_pops + [0.1],  # Small width for colorbar column
+        wspace=0,  # No horizontal gap
+        hspace=0,  # No vertical gap
+        left=0.12, right=0.88, top=0.92, bottom=0.08
+    )
+    
+    axes = {}
+    
+    for i, pop_row in enumerate(pop_ids):
+        for j, pop_col in enumerate(pop_ids):
+            ax = fig.add_subplot(gs[i, j])
+            axes[(i, j)] = ax
+            
+            if i == j:
+                # Diagonal: 1D SFS as column heatmap
+                if pop_row in sfs_1d:
+                    sfs_data = sfs_1d[pop_row]
+                    im = ax.imshow(
+                        sfs_data.reshape(-1, 1),
+                        aspect='auto',
+                        cmap=cmap,
+                        vmin=0,
+                        vmax=vmax,
+                        origin='upper'
+                    )
+                    ax.set_xticks([])
+                else:
+                    ax.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=10)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    
+            elif i > j:
+                # Lower triangle: 2D joint SFS
+                key = (pop_col, pop_row) if (pop_col, pop_row) in sfs_2d else (pop_row, pop_col)
+                if key in sfs_2d:
+                    sfs_data = sfs_2d[key]
+                    if key == (pop_row, pop_col):
+                        sfs_data = sfs_data.T
+                    
+                    im = ax.imshow(
+                        sfs_data,
+                        aspect='auto',
+                        cmap=cmap,
+                        vmin=0,
+                        vmax=vmax,
+                        origin='upper'
+                    )
+                else:
+                    ax.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=10)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    
+            else:
+                # Upper triangle: empty (white), no border
+                ax.axis('off')
+            
+            # Y-axis: only show ticks on leftmost column
+            if j == 0 and i >= j:
+                if i == j and pop_row in sfs_1d:
+                    n_bins = len(sfs_1d[pop_row])
+                    ax.set_yticks(range(n_bins))
+                    ax.set_yticklabels(range(n_bins), fontsize=7)
+                elif i > j:
+                    key = (pop_col, pop_row) if (pop_col, pop_row) in sfs_2d else (pop_row, pop_col)
+                    if key in sfs_2d:
+                        sfs_data = sfs_2d[key]
+                        if key == (pop_row, pop_col):
+                            sfs_data = sfs_data.T
+                        ax.set_yticks(range(sfs_data.shape[0]))
+                        ax.set_yticklabels(range(sfs_data.shape[0]), fontsize=7)
+            elif i >= j:
+                ax.set_yticks([])
+                # Also hide tick marks on non-leftmost columns
+                ax.tick_params(left=False)
+            
+            # X-axis: hide all ticks
+            if i >= j:
+                ax.set_xticks([])
+                ax.tick_params(bottom=False)
+            
+            # Black border only for diagonal and lower triangle
+            if i >= j:
+                for spine in ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_color('black')
+                    spine.set_linewidth(1.5)
+    
+    # Add population labels on top (X-axis titles)
+    for j, pop_col in enumerate(pop_ids):
+        ax = axes[(0, j)]
+        ax.set_title(pop_col, fontsize=11, fontweight='bold', pad=8)
+    
+    # Add population labels on left (Y-axis titles)
+    for i, pop_row in enumerate(pop_ids):
+        ax = axes[(i, 0)]
+        ax.set_ylabel(pop_row, fontsize=11, fontweight='bold', labelpad=8)
+    
+    # Add colorbar on the right side (shortened to half height)
+    cbar_ax = fig.add_axes([0.91, 0.65, 0.025, 0.175])  # Height reduced from 0.35 to 0.175
+    cbar = fig.colorbar(
+        plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, vmax)),
+        cax=cbar_ax
+    )
+    cbar.set_label('Number of alleles', fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+    
+    # Add title
+    fig.suptitle(title, fontsize=13, fontweight='bold', y=0.98)
+    
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    
+    return Ok(output_path)
+
+
+def run_sfs_assessment(
+    snp_tsv_path: Path,
+    vcf_path: Path,
+    output_prefix: Path,
+    pop_file: Path,
+    n_samples_per_pop: int = 5,
+    specified_samples: Optional[List[str]] = None,
+    projection: Optional[str] = None,
+    seed: int = 42,
+    verbose: bool = False,
+) -> Result[Dict[str, Any], str]:
+    """
+    Compare Site Frequency Spectrum between full VCF and probe-covered SNPs.
+    
+    Uses easySFS to calculate multi-population joint SFS with proper
+    down-projection to handle missing data.
+    
+    Args:
+        snp_tsv_path: Path to selected SNPs TSV file
+        vcf_path: Path to original VCF file
+        output_prefix: Output file prefix
+        pop_file: Population assignment file (sample_id<tab>pop_id)
+        n_samples_per_pop: Number of samples to randomly select per population
+        specified_samples: Optional list of specific samples to use
+        projection: Projection string (e.g., "10,10,10"), auto-calculated if None
+        seed: Random seed for reproducibility
+        verbose: Enable verbose logging
+        
+    Returns:
+        Result containing SFS assessment statistics
+    """
+    import tempfile
+    import shutil
+    
+    logger.info("Starting SFS assessment using easySFS")
+    logger.info(f"SNP TSV: {snp_tsv_path}")
+    logger.info(f"VCF: {vcf_path}")
+    logger.info(f"Pop file: {pop_file}")
+    
+    # Check easySFS and bcftools
+    easysfs_check = check_easysfs_available()
+    if easysfs_check.is_err():
+        return Err(easysfs_check.unwrap_err())
+    
+    if shutil.which("bcftools") is None:
+        return Err("bcftools not found in PATH")
+    
+    # Validate input files exist
+    if not snp_tsv_path.exists():
+        return Err(f"SNP TSV file not found: {snp_tsv_path}")
+    if not vcf_path.exists():
+        return Err(f"VCF file not found: {vcf_path}")
+    if not pop_file.exists():
+        return Err(f"Population file not found: {pop_file}")
+    
+    # Create output directory
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load population file
+    pop_result = load_pop_file(pop_file)
+    if pop_result.is_err():
+        return Err(pop_result.unwrap_err())
+    
+    pop_dict = pop_result.unwrap()
+    pop_ids = sorted(pop_dict.keys())
+    
+    # Validate number of populations
+    if len(pop_ids) < 1:
+        return Err("At least one population is required")
+    if len(pop_ids) > 10:
+        logger.warning(f"Large number of populations ({len(pop_ids)}) may result in slow computation and poor visualization. "
+                       "Recommended: ≤3 populations.")
+    
+    logger.info(f"Populations: {pop_ids}")
+    logger.info(f"Samples per pop: {[len(pop_dict[p]) for p in pop_ids]}")
+    
+    # Subsample populations
+    subsample_result = subsample_populations(
+        pop_dict, n_samples_per_pop, specified_samples, seed
+    )
+    if subsample_result.is_err():
+        return Err(subsample_result.unwrap_err())
+    
+    subsampled_pops = subsample_result.unwrap()
+    logger.info(f"Subsampled to {n_samples_per_pop} samples per pop")
+    
+    # Load probe positions
+    snp_df_result = SNPDataFrame.from_tsv(snp_tsv_path)
+    if snp_df_result.is_err():
+        return Err(f"Failed to load SNP TSV: {snp_df_result.unwrap_err()}")
+    
+    snp_df = snp_df_result.unwrap()
+    probe_positions = set()
+    for _, row in snp_df.df.iterrows():
+        probe_positions.add((str(row['chr']), int(row['pos'])))
+    
+    logger.info(f"Loaded {len(probe_positions)} probe positions")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        
+        # Create subsampled pop file
+        sub_pop_file = tmpdir / "subsampled_pops.txt"
+        pop_file_result = create_subsampled_pop_file(subsampled_pops, sub_pop_file)
+        if pop_file_result.is_err():
+            return Err(pop_file_result.unwrap_err())
+        
+        # Determine projection values
+        if projection is None:
+            # Use 2 * n_samples_per_pop as default projection (diploid)
+            proj_val = 2 * n_samples_per_pop
+            projection = ",".join([str(proj_val)] * len(pop_ids))
+            logger.info(f"Auto projection: {projection}")
+        
+        # === Run easySFS on full VCF ===
+        logger.info("Running easySFS on full VCF...")
+        full_sfs_dir = tmpdir / "full_sfs"
+        
+        full_result = run_easysfs(
+            vcf_path, sub_pop_file, full_sfs_dir,
+            projection=projection, preview_only=False
+        )
+        
+        if full_result.is_err():
+            return Err(f"easySFS failed on full VCF: {full_result.unwrap_err()}")
+        
+        # Count sites in full VCF
+        n_sites_full = _count_vcf_sites(vcf_path)
+        
+        # === Create probe subset VCF ===
+        logger.info("Creating probe-subset VCF...")
+        probe_vcf = tmpdir / "probe_subset.vcf.gz"
+        subset_result = subset_vcf_by_positions(vcf_path, probe_positions, probe_vcf)
+        
+        if subset_result.is_err():
+            return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
+        
+        # === Run easySFS on probe VCF ===
+        logger.info("Running easySFS on probe-subset VCF...")
+        probe_sfs_dir = tmpdir / "probe_sfs"
+        
+        probe_result = run_easysfs(
+            probe_vcf, sub_pop_file, probe_sfs_dir,
+            projection=projection, preview_only=False
+        )
+        
+        if probe_result.is_err():
+            return Err(f"easySFS failed on probe VCF: {probe_result.unwrap_err()}")
+        
+        n_sites_probe = len(probe_positions)
+        
+        # === Generate comparison plots ===
+        logger.info("Generating SFS heatmaps...")
+        
+        # Full VCF heatmap
+        full_plot_path = Path(str(output_prefix) + ".sfs_full.png")
+        full_plot_result = generate_multipop_sfs_heatmap(
+            full_sfs_dir, pop_ids, full_plot_path,
+            title=f"Full VCF SFS (n={n_sites_full:,} sites)"
+        )
+        if full_plot_result.is_err():
+            logger.warning(f"Full SFS plot failed: {full_plot_result.unwrap_err()}")
+        
+        # Probe VCF heatmap
+        probe_plot_path = Path(str(output_prefix) + ".sfs_probe.png")
+        probe_plot_result = generate_multipop_sfs_heatmap(
+            probe_sfs_dir, pop_ids, probe_plot_path,
+            title=f"Probe Set SFS (n={n_sites_probe:,} sites)"
+        )
+        if probe_plot_result.is_err():
+            logger.warning(f"Probe SFS plot failed: {probe_plot_result.unwrap_err()}")
+        
+        # Calculate SFS correlation (using 1D SFS)
+        sfs_correlations = {}
+        for pop in pop_ids:
+            full_1d = parse_dadi_1d_sfs(full_sfs_dir, pop)
+            probe_1d = parse_dadi_1d_sfs(probe_sfs_dir, pop)
+            
+            if full_1d.is_ok() and probe_1d.is_ok():
+                f_sfs = full_1d.unwrap()
+                p_sfs = probe_1d.unwrap()
+                
+                # Normalize
+                f_sfs = f_sfs / np.sum(f_sfs) if np.sum(f_sfs) > 0 else f_sfs
+                p_sfs = p_sfs / np.sum(p_sfs) if np.sum(p_sfs) > 0 else p_sfs
+                
+                # Ensure same length
+                min_len = min(len(f_sfs), len(p_sfs))
+                f_sfs = f_sfs[:min_len]
+                p_sfs = p_sfs[:min_len]
+                
+                if not np.all(f_sfs == 0) and not np.all(p_sfs == 0):
+                    corr, _ = stats.pearsonr(f_sfs, p_sfs)
+                    sfs_correlations[pop] = corr
+        
+        avg_correlation = np.mean(list(sfs_correlations.values())) if sfs_correlations else np.nan
+        
+        # Copy dadi output files to output directory
+        dadi_output = Path(str(output_prefix) + "_dadi")
+        if (full_sfs_dir / "dadi").exists():
+            shutil.copytree(full_sfs_dir / "dadi", dadi_output / "full")
+        if (probe_sfs_dir / "dadi").exists():
+            shutil.copytree(probe_sfs_dir / "dadi", dadi_output / "probe")
+    
+    # Save summary
+    summary_path = Path(str(output_prefix) + ".sfs_summary.txt")
+    with open(summary_path, 'w') as f:
+        f.write("Site Frequency Spectrum Assessment Summary\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Full VCF: {vcf_path}\n")
+        f.write(f"Probe SNPs: {snp_tsv_path}\n")
+        f.write(f"Pop file: {pop_file}\n\n")
+        f.write(f"Populations: {', '.join(pop_ids)}\n")
+        f.write(f"Samples per pop: {n_samples_per_pop}\n")
+        f.write(f"Projection: {projection}\n\n")
+        f.write(f"Full VCF sites: {n_sites_full:,}\n")
+        f.write(f"Probe sites: {n_sites_probe:,}\n")
+        f.write(f"Probe coverage: {n_sites_probe / n_sites_full * 100:.2f}%\n\n")
+        f.write("SFS Correlations per Population:\n")
+        f.write("-" * 30 + "\n")
+        for pop, corr in sfs_correlations.items():
+            f.write(f"  {pop}: {corr:.4f}\n")
+        f.write(f"\nAverage correlation: {avg_correlation:.4f}\n\n")
+        f.write("Interpretation:\n")
+        f.write("-" * 30 + "\n")
+        if np.isnan(avg_correlation):
+            f.write("Unable to calculate correlation.\n")
+        elif avg_correlation > 0.95:
+            f.write("Excellent: SFS highly similar across populations.\n")
+        elif avg_correlation > 0.85:
+            f.write("Good: SFS similar, probe set captures most signal.\n")
+        elif avg_correlation > 0.7:
+            f.write("Moderate: Some deviation, consider more probes.\n")
+        else:
+            f.write("Low: SFS differs substantially.\n")
+    
+    logger.info(f"Saved summary to {summary_path}")
+    
+    stats_dict = {
+        "populations": pop_ids,
+        "n_samples_per_pop": n_samples_per_pop,
+        "projection": projection,
+        "n_sites_full": n_sites_full,
+        "n_sites_probe": n_sites_probe,
+        "coverage_percent": n_sites_probe / n_sites_full * 100,
+        "sfs_correlations": sfs_correlations,
+        "avg_correlation": float(avg_correlation) if not np.isnan(avg_correlation) else None,
+        "full_plot": str(full_plot_path) if full_plot_result.is_ok() else None,
+        "probe_plot": str(probe_plot_path) if probe_plot_result.is_ok() else None,
+        "dadi_output": str(dadi_output),
+        "summary_file": str(summary_path),
+    }
+    
+    return Ok(stats_dict)
+
+
+def _count_vcf_sites(vcf_path: Path) -> int:
+    """Count number of variant sites in VCF."""
+    import subprocess
+    import shutil
+    
+    if shutil.which("bcftools") is None:
+        return 0
+    
+    try:
+        result = subprocess.run(
+            ["bcftools", "view", "-H", str(vcf_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
+    except:
+        return 0
+
+
+def run_distance_assessment(
+    snp_tsv_path: Path,
+    vcf_path: Path,
+    output_prefix: Path,
+    max_sites: int = 100000,
+    verbose: bool = False,
+) -> Result[Dict[str, Any], str]:
+    """
+    Run IBS distance comparison between full VCF and probe-covered SNPs using PLINK.
+    
+    Compares pairwise genetic distances calculated from:
+    1. Full VCF (all SNPs)
+    2. Probe-covered SNPs only
+    
+    Uses PLINK's 1-IBS distance calculation for consistency with standard
+    population genetics workflows.
+    
+    Generates combined heatmap and scatter plot for comparison.
+    
+    Args:
+        snp_tsv_path: Path to selected SNPs TSV file
+        vcf_path: Path to original VCF file
+        output_prefix: Output file prefix
+        max_sites: Not used (kept for backwards compatibility)
+        verbose: Enable verbose logging
+        
+    Returns:
+        Result containing distance assessment statistics
+    """
+    import tempfile
+    import shutil
+    
+    logger.info("Starting IBS distance assessment using PLINK")
+    logger.info(f"SNP TSV: {snp_tsv_path}")
+    logger.info(f"VCF: {vcf_path}")
+    
+    # Check plink and bcftools
+    plink_check = check_plink_available()
+    if plink_check.is_err():
+        return Err(plink_check.unwrap_err())
+    
+    if shutil.which("bcftools") is None:
+        return Err("bcftools not found in PATH")
+    
+    # Validate input files
+    if not snp_tsv_path.exists():
+        return Err(f"SNP TSV file not found: {snp_tsv_path}")
+    if not vcf_path.exists():
+        return Err(f"VCF file not found: {vcf_path}")
+    
+    # Load selected SNP positions from TSV (only requires chr and pos columns)
+    try:
+        snp_df_pandas = pd.read_csv(snp_tsv_path, sep='\t')
+        if 'chr' not in snp_df_pandas.columns or 'pos' not in snp_df_pandas.columns:
+            return Err(f"SNP TSV must have 'chr' and 'pos' columns. Found: {list(snp_df_pandas.columns)}")
+        
+        probe_positions = set()
+        for _, row in snp_df_pandas.iterrows():
+            probe_positions.add((str(row['chr']), int(row['pos'])))
+    except Exception as e:
+        return Err(f"Failed to load SNP TSV: {e}")
+    
+    logger.info(f"Loaded {len(probe_positions)} probe positions")
+    
+    # Create output directory
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        
+        # === Calculate IBS distance for full VCF ===
+        logger.info("Calculating IBS distances for full VCF using PLINK...")
+        full_ibs_result = run_plink_ibs_distance(vcf_path, tmpdir / "full")
+        
+        if full_ibs_result.is_err():
+            return Err(f"Full VCF IBS failed: {full_ibs_result.unwrap_err()}")
+        
+        dist_full, samples_full = full_ibs_result.unwrap()
+        n_sites_full = _count_vcf_sites(vcf_path)
+        logger.info(f"Full VCF: {len(samples_full)} samples, ~{n_sites_full} sites")
+        
+        # === Create probe subset VCF ===
+        logger.info("Creating probe-subset VCF...")
+        probe_vcf = tmpdir / "probe_subset.vcf.gz"
+        subset_result = subset_vcf_by_positions(vcf_path, probe_positions, probe_vcf)
+        
+        if subset_result.is_err():
+            return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
+        
+        # === Calculate IBS distance for probe VCF ===
+        logger.info("Calculating IBS distances for probe set using PLINK...")
+        probe_ibs_result = run_plink_ibs_distance(probe_vcf, tmpdir / "probe")
+        
+        if probe_ibs_result.is_err():
+            return Err(f"Probe VCF IBS failed: {probe_ibs_result.unwrap_err()}")
+        
+        dist_probe, samples_probe = probe_ibs_result.unwrap()
+        n_sites_probe = len(probe_positions)
+        logger.info(f"Probe VCF: {len(samples_probe)} samples, {n_sites_probe} sites")
+    
+    # Verify samples match
+    if samples_full != samples_probe:
+        return Err("Sample mismatch between full and probe VCF parsing")
+    
+    # Calculate correlation statistics
+    logger.info("Calculating correlation statistics...")
+    corr_stats = calculate_distance_correlation(dist_full, dist_probe)
+    
+    logger.info(f"Pearson r: {corr_stats['pearson_r']:.4f}")
+    logger.info(f"Spearman ρ: {corr_stats['spearman_r']:.4f}")
+    logger.info(f"Manhattan distance: {corr_stats['manhattan_distance']:.4f}")
+    
+    # Generate plots
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Combined heatmap
+    heatmap_path = Path(str(output_prefix) + ".ibs_heatmap.png")
+    logger.info(f"Generating combined heatmap: {heatmap_path}")
+    heatmap_result = generate_combined_heatmap(
+        dist_full, dist_probe, samples_full, heatmap_path, corr_stats
+    )
+    if heatmap_result.is_err():
+        logger.warning(f"Failed to generate heatmap: {heatmap_result.unwrap_err()}")
+    
+    # Save distance matrices
+    dist_full_path = Path(str(output_prefix) + ".ibs_full.tsv")
+    dist_probe_path = Path(str(output_prefix) + ".ibs_probe.tsv")
+    
+    df_full = pd.DataFrame(dist_full, index=samples_full, columns=samples_full)
+    df_probe = pd.DataFrame(dist_probe, index=samples_probe, columns=samples_probe)
+    
+    df_full.to_csv(dist_full_path, sep='\t')
+    df_probe.to_csv(dist_probe_path, sep='\t')
+    logger.info(f"Saved distance matrices to {dist_full_path} and {dist_probe_path}")
+    
+    # Save summary statistics
+    summary_path = Path(str(output_prefix) + ".distance_summary.txt")
+    with open(summary_path, 'w') as f:
+        f.write("1-IBS Distance Assessment Summary (PLINK)\n")
+        f.write("=" * 50 + "\n\n")
+        f.write("Distance metric: 1-IBS (one minus Identity By State)\n")
+        f.write("  0 = identical genotypes, 1 = completely different\n\n")
+        f.write(f"Full VCF: {vcf_path}\n")
+        f.write(f"Probe SNPs: {snp_tsv_path}\n\n")
+        f.write(f"Samples: {len(samples_full)}\n")
+        f.write(f"Full VCF sites: {n_sites_full}\n")
+        f.write(f"Probe sites: {n_sites_probe}\n")
+        coverage_pct = (n_sites_probe / n_sites_full * 100) if n_sites_full > 0 else 0
+        f.write(f"Probe coverage: {coverage_pct:.2f}%\n\n")
+        f.write("Correlation Statistics (Full VCF vs Probe Set):\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Pearson r:         {corr_stats['pearson_r']:.6f}\n")
+        f.write(f"Pearson p-value:   {corr_stats['pearson_p']:.2e}\n")
+        f.write(f"Spearman ρ:        {corr_stats['spearman_r']:.6f}\n")
+        f.write(f"Spearman p-value:  {corr_stats['spearman_p']:.2e}\n")
+        f.write(f"Manhattan dist:    {corr_stats['manhattan_distance']:.6f}\n")
+        f.write(f"Sample pairs:      {corr_stats['n_pairs']}\n")
+    
+    logger.info(f"Saved summary to {summary_path}")
+    
+    stats = {
+        "n_samples": len(samples_full),
+        "n_sites_full": n_sites_full,
+        "n_sites_probe": n_sites_probe,
+        "coverage_percent": coverage_pct,
+        "correlation": corr_stats,
+        "heatmap_file": str(heatmap_path) if heatmap_result.is_ok() else None,
+        "dist_full_file": str(dist_full_path),
+        "dist_probe_file": str(dist_probe_path),
+        "summary_file": str(summary_path),
+    }
+    
+    return Ok(stats)
+
+
 def generate_assessment_plots(
     results: List[AssessmentResult],
     tags: List[str],
@@ -219,34 +2264,80 @@ def generate_assessment_plots(
     
     plot_paths = []
     
-    for tag in tags:
+    # Legacy color palette
+    colors = ['#83639F', '#EA7827', '#C22f2F', '#449945', '#1F70A9']
+    
+    for idx, tag in enumerate(tags):
         values = [getattr(r, tag) for r in results if getattr(r, tag) is not None]
         
         if not values:
             continue
         
-        fig, ax = plt.subplots(figsize=(8, 5))
+        # Auto bins based on tag type (legacy logic)
+        if tag.lower() == 'gc':
+            bins_interval = 2
+            xlim = (0, 100)
+        elif tag.lower() == 'tm':
+            bins_interval = 1
+            xlim = (0, 100)
+        elif tag.lower() == 'complexity':
+            bins_interval = 0.1
+            xlim = (0, 5)
+        elif tag.lower() == 'hairpin':
+            bins_interval = 2
+            xlim = (0, 100)
+        elif tag.lower() == 'dimer':
+            bins_interval = 0.01
+            xlim = (0, 1)
+        else:
+            bins_interval = 'auto'
+            xlim = None
         
-        # Histogram with KDE
-        sns.histplot(values, kde=True, ax=ax)
+        # Calculate number of bins
+        if bins_interval != 'auto' and xlim is not None:
+            n_bins = int((xlim[1] - xlim[0]) / bins_interval)
+        else:
+            n_bins = 'auto'
         
-        # Add statistics annotation
-        mean_val = np.mean(values)
-        std_val = np.std(values)
-        ax.axvline(mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.2f}')
+        # Get color for this tag
+        color = colors[idx % len(colors)]
         
-        ax.set_xlabel(AVAILABLE_TAGS.get(tag, tag))
-        ax.set_ylabel("Count")
-        ax.set_title(f"Distribution of {tag.upper()}")
-        ax.legend()
+        # Set seaborn style (legacy)
+        sns.set(style='darkgrid')
         
-        # Save plot
-        plot_path = Path(str(output_prefix) + f".{tag}_dist.png")
-        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        fig, ax = plt.subplots(figsize=(8, 6))
+        
+        # Use step histogram style (legacy default)
+        sns.histplot(values, alpha=0.7, stat='percent', edgecolor=color, 
+                    color=color, bins=n_bins, element='step',
+                    line_kws={'linewidth': 2}, ax=ax)
+        
+        # Set labels with Arial font (legacy style)
+        ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
+        ax.set_xlabel('Values', fontsize=20, fontname='Arial', labelpad=10)
+        ax.set_ylabel('Percent (%)', fontsize=18, fontname='Arial', labelpad=10)
+        
+        # Set axis limits
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        ax.set_ylim(0, 40)  # Legacy default for percent
+        
+        # Set tick font (legacy style)
+        ax.tick_params(axis='both', labelsize=18)
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontname('Arial')
+        
+        plt.tight_layout()
+        
+        # Save as jpg with 600 dpi (legacy style)
+        plot_path = Path(str(output_prefix) + f".{tag}_dist.jpg")
+        fig.savefig(plot_path, dpi=600)
         plt.close(fig)
         
         plot_paths.append(plot_path)
         logger.info(f"Saved plot: {plot_path}")
+    
+    return Ok(plot_paths)
     
     return Ok(plot_paths)
 
@@ -254,33 +2345,195 @@ def generate_assessment_plots(
 def run_assess(
     input_path: Path,
     output_prefix: Path,
+    mode: str = "tags",
+    vcf_path: Optional[Path] = None,
+    reference_path: Optional[Path] = None,
     tags: Optional[List[str]] = None,
     generate_plots: bool = True,
     sample_dimer: int = 1000,
+    max_vcf_sites: int = 100000,
+    pop_file: Optional[Path] = None,
+    n_samples_per_pop: int = 5,
+    specified_samples: Optional[List[str]] = None,
+    projection: Optional[str] = None,
+    seed: int = 42,
     threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Assess quality of probe set.
     
-    Main entry point for the assess command. Calculates biophysical
-    metrics and generates summary statistics and plots.
+    Main entry point for the assess command. Supports multiple assessment modes:
+    - tags: Calculate biophysical metrics and distributions
+    - distance: Compare IBS distances between full VCF and probe-covered SNPs (uses PLINK)
+    - pca: Compare Principal Component Analysis between full VCF and probe-covered SNPs (uses PLINK)
+    - sfs: Compare multi-population joint Site Frequency Spectrum using easySFS
+    - all: Run all assessments
     
     Args:
-        input_path: Input file (FASTA or TSV)
+        input_path: Input file (FASTA or TSV for tags, TSV for distance/pca/sfs)
         output_prefix: Output file prefix
-        tags: List of metrics to calculate (default: all)
+        mode: Assessment mode (tags, distance, pca, sfs, all)
+        vcf_path: Original VCF file (required for distance/pca/sfs mode)
+        reference_path: Reference FASTA (optional, for generating probe sequences)
+        tags: List of metrics to calculate (default: gc, tm, complexity, hairpin)
         generate_plots: Generate distribution plots
         sample_dimer: Number of pairs to sample for dimer calculation
+        max_vcf_sites: Maximum sites to load from full VCF
+        pop_file: Population assignment file for SFS/PCA mode (optional for PCA coloring)
+        n_samples_per_pop: Number of samples per population for SFS
+        specified_samples: Specific samples to use (overrides random subsampling)
+        projection: easySFS projection values (e.g., "10,10,10")
+        seed: Random seed for sample subsampling
         threads: Number of threads
         verbose: Enable verbose logging
         
     Returns:
         Result containing assessment statistics
     """
+    # Configure logging
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+        logger.addHandler(handler)
+    
     if verbose:
         logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
     
+    mode = mode.lower()
+    all_stats = {}
+    
+    # === DISTANCE MODE ===
+    if mode in ["distance", "all"]:
+        if vcf_path is None:
+            return Err("Distance mode requires --vcf parameter")
+        
+        logger.info("=" * 50)
+        logger.info("Running IBS Distance Assessment")
+        logger.info("=" * 50)
+        
+        dist_result = run_distance_assessment(
+            snp_tsv_path=input_path,
+            vcf_path=vcf_path,
+            output_prefix=output_prefix,
+            max_sites=max_vcf_sites,
+            verbose=verbose,
+        )
+        
+        if dist_result.is_err():
+            return Err(f"Distance assessment failed: {dist_result.unwrap_err()}")
+        
+        all_stats["distance"] = dist_result.unwrap()
+        logger.info("Distance assessment complete")
+    
+    # === SFS MODE ===
+    if mode in ["sfs", "all"]:
+        if vcf_path is None:
+            return Err("SFS mode requires --vcf parameter")
+        if pop_file is None:
+            return Err("SFS mode requires --pop_file parameter")
+        
+        logger.info("=" * 50)
+        logger.info("Running SFS Assessment (easySFS)")
+        logger.info("=" * 50)
+        
+        sfs_result = run_sfs_assessment(
+            snp_tsv_path=input_path,
+            vcf_path=vcf_path,
+            output_prefix=output_prefix,
+            pop_file=pop_file,
+            n_samples_per_pop=n_samples_per_pop,
+            specified_samples=specified_samples,
+            projection=projection,
+            seed=seed,
+            verbose=verbose,
+        )
+        
+        if sfs_result.is_err():
+            return Err(f"SFS assessment failed: {sfs_result.unwrap_err()}")
+        
+        all_stats["sfs"] = sfs_result.unwrap()
+        logger.info("SFS assessment complete")
+    
+    # === PCA MODE ===
+    if mode in ["pca", "all"]:
+        if vcf_path is None:
+            return Err("PCA mode requires --vcf parameter")
+        
+        logger.info("=" * 50)
+        logger.info("Running PCA Assessment (PLINK)")
+        logger.info("=" * 50)
+        
+        pca_result = run_pca_assessment(
+            snp_tsv_path=input_path,
+            vcf_path=vcf_path,
+            output_prefix=output_prefix,
+            pop_file=pop_file,
+            verbose=verbose,
+        )
+        
+        if pca_result.is_err():
+            return Err(f"PCA assessment failed: {pca_result.unwrap_err()}")
+        
+        all_stats["pca"] = pca_result.unwrap()
+        logger.info("PCA assessment complete")
+    
+    # === TAGS MODE ===
+    if mode in ["tags", "all"]:
+        logger.info("=" * 50)
+        logger.info("Running Biophysical Tags Assessment")
+        logger.info("=" * 50)
+        
+        tags_result = run_tags_assessment(
+            input_path=input_path,
+            output_prefix=output_prefix,
+            reference_path=reference_path,
+            tags=tags,
+            generate_plots=generate_plots,
+            sample_dimer=sample_dimer,
+            verbose=verbose,
+        )
+        
+        if tags_result.is_err():
+            return Err(f"Tags assessment failed: {tags_result.unwrap_err()}")
+        
+        all_stats["tags"] = tags_result.unwrap()
+        logger.info("Tags assessment complete")
+    
+    if not all_stats:
+        return Err(f"Unknown mode: {mode}. Use: tags, distance, sfs, all")
+    
+    return Ok(all_stats)
+
+
+def run_tags_assessment(
+    input_path: Path,
+    output_prefix: Path,
+    reference_path: Optional[Path] = None,
+    tags: Optional[List[str]] = None,
+    generate_plots: bool = True,
+    sample_dimer: int = 1000,
+    verbose: bool = False,
+) -> Result[Dict[str, Any], str]:
+    """
+    Run biophysical tags assessment.
+    
+    Calculates GC, Tm, complexity, hairpin, dimer scores for probes.
+    
+    Args:
+        input_path: Input file (FASTA or TSV)
+        output_prefix: Output file prefix
+        reference_path: Reference FASTA (for generating sequences from TSV)
+        tags: List of metrics to calculate
+        generate_plots: Generate distribution plots
+        sample_dimer: Number of pairs for dimer sampling
+        verbose: Enable verbose logging
+        
+    Returns:
+        Result containing assessment statistics
+    """
     # Default to all tags except dimer (expensive)
     if tags is None:
         tags = ["gc", "tm", "complexity", "hairpin"]
@@ -293,7 +2546,7 @@ def run_assess(
     if invalid_tags:
         return Err(f"Invalid tags: {invalid_tags}. Available: {list(AVAILABLE_TAGS.keys())}")
     
-    logger.info(f"Starting probe assessment from {input_path}")
+    logger.info(f"Starting tags assessment from {input_path}")
     logger.info(f"Tags: {tags}")
     
     # Load input
@@ -306,16 +2559,54 @@ def run_assess(
             return Err(f"Failed to read FASTA: {fasta_result.unwrap_err()}")
         sequences = fasta_result.unwrap()
     elif suffix == '.tsv':
-        # Load from TSV (assume SNP format)
-        snp_df = SNPDataFrame.from_tsv(input_path)
-        if snp_df.is_err():
-            return Err(f"Failed to read TSV: {snp_df.unwrap_err()}")
+        # Load from TSV - check if it has biophysical columns already
+        snp_df_result = SNPDataFrame.from_tsv(input_path)
+        if snp_df_result.is_err():
+            return Err(f"Failed to read TSV: {snp_df_result.unwrap_err()}")
         
-        snps = snp_df.unwrap().to_snps()
-        sequences = {
-            snp.snp_id: snp.left_flank + snp.ref + snp.right_flank
-            for snp in snps
-        }
+        snp_df = snp_df_result.unwrap()
+        df = snp_df.df
+        
+        # Check if biophysical columns already exist
+        biophysical_cols = ['gc', 'tm', 'complexity', 'hairpin', 'dimer']
+        existing_cols = [c for c in biophysical_cols if c in df.columns]
+        
+        if existing_cols:
+            # Use existing biophysical data from filter step
+            logger.info(f"Found existing biophysical columns: {existing_cols}")
+            return run_tags_from_dataframe(df, existing_cols, output_prefix, generate_plots)
+        else:
+            # Need to generate sequences - requires reference
+            if reference_path is None:
+                return Err("TSV without biophysical columns requires --reference to generate sequences")
+            
+            # Load reference and generate sequences
+            ref_result = read_fasta(reference_path)
+            if ref_result.is_err():
+                return Err(f"Failed to read reference: {ref_result.unwrap_err()}")
+            
+            reference = ref_result.unwrap()
+            
+            # Generate probe sequences from SNP positions
+            sequences = {}
+            flank_size = 40  # Default flank size
+            
+            for _, row in df.iterrows():
+                chrom = str(row['chr'])
+                pos = int(row['pos'])
+                
+                if chrom not in reference:
+                    continue
+                
+                ref_seq = reference[chrom]
+                start = max(0, pos - flank_size - 1)
+                end = min(len(ref_seq), pos + flank_size)
+                
+                probe_seq = ref_seq[start:end]
+                probe_id = f"{chrom}_{pos}"
+                sequences[probe_id] = probe_seq
+            
+            logger.info(f"Generated {len(sequences)} probe sequences from reference")
     else:
         return Err(f"Unsupported input format: {suffix}")
     
@@ -338,7 +2629,7 @@ def run_assess(
     summary = calculate_summary_statistics(results, tags)
     
     # Save detailed results to TSV
-    output_path = Path(str(output_prefix) + ".stats.tsv")
+    output_path = Path(str(output_prefix) + ".tags_stats.tsv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Convert results to DataFrame
@@ -354,10 +2645,10 @@ def run_assess(
     logger.info(f"Saved detailed stats to {output_path}")
     
     # Save summary
-    summary_path = Path(str(output_prefix) + ".summary.txt")
+    summary_path = Path(str(output_prefix) + ".tags_summary.txt")
     with open(summary_path, 'w') as f:
-        f.write("eProbe Assessment Summary\n")
-        f.write("=" * 40 + "\n\n")
+        f.write("eProbe Biophysical Tags Assessment Summary\n")
+        f.write("=" * 50 + "\n\n")
         f.write(f"Input: {input_path}\n")
         f.write(f"Total probes: {len(sequences)}\n\n")
         
@@ -387,6 +2678,160 @@ def run_assess(
         "plot_files": [str(p) for p in plot_paths],
     }
     
-    logger.info(f"Assessment complete for {len(sequences)} probes")
+    logger.info(f"Tags assessment complete for {len(sequences)} probes")
     
     return Ok(stats)
+
+
+def run_tags_from_dataframe(
+    df: pd.DataFrame,
+    tags: List[str],
+    output_prefix: Path,
+    generate_plots: bool = True,
+) -> Result[Dict[str, Any], str]:
+    """
+    Run tags assessment using existing biophysical columns in DataFrame.
+    
+    This is used when the TSV from filter step already has gc, tm, etc. columns.
+    
+    Args:
+        df: DataFrame with biophysical columns
+        tags: List of tags to analyze
+        output_prefix: Output prefix
+        generate_plots: Whether to generate plots
+        
+    Returns:
+        Result with assessment statistics
+    """
+    logger.info("Using existing biophysical data from DataFrame")
+    
+    summary = {}
+    for tag in tags:
+        if tag not in df.columns:
+            continue
+        
+        values = df[tag].dropna().values
+        if len(values) == 0:
+            continue
+        
+        summary[tag] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+            "median": float(np.median(values)),
+            "count": len(values),
+        }
+    
+    # Save summary
+    summary_path = Path(str(output_prefix) + ".tags_summary.txt")
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(summary_path, 'w') as f:
+        f.write("eProbe Biophysical Tags Assessment Summary\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Total SNPs: {len(df)}\n")
+        f.write(f"Tags analyzed: {tags}\n\n")
+        
+        for tag, stats in summary.items():
+            f.write(f"{AVAILABLE_TAGS.get(tag, tag)}:\n")
+            f.write(f"  Mean:   {stats['mean']:.3f}\n")
+            f.write(f"  Std:    {stats['std']:.3f}\n")
+            f.write(f"  Min:    {stats['min']:.3f}\n")
+            f.write(f"  Max:    {stats['max']:.3f}\n")
+            f.write(f"  Median: {stats['median']:.3f}\n\n")
+    
+    logger.info(f"Saved summary to {summary_path}")
+    
+    # Generate plots using legacy style
+    plot_paths = []
+    if generate_plots:
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
+            # Legacy color palette
+            colors = ['#83639F', '#EA7827', '#C22f2F', '#449945', '#1F70A9']
+            
+            for idx, tag in enumerate(tags):
+                if tag not in df.columns:
+                    continue
+                
+                values = df[tag].dropna()
+                if len(values) == 0:
+                    continue
+                
+                # Auto bins based on tag type (legacy logic)
+                if tag.lower() == 'gc':
+                    bins_interval = 2
+                    xlim = (0, 100)
+                elif tag.lower() == 'tm':
+                    bins_interval = 1
+                    xlim = (0, 100)
+                elif tag.lower() == 'complexity':
+                    bins_interval = 0.1
+                    xlim = (0, 5)
+                elif tag.lower() == 'hairpin':
+                    bins_interval = 2
+                    xlim = (0, 100)
+                elif tag.lower() == 'dimer':
+                    bins_interval = 0.01
+                    xlim = (0, 1)
+                else:
+                    bins_interval = 'auto'
+                    xlim = None
+                
+                # Calculate number of bins
+                if bins_interval != 'auto' and xlim is not None:
+                    n_bins = int((xlim[1] - xlim[0]) / bins_interval)
+                else:
+                    n_bins = 'auto'
+                
+                # Get color for this tag
+                color = colors[idx % len(colors)]
+                
+                # Set seaborn style (legacy)
+                sns.set(style='darkgrid')
+                
+                fig, ax = plt.subplots(figsize=(8, 6))
+                
+                # Use step histogram style (legacy default)
+                sns.histplot(values, alpha=0.7, stat='percent', edgecolor=color, 
+                            color=color, bins=n_bins, element='step',
+                            line_kws={'linewidth': 2}, ax=ax)
+                
+                # Set labels with Arial font (legacy style)
+                ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
+                ax.set_xlabel('Values', fontsize=20, fontname='Arial', labelpad=10)
+                ax.set_ylabel('Percent (%)', fontsize=18, fontname='Arial', labelpad=10)
+                
+                # Set axis limits
+                if xlim is not None:
+                    ax.set_xlim(xlim)
+                ax.set_ylim(0, 40)  # Legacy default for percent
+                
+                # Set tick font (legacy style)
+                ax.tick_params(axis='both', labelsize=18)
+                for label in ax.get_xticklabels() + ax.get_yticklabels():
+                    label.set_fontname('Arial')
+                
+                plt.tight_layout()
+                
+                # Save as jpg with 600 dpi (legacy style)
+                plot_path = Path(str(output_prefix) + f".{tag}_dist.jpg")
+                fig.savefig(plot_path, dpi=600)
+                plt.close(fig)
+                
+                plot_paths.append(str(plot_path))
+                logger.info(f"Saved plot: {plot_path}")
+                
+        except ImportError:
+            logger.warning("Plotting requires matplotlib and seaborn")
+    
+    return Ok({
+        "probe_count": len(df),
+        "tags": tags,
+        "summary": summary,
+        "summary_file": str(summary_path),
+        "plot_files": plot_paths,
+    })

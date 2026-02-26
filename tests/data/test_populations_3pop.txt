@@ -1,0 +1,10 @@
+Sample1	Pop_A
+Sample2	Pop_A
+Sample3	Pop_A
+Sample4	Pop_B
+Sample5	Pop_B
+Sample6	Pop_B
+Sample7	Pop_C
+Sample8	Pop_C
+Sample9	Pop_C
+Sample10	Pop_C

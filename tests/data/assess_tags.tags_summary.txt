@@ -1,0 +1,34 @@
+eProbe Biophysical Tags Assessment Summary
+==================================================
+
+Total SNPs: 15
+Tags analyzed: ['gc', 'tm', 'complexity', 'hairpin']
+
+GC content (%):
+  Mean:   0.495
+  Std:    0.073
+  Min:    0.380
+  Max:    0.630
+  Median: 0.490
+
+Melting temperature (°C):
+  Mean:   64.247
+  Std:    2.976
+  Min:    58.700
+  Max:    69.100
+  Median: 64.200
+
+DUST complexity score:
+  Mean:   0.799
+  Std:    0.071
+  Min:    0.680
+  Max:    0.920
+  Median: 0.790
+
+Self-complementarity score:
+  Mean:   9.867
+  Std:    3.171
+  Min:    4.500
+  Max:    15.300
+  Median: 9.600
+

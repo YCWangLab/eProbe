@@ -1,0 +1,19 @@
+IBS Distance Assessment Summary
+==================================================
+
+Full VCF: tests/data/test.vcf
+Probe SNPs: tests/data/selected_snps.tsv
+
+Samples: 10
+Full VCF sites: 20
+Probe sites: 8
+Probe coverage: 40.00%
+
+Correlation Statistics:
+------------------------------
+Pearson r:         0.690898
+Pearson p-value:   1.50e-07
+Spearman ρ:        0.701480
+Spearman p-value:  7.98e-08
+Manhattan dist:    0.082222
+Sample pairs:      45

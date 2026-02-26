@@ -1,128 +1,351 @@
 """
 Probe generation from BED regions.
 
-Extracts sequences from reference genome at BED-specified regions,
-then generates tiled probes. Supports haplotype inference via VCF.
+Entry points:
+  - Simple mode: extract sequences from reference at BED regions, tile probes
+  - Haplotype mode: use phased VCF to construct per-region haplotype sequences,
+    then generate haplotype-aware probes
 
-This module corresponds to part of the original Seq_generator.py functionality.
+The shared function ``process_regions()`` is also used by from_gff.
+
+Legacy equivalent: Get_probe_from_bed.py + Get_allele_from_vcf.py + Get_probe_from_allele.py (bed mode)
 """
 
 import logging
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from eprobe.core.result import Result, Ok, Err
-from eprobe.core.fasta import read_fasta, write_fasta, extract_sequence
+import pysam
+
+from eprobe.core.fasta import write_fasta
 from eprobe.core.models import Probe
-from eprobe.funcgen.from_fasta import tile_sequence, TilingConfig
+from eprobe.core.result import Err, Ok, Result
+from eprobe.funcgen.haplotype import (
+    HaplotypeSet,
+    extract_haplotypes,
+    generate_haplotype_probes,
+    phase_vcf_region,
+    tile_sequence,
+)
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# BED region data model
+# ---------------------------------------------------------------------------
+
 @dataclass
 class BedRegion:
-    """Representation of a BED region."""
+    """Representation of a BED region (0-based, half-open)."""
     chrom: str
-    start: int  # 0-based
-    end: int    # 0-based, exclusive
+    start: int    # 0-based
+    end: int      # 0-based exclusive
     name: Optional[str] = None
     score: Optional[float] = None
     strand: Optional[str] = None
-    
+
     @property
     def length(self) -> int:
         return self.end - self.start
 
 
+# ---------------------------------------------------------------------------
+# BED parsing
+# ---------------------------------------------------------------------------
+
 def parse_bed_file(bed_path: Path) -> Result[List[BedRegion], str]:
     """
     Parse BED file into list of BedRegion objects.
-    
+
+    Supports 3-6 column BED format. Skips comment lines and headers.
+
     Args:
         bed_path: Path to BED file
-        
+
     Returns:
-        Result containing list of BedRegion objects
+        Ok(list of BedRegion), Err(message) on failure
     """
-    regions = []
-    
+    regions: List[BedRegion] = []
+
     try:
         with open(bed_path) as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
-                
-                # Skip empty lines and headers
-                if not line or line.startswith('#') or line.startswith('track'):
+                if not line or line.startswith("#") or line.startswith("track"):
                     continue
-                
-                parts = line.split('\t')
-                
+
+                parts = line.split("\t")
                 if len(parts) < 3:
-                    logger.warning(f"Line {line_num}: insufficient columns, skipping")
+                    logger.warning(f"BED line {line_num}: insufficient columns, skipping")
                     continue
-                
+
                 try:
                     chrom = parts[0]
                     start = int(parts[1])
                     end = int(parts[2])
-                    
-                    name = parts[3] if len(parts) > 3 else f"region_{line_num}"
-                    score = float(parts[4]) if len(parts) > 4 and parts[4] != '.' else None
+                    name = parts[3] if len(parts) > 3 else f"{chrom}:{start}-{end}"
+                    score = float(parts[4]) if len(parts) > 4 and parts[4] != "." else None
                     strand = parts[5] if len(parts) > 5 else None
-                    
-                    region = BedRegion(
-                        chrom=chrom,
-                        start=start,
-                        end=end,
-                        name=name,
-                        score=score,
-                        strand=strand,
-                    )
-                    regions.append(region)
-                    
+
+                    regions.append(BedRegion(
+                        chrom=chrom, start=start, end=end,
+                        name=name, score=score, strand=strand,
+                    ))
                 except (ValueError, IndexError) as e:
-                    logger.warning(f"Line {line_num}: parse error ({e}), skipping")
-                    continue
-        
+                    logger.warning(f"BED line {line_num}: parse error ({e}), skipping")
+
         return Ok(regions)
-        
+
     except Exception as e:
         return Err(f"Failed to parse BED file: {e}")
 
 
-def extract_region_sequence(
-    region: BedRegion,
-    reference_sequences: Dict[str, str],
-) -> Result[str, str]:
-    """
-    Extract sequence for a BED region from reference.
-    
-    Args:
-        region: BED region
-        reference_sequences: Reference sequences by chromosome
-        
-    Returns:
-        Result containing extracted sequence
-    """
-    chrom_seq = reference_sequences.get(region.chrom)
-    
-    if chrom_seq is None:
-        return Err(f"Chromosome {region.chrom} not in reference")
-    
-    if region.start < 0 or region.end > len(chrom_seq):
-        return Err(f"Region {region.name} ({region.chrom}:{region.start}-{region.end}) "
-                   f"outside chromosome bounds (length: {len(chrom_seq)})")
-    
-    sequence = chrom_seq[region.start:region.end].upper()
-    
-    # Handle strand
-    if region.strand == '-':
-        from eprobe.core.fasta import reverse_complement
-        sequence = reverse_complement(sequence)
-    
-    return Ok(sequence)
+# ---------------------------------------------------------------------------
+# Core region processing (shared with from_gff)
+# ---------------------------------------------------------------------------
 
+def process_regions(
+    regions: List[BedRegion],
+    reference_path: Path,
+    output_prefix: Path,
+    probe_length: int,
+    step_size: int,
+    vcf_path: Optional[Path] = None,
+    phase: bool = False,
+    min_freq: float = 0.05,
+    variant_only: bool = False,
+    aligner: str = "muscle",
+    threads: int = 1,
+    verbose: bool = False,
+) -> Result[Dict[str, Any], str]:
+    """
+    Generate probes for a list of genomic regions.
+
+    This is the shared engine used by both from_bed and from_gff.
+
+    Simple mode (no VCF):
+      Extracts reference sequences at each BED region, tiles probes.
+
+    Haplotype mode (with VCF):
+      For each region:
+        1. Phase VCF if requested (shapeit5 per region)
+        2. Extract per-sample haplotype sequences from phased genotypes
+        3. Frequency-filter unique haplotypes
+        4. Generate haplotype-aware probes (1 probe at non-variant,
+           N probes at variant positions)
+
+    Args:
+        regions: List of BedRegion objects
+        reference_path: Reference genome FASTA (must have .fai index)
+        output_prefix: Output file prefix
+        probe_length: Probe length (bp)
+        step_size: Sliding window step (bp)
+        vcf_path: VCF for haplotype inference (optional)
+        phase: Run shapeit5 phasing before haplotype extraction
+        min_freq: Minimum haplotype frequency to retain
+        variant_only: Only generate probes at variant positions
+        aligner: MSA aligner for indel-containing haplotypes
+        threads: Number of threads (for parallel region processing)
+        verbose: Enable verbose logging
+
+    Returns:
+        Ok(stats dict) on success, Err(message) on failure
+    """
+    if not regions:
+        return Err("No regions to process")
+
+    all_probes: List[Probe] = []
+    n_regions_ok = 0
+    n_regions_err = 0
+    n_haplo_regions = 0  # regions with >1 haplotype
+
+    if vcf_path is not None:
+        # ======================= HAPLOTYPE MODE =======================
+        logger.info(f"Haplotype mode: VCF={vcf_path}, phase={phase}, min_freq={min_freq}")
+
+        temp_dir = Path(str(output_prefix) + "_eprobe_temp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            for region in regions:
+                rid = region.name or f"{region.chrom}:{region.start}-{region.end}"
+
+                # Step 1: Phase if requested
+                if phase:
+                    phase_result = phase_vcf_region(
+                        vcf_path, region.chrom, region.start, region.end,
+                        temp_dir, rid,
+                    )
+                    if phase_result.is_err():
+                        # No variants → use reference only
+                        logger.info(f"  {rid}: no variants, using reference")
+                        if not variant_only:
+                            ref_fasta = pysam.FastaFile(str(reference_path))
+                            ref_seq = ref_fasta.fetch(region.chrom, region.start, region.end)
+                            ref_fasta.close()
+                            probes = tile_sequence(
+                                rid, ref_seq, probe_length, step_size,
+                                source_chrom=region.chrom,
+                                source_offset=region.start,
+                            )
+                            all_probes.extend(probes)
+                            n_regions_ok += 1
+                        continue
+                    vcf_to_use = phase_result.unwrap()
+                else:
+                    vcf_to_use = vcf_path
+
+                # Step 2: Extract haplotypes
+                haplo_result = extract_haplotypes(
+                    phased_vcf_path=vcf_to_use,
+                    reference_fasta_path=reference_path,
+                    chrom=region.chrom,
+                    start=region.start,
+                    end=region.end,
+                    min_freq=min_freq,
+                    region_id=rid,
+                )
+
+                if haplo_result.is_err():
+                    logger.warning(f"  {rid}: haplotype extraction failed: {haplo_result.unwrap_err()}")
+                    n_regions_err += 1
+                    continue
+
+                haplo_set = haplo_result.unwrap()
+
+                if len(haplo_set.alleles) > 1:
+                    n_haplo_regions += 1
+                    logger.info(
+                        f"  {rid}: {len(haplo_set.alleles)} haplotypes, "
+                        f"{haplo_set.n_variants} variants "
+                        f"({', '.join(f'{k}={haplo_set.frequencies[k]:.2%}' for k in haplo_set.alleles)})"
+                    )
+                else:
+                    logger.debug(f"  {rid}: 1 haplotype (monomorphic)")
+
+                # Step 3: Generate haplotype-aware probes
+                probe_result = generate_haplotype_probes(
+                    region_id=rid,
+                    alleles=haplo_set.alleles,
+                    probe_length=probe_length,
+                    step_size=step_size,
+                    variant_only=variant_only,
+                    source_chrom=region.chrom,
+                    source_offset=region.start,
+                    aligner=aligner,
+                )
+
+                if probe_result.is_err():
+                    logger.warning(f"  {rid}: probe generation failed: {probe_result.unwrap_err()}")
+                    n_regions_err += 1
+                    continue
+
+                probes = probe_result.unwrap()
+                all_probes.extend(probes)
+                n_regions_ok += 1
+
+        finally:
+            # Cleanup temp directory
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                logger.debug(f"Cleaned up temp dir: {temp_dir}")
+
+    else:
+        # ======================= SIMPLE MODE ==========================
+        logger.info("Simple mode: extracting reference sequences")
+
+        ref_fasta = pysam.FastaFile(str(reference_path))
+
+        for region in regions:
+            rid = region.name or f"{region.chrom}:{region.start}-{region.end}"
+
+            try:
+                seq = ref_fasta.fetch(region.chrom, region.start, region.end)
+            except Exception as e:
+                logger.warning(f"  {rid}: failed to extract sequence: {e}")
+                n_regions_err += 1
+                continue
+
+            if not seq:
+                logger.warning(f"  {rid}: empty sequence")
+                n_regions_err += 1
+                continue
+
+            # Handle reverse strand
+            if region.strand == "-":
+                from eprobe.core.fasta import reverse_complement
+                seq = reverse_complement(seq)
+
+            probes = tile_sequence(
+                rid, seq, probe_length, step_size,
+                source_chrom=region.chrom,
+                source_offset=region.start,
+            )
+            all_probes.extend(probes)
+            n_regions_ok += 1
+
+        ref_fasta.close()
+
+    logger.info(
+        f"Processed {n_regions_ok} regions OK, {n_regions_err} errors, "
+        f"{n_haplo_regions} with multiple haplotypes"
+    )
+    logger.info(f"Generated {len(all_probes)} probes total")
+
+    if not all_probes:
+        return Err("No probes generated")
+
+    # --- Save FASTA output ---
+    fasta_output = Path(str(output_prefix) + ".probes.fa")
+    fasta_output.parent.mkdir(parents=True, exist_ok=True)
+
+    probe_seqs = {p.id: p.sequence for p in all_probes}
+    wr = write_fasta(probe_seqs, fasta_output)
+    if wr.is_err():
+        return Err(f"Failed to write FASTA: {wr.unwrap_err()}")
+
+    logger.info(f"Saved probes to {fasta_output}")
+
+    # --- Save TSV metadata ---
+    tsv_output = Path(str(output_prefix) + ".probes.tsv")
+    with open(tsv_output, "w") as f:
+        f.write("probe_id\tsequence\tchrom\tstart\tend\tregion\tlength\n")
+        for p in all_probes:
+            # Extract region name from probe ID (before _P or _H)
+            region_name = p.id.rsplit("_P", 1)[0]
+            # Strip allele suffix if present
+            for suffix in ("_H1", "_H2", "_H3", "_H4", "_H5"):
+                if region_name.endswith(suffix):
+                    region_name = region_name[: -len(suffix)]
+                    break
+            f.write(
+                f"{p.id}\t{p.sequence}\t{p.source_chrom}\t"
+                f"{p.source_start}\t{p.source_end}\t{region_name}\t"
+                f"{len(p.sequence)}\n"
+            )
+
+    stats = {
+        "region_count": n_regions_ok,
+        "region_errors": n_regions_err,
+        "haplo_regions": n_haplo_regions,
+        "probe_count": len(all_probes),
+        "probe_length": probe_length,
+        "step_size": step_size,
+        "haplotyping": vcf_path is not None,
+        "variant_only": variant_only,
+        "fasta_file": str(fasta_output),
+        "tsv_file": str(tsv_output),
+    }
+
+    return Ok(stats)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def run_from_bed(
     bed_path: Path,
@@ -133,126 +356,65 @@ def run_from_bed(
     vcf_path: Optional[Path] = None,
     phase: bool = False,
     min_freq: float = 0.05,
+    variant_only: bool = False,
+    aligner: str = "muscle",
     threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Generate probes from BED regions.
-    
-    Main entry point for the from_bed command. Extracts sequences
-    from reference at BED regions, then tiles probes.
-    
+
     Args:
         bed_path: Input BED file
-        reference_path: Reference genome FASTA
+        reference_path: Reference genome FASTA (must have .fai index)
         output_prefix: Output file prefix
-        probe_length: Probe length
-        step_size: Sliding window step
+        probe_length: Probe length (bp)
+        step_size: Sliding window step (bp)
         vcf_path: VCF for haplotype inference (optional)
-        phase: Enable haplotype phasing
-        min_freq: Minimum haplotype frequency
+        phase: Phase VCF with shapeit5 before haplotype extraction
+        min_freq: Minimum haplotype frequency to retain
+        variant_only: Only generate probes at variant positions
+        aligner: MSA aligner ('muscle', 'clustalo', 'mafft')
         threads: Number of threads
         verbose: Enable verbose logging
-        
+
     Returns:
-        Result containing generation statistics
+        Ok(stats dict) on success, Err(message) on failure
+
+    Output files:
+        {output_prefix}.probes.fa   - Probe sequences
+        {output_prefix}.probes.tsv  - Probe metadata
     """
     if verbose:
         logger.setLevel(logging.DEBUG)
-    
+
     logger.info(f"Starting probe generation from {bed_path}")
     logger.info(f"Reference: {reference_path}")
     logger.info(f"Probe length: {probe_length}, Step: {step_size}")
-    
+
     # Parse BED file
     bed_result = parse_bed_file(bed_path)
     if bed_result.is_err():
         return Err(bed_result.unwrap_err())
-    
+
     regions = bed_result.unwrap()
     logger.info(f"Loaded {len(regions)} regions from BED")
-    
+
     if not regions:
         return Err("No valid regions found in BED file")
-    
-    # Load reference genome
-    logger.info("Loading reference genome...")
-    ref_result = read_fasta(reference_path)
-    if ref_result.is_err():
-        return Err(f"Failed to read reference: {ref_result.unwrap_err()}")
-    
-    reference_sequences = ref_result.unwrap()
-    logger.info(f"Loaded {len(reference_sequences)} chromosomes")
-    
-    # Configure tiling
-    tiling_config = TilingConfig(
+
+    # Delegate to shared region processor
+    return process_regions(
+        regions=regions,
+        reference_path=reference_path,
+        output_prefix=output_prefix,
         probe_length=probe_length,
         step_size=step_size,
+        vcf_path=vcf_path,
+        phase=phase,
+        min_freq=min_freq,
+        variant_only=variant_only,
+        aligner=aligner,
+        threads=threads,
+        verbose=verbose,
     )
-    
-    # Extract sequences and generate probes
-    all_probes: List[Probe] = []
-    extraction_errors = 0
-    
-    for region in regions:
-        # Extract sequence
-        seq_result = extract_region_sequence(region, reference_sequences)
-        
-        if seq_result.is_err():
-            logger.warning(f"Failed to extract {region.name}: {seq_result.unwrap_err()}")
-            extraction_errors += 1
-            continue
-        
-        sequence = seq_result.unwrap()
-        
-        # Tile probes
-        probes = tile_sequence(region.name, sequence, tiling_config)
-        
-        # Update coordinates to genomic (for reference strand regions)
-        for probe in probes:
-            if region.strand != '-':
-                probe.start = region.start + probe.start
-                probe.end = region.start + probe.end
-            probe.chrom = region.chrom
-        
-        all_probes.extend(probes)
-    
-    logger.info(f"Generated {len(all_probes)} probes from {len(regions) - extraction_errors} regions")
-    
-    if extraction_errors > 0:
-        logger.warning(f"Failed to extract {extraction_errors} regions")
-    
-    # Handle haplotype phasing (placeholder for future implementation)
-    if phase and vcf_path:
-        logger.warning("Haplotype phasing not yet implemented for BED mode")
-    
-    # Save FASTA output
-    fasta_output = Path(str(output_prefix) + ".probes.fa")
-    fasta_output.parent.mkdir(parents=True, exist_ok=True)
-    
-    probe_sequences = {p.probe_id: p.sequence for p in all_probes}
-    write_result = write_fasta(probe_sequences, fasta_output)
-    if write_result.is_err():
-        return Err(f"Failed to save FASTA: {write_result.unwrap_err()}")
-    
-    logger.info(f"Saved probes to {fasta_output}")
-    
-    # Save TSV metadata
-    tsv_output = Path(str(output_prefix) + ".probes.tsv")
-    
-    with open(tsv_output, 'w') as f:
-        f.write("probe_id\tsequence\tchrom\tstart\tend\tregion\tlength\n")
-        for p in all_probes:
-            f.write(f"{p.probe_id}\t{p.sequence}\t{p.chrom}\t{p.start}\t{p.end}\t{p.snp_id}\t{len(p.sequence)}\n")
-    
-    stats = {
-        "region_count": len(regions) - extraction_errors,
-        "probe_count": len(all_probes),
-        "extraction_errors": extraction_errors,
-        "probe_length": probe_length,
-        "step_size": step_size,
-        "fasta_file": str(fasta_output),
-        "tsv_file": str(tsv_output),
-    }
-    
-    return Ok(stats)

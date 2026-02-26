@@ -1610,8 +1610,13 @@ def filter_cmd(
             echo_error(f"Failed to parse target names: {name_result.unwrap_err()}")
             raise SystemExit(1)
         name_taxids = name_result.unwrap()
-        echo_info(f"Target names → IDs: {dict(zip(name_list, name_taxids))}")
-        tx_ids = list(set((tx_ids or []) + name_taxids))
+        echo_info(f"Resolved target names → taxids: {name_taxids}")
+        if len(name_taxids) != len(name_list):
+            echo_warning(
+                f"Note: {len(name_list)} name(s) resolved to {len(name_taxids)} taxid(s). "
+                f"Use --tx_taxid with explicit IDs for precise control."
+            )
+        tx_ids = list(dict.fromkeys((tx_ids or []) + name_taxids))
 
     # Parse outgroup IDs
     parsed_outgroup_ids = None
@@ -1630,8 +1635,13 @@ def filter_cmd(
             echo_error(f"Failed to parse outgroup names: {og_result.unwrap_err()}")
             raise SystemExit(1)
         og_taxids = og_result.unwrap()
-        echo_info(f"Outgroup names → IDs: {dict(zip(og_list, og_taxids))}")
-        parsed_outgroup_ids = list(set((parsed_outgroup_ids or []) + og_taxids))
+        echo_info(f"Resolved outgroup names → taxids: {og_taxids}")
+        if len(og_taxids) != len(og_list):
+            echo_warning(
+                f"Note: {len(og_list)} outgroup name(s) resolved to {len(og_taxids)} taxid(s). "
+                f"Use --tx_outgroup_ids with explicit IDs for precise control."
+            )
+        parsed_outgroup_ids = list(dict.fromkeys((parsed_outgroup_ids or []) + og_taxids))
 
     step_list = list(steps)
     echo_info(f"Filtering {input}")

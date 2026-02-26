@@ -1,0 +1,14 @@
+Target Region Generation Summary
+========================================
+
+Probe FASTA: tests/util_test/set_a.fa
+Genome: tests/util_test/gene.fa
+Alignment mode: very-sensitive-local
+Merge distance: 0bp
+
+Input probes: 5
+Mapped probes: 2
+Mapping rate: 40.0%
+
+Target regions: 2
+Total target bp: 162

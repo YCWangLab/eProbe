@@ -1,0 +1,24 @@
+Site Frequency Spectrum Assessment Summary
+==================================================
+
+Full VCF: tests/data/test.vcf
+Probe SNPs: tests/data/selected_snps.tsv
+Pop file: tests/data/test_populations.txt
+
+Populations: Pop_A, Pop_B
+Samples per pop: 3
+Projection: 6,6
+
+Full VCF sites: 20
+Probe sites: 8
+Probe coverage: 40.00%
+
+SFS Correlations per Population:
+------------------------------
+  Pop_B: 0.9111
+
+Average correlation: 0.9111
+
+Interpretation:
+------------------------------
+Good: SFS similar, probe set captures most signal.

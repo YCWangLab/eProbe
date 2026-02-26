@@ -2,8 +2,6 @@ Metadata-Version: 2.4
 Name: eprobe
 Version: 1.0.0
 Summary: A one-stop capture probe design toolkit for genetic diversity reconstructions from ancient environmental DNA
-Home-page: https://github.com/YCWangLab/eProbe
-Author: Zi-Hao Huang
 Author-email: Zi-Hao Huang <zh384@cam.ac.uk>
 Maintainer-email: Zi-Hao Huang <zh384@cam.ac.uk>
 License: CC-BY-NC-4.0
@@ -26,27 +24,22 @@ Classifier: Topic :: Scientific/Engineering :: Bio-Informatics
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 License-File: LICENSE-CC-BY-NC-4.0.md
-Requires-Dist: biopython>=1.80
-Requires-Dist: pandas>=1.5.0
-Requires-Dist: numpy>=1.21.0
-Requires-Dist: pysam>=0.20.0
+Requires-Dist: biopython>=1.81
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: cyvcf2>=0.30.0
 Requires-Dist: pybedtools>=0.9.0
-Requires-Dist: click>=8.0.0
+Requires-Dist: click>=8.1.0
 Provides-Extra: plot
-Requires-Dist: matplotlib>=3.5.0; extra == "plot"
+Requires-Dist: matplotlib>=3.7.0; extra == "plot"
 Requires-Dist: seaborn>=0.12.0; extra == "plot"
-Requires-Dist: scipy>=1.9.0; extra == "plot"
+Requires-Dist: scipy>=1.10.0; extra == "plot"
 Requires-Dist: fastcluster>=1.2.0; extra == "plot"
 Provides-Extra: dev
-Requires-Dist: pytest>=7.0.0; extra == "dev"
-Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
-Requires-Dist: ruff>=0.1.0; extra == "dev"
-Requires-Dist: mypy>=1.0.0; extra == "dev"
-Requires-Dist: pandas-stubs; extra == "dev"
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
 Provides-Extra: all
 Requires-Dist: eprobe[dev,plot]; extra == "all"
-Dynamic: author
-Dynamic: home-page
 Dynamic: license-file
 
 <div style="text-align: center;">

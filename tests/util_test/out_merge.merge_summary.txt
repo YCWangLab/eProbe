@@ -1,0 +1,10 @@
+Merge Summary
+========================================
+
+Input files:
+  set_a.fa: 5 probes
+  set_b.fa: 4 probes
+
+Total input: 9
+Unique probes: 7
+Duplicates removed: 2

@@ -146,6 +146,13 @@ biophysics:
   tm:
     min: 55.0
     max: 75.0
+    # Nearest-neighbor thermodynamic table for Tm calculation
+    # DNA/DNA: DNA_NN1 (Breslauer 1986), DNA_NN2 (Sugimoto 1996),
+    #          DNA_NN3 (Allawi 1997), DNA_NN4 (SantaLucia 1998, default)
+    # RNA/DNA: R_DNA_NN1 for RNA probes hybridizing to DNA targets
+    nn_table: DNA_NN4
+    # Sodium concentration in mM
+    na_conc: 50.0
   complexity:
     max: 2.0
   hairpin:
@@ -196,14 +203,22 @@ output:
 @click.pass_context
 def init(ctx: click.Context) -> None:
     """
-    Generate configuration templates.
+    Generate config templates for the pipeline runner.
     
-    Create template configuration files to customize eProbe pipelines.
+    Creates YAML config files accepted by 'eprobe run pipeline'.
+    All input file paths and parameters are pre-filled with
+    defaults — just edit the paths for your project.
     
     \b
     Available templates:
-      config   - Pipeline configuration file
-      defaults - Default settings file
+      config   - Pipeline config (popgen or funcgen)
+      defaults - Global default settings
+    
+    \b
+    Workflow:
+      eprobe init config -o my_run.yaml --panel popgen
+      # ... edit paths & parameters ...
+      eprobe run pipeline -c my_run.yaml -o results/
     """
     pass
 
