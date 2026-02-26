@@ -24,10 +24,15 @@ class AliasedGroup(click.Group):
     Custom Click group that supports command aliases and underscore/hyphen interchangeability.
     
     Features:
+    - Preserves command registration order (instead of alphabetical)
     - Allows users to type shortened versions of commands as long as unambiguous
     - Treats underscores and hyphens as equivalent (from_fasta == from-fasta)
     """
-    
+
+    def list_commands(self, ctx: click.Context) -> list:
+        """Return commands in registration order."""
+        return list(self.commands)
+
     def get_command(self, ctx: click.Context, cmd_name: str) -> Optional[click.Command]:
         # Normalize: convert underscores to hyphens for lookup
         normalized_name = cmd_name.replace("_", "-")
@@ -78,15 +83,21 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
     reconstructions from ancient and environmental DNA samples.
     
     \b
-    Two main panels are available:
+    Probe design panels:
       popgen   - SNP-based probes for population genetics
       funcgen  - Sequence-based probes for functional genetics
+      barcode  - Kmer-based probes for taxonomic identification
+                 with haploid genome (Mito/Plastid/Sex Chr) (developing)
     
     \b
-    Utility tools:
-      util     - Data manipulation (tiling, merge, dedup, subset)
-      run      - One-click pipeline execution
-      init     - Initialize configuration templates
+    Post-design toolkit:
+      util     - Merge, tile, adapt, rename, assess, sample, target
+    
+    \b
+    Pipeline management:
+      init     - Generate config templates for pipeline runner
+      run      - Execute multi-step pipeline from config
+      info     - Show dependencies and external tool versions
     
     \b
     Quick start:
@@ -115,56 +126,98 @@ def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
         logging.basicConfig(level=logging.ERROR)
 
 
-# Import and register subcommand groups
+# Import and register subcommand groups (order defines help display order)
 from eprobe.cli.popgen import popgen
 from eprobe.cli.funcgen import funcgen
 from eprobe.cli.util import util
-from eprobe.cli.run import run
 from eprobe.cli.init import init
+from eprobe.cli.run import run
 
 cli.add_command(popgen)
 cli.add_command(funcgen)
 cli.add_command(util)
-cli.add_command(run)
 cli.add_command(init)
+cli.add_command(run)
 
 
 @cli.command()
 @click.pass_context
 def info(ctx: click.Context) -> None:
     """
-    Display version and environment information.
+    Show dependencies, external tools, and environment info.
     
-    Shows eProbe version, Python version, and installed dependencies.
+    Reports versions of Python libraries and external bioinformatics
+    tools required by various eProbe modules.
     """
     import sys
     import platform
+    import subprocess
+    import shutil
     
     click.echo(f"eProbe version: {__version__}")
-    click.echo(f"Python version: {sys.version}")
+    click.echo(f"Python: {sys.version.split()[0]}")
     click.echo(f"Platform: {platform.platform()}")
     
-    click.echo("\nInstalled dependencies:")
+    # --- Python libraries ---
+    click.echo("\nPython libraries:")
     
-    # Check key dependencies (map names to import names)
-    dependencies = {
-        "biopython": "Bio",
-        "pandas": "pandas",
-        "numpy": "numpy",
-        "pysam": "pysam",
-        "pybedtools": "pybedtools",
-        "click": "click",
-        "matplotlib": "matplotlib",
-        "seaborn": "seaborn",
-    }
+    libraries = [
+        ("biopython", "Bio"),
+        ("numpy", "numpy"),
+        ("pandas", "pandas"),
+        ("pysam", "pysam"),
+        ("pybedtools", "pybedtools"),
+        ("click", "click"),
+        ("matplotlib", "matplotlib"),
+        ("seaborn", "seaborn"),
+        ("scipy", "scipy"),
+        ("cyvcf2", "cyvcf2"),
+        ("pyyaml", "yaml"),
+    ]
     
-    for name, import_name in dependencies.items():
+    for name, import_name in libraries:
         try:
             module = __import__(import_name)
             version = getattr(module, "__version__", "unknown")
-            click.echo(f"  {name}: {version}")
+            click.echo(click.style(f"  ✓ {name}: {version}", fg="green"))
         except ImportError:
-            click.echo(f"  {name}: not installed")
+            click.echo(click.style(f"  ✗ {name}: not installed", fg="red"))
+    
+    # --- External tools ---
+    click.echo("\nExternal tools:")
+    
+    tools = [
+        ("bowtie2",     "bowtie2 --version",    0),
+        ("samtools",    "samtools --version",    0),
+        ("bedtools",    "bedtools --version",    0),
+        ("bcftools",    "bcftools --version",    0),
+        ("kraken2",     "kraken2 --version",     0),
+        ("cd-hit-est",  "cd-hit-est -h",         None),  # exits non-zero
+        ("plink",       "plink --version",       None),
+        ("shapeit5",    "phase_common --help",   None),
+        ("clustalo",    "clustalo --version",    0),
+    ]
+    
+    for name, cmd, expected_rc in tools:
+        exe = cmd.split()[0]
+        if shutil.which(exe) is None:
+            click.echo(click.style(f"  ✗ {name}: not found", fg="red"))
+            continue
+        try:
+            r = subprocess.run(
+                cmd.split(), capture_output=True, text=True, timeout=5,
+            )
+            # Extract version from first non-empty output line
+            output = (r.stdout or r.stderr).strip()
+            ver_line = ""
+            for line in output.splitlines():
+                line = line.strip()
+                if line:
+                    ver_line = line
+                    break
+            click.echo(click.style(f"  ✓ {name}: ", fg="green") + ver_line)
+        except Exception:
+            click.echo(click.style(f"  ? {name}: found but version unknown", fg="yellow"))
 
 
 if __name__ == "__main__":

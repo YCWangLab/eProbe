@@ -35,15 +35,16 @@ def popgen(ctx: click.Context) -> None:
       1. extract  - Extract SNPs from VCF
       2. filter   - Apply quality filters
       3. select   - Select optimal SNPs per window
-      4. build    - Generate probe sequences
-      5. assess   - Evaluate probe set quality
+      4. assess   - Evaluate selected SNPs quality
+      5. build    - Generate probe sequences
     
     \b
     Example workflow:
       eprobe popgen extract -v input.vcf.gz -r ref.fa -o project/step1
       eprobe popgen filter -i project/step1.snps.tsv -r ref.fa -o project/step2
-      eprobe popgen select -i project/step2.snps.tsv -r ref.fa -o project/step3
-      eprobe popgen build -i project/step3.snps.tsv -r ref.fa -o project/probes
+      eprobe popgen select -i project/step2.filtered.tsv -o project/step3
+      eprobe popgen assess -i project/step3.selected.tsv -o project/step4
+      eprobe popgen build -i project/step4.snps.tsv -r ref.fa -o project/probes
     """
     pass
 
@@ -344,6 +345,51 @@ def extract(
     help="Number of alignments to report per sequence (default: 100).",
 )
 @click.option(
+    "--tx_mode",
+    type=click.Choice(["lca", "besthit"]),
+    default="lca",
+    help="Taxonomic classification mode: 'lca' (ngsLCA, default) or 'besthit'.",
+)
+@click.option(
+    "--tx_outgroup_ids",
+    type=str,
+    help="Outgroup taxon ID(s) for best-hit mode (comma-separated). "
+         "If omitted, ALL non-target taxa are treated as outgroups.",
+)
+@click.option(
+    "--tx_outgroup_names",
+    type=str,
+    help="Outgroup taxon name(s) for best-hit mode (comma-separated).",
+)
+@click.option(
+    "--tx_exclude_mode",
+    type=click.Choice(["sim", "nm", "diff"]),
+    default="diff",
+    help="Best-hit exclusion strategy: "
+         "'sim' (reject if outgroup sim >= val), "
+         "'nm' (reject if outgroup NM <= val), "
+         "'diff' (reject if outgroup_NM - target_NM < val, default).",
+)
+@click.option(
+    "--tx_exclude_val",
+    type=float,
+    default=2,
+    help="Threshold for best-hit exclusion (default: 2). "
+         "For 'sim': percentage, 'nm': edit distance, 'diff': NM delta.",
+)
+@click.option(
+    "--tx_target_min_sim",
+    type=float,
+    default=90.0,
+    help="Min target similarity %% for best-hit acceptance (default: 90).",
+)
+@click.option(
+    "--tx_target_max_nm",
+    type=int,
+    default=5,
+    help="Max target NM for best-hit acceptance (default: 5).",
+)
+@click.option(
     "--gc",
     type=str,
     default="35,65",
@@ -372,6 +418,24 @@ def extract(
     type=float,
     default=50.0,
     help="Maximum dimer score (default: 50.0).",
+)
+@click.option(
+    "--nn-table",
+    type=click.Choice([
+        "DNA_NN1", "DNA_NN2", "DNA_NN3", "DNA_NN4", "R_DNA_NN1"
+    ]),
+    default="DNA_NN4",
+    help="Nearest-neighbor thermodynamic table for Tm calculation. "
+         "DNA_NN tables for DNA/DNA hybridization, R_DNA_NN1 for RNA/DNA. "
+         "Options: DNA_NN1 (Breslauer 1986), DNA_NN2 (Sugimoto 1996), "
+         "DNA_NN3 (Allawi 1997), DNA_NN4 (SantaLucia 1998, default). "
+         "R_DNA_NN1 for RNA probes hybridizing to DNA targets.",
+)
+@click.option(
+    "--na-conc",
+    type=float,
+    default=50.0,
+    help="Sodium ion concentration in mM for Tm calculation (default: 50.0).",
 )
 @click.option(
     "--no-biophysical",
@@ -405,11 +469,20 @@ def filter(
     tx_minedit: int,
     tx_maxedit: int,
     tx_keep_hits: int,
+    tx_mode: str,
+    tx_outgroup_ids: Optional[str],
+    tx_outgroup_names: Optional[str],
+    tx_exclude_mode: str,
+    tx_exclude_val: float,
+    tx_target_min_sim: float,
+    tx_target_max_nm: int,
     gc: str,
     tm: str,
     complexity: float,
     hairpin: float,
     dimer: float,
+    nn_table: str,
+    na_conc: float,
     no_biophysical: bool,
     keep_temp: bool,
 ) -> None:
@@ -466,6 +539,48 @@ def filter(
             tx_ids.extend(name_taxids)
             tx_ids = list(set(tx_ids))  # Remove duplicates
     
+    # Parse outgroup IDs for best-hit mode
+    parsed_outgroup_ids = None
+    if tx_outgroup_ids:
+        parsed_outgroup_ids = [int(t.strip()) for t in tx_outgroup_ids.split(",")]
+    
+    # Convert outgroup names → taxids for best-hit mode
+    if tx_outgroup_names:
+        if not tx_names:
+            echo_error("--tx_outgroup_names requires --tx_names (names.dmp file)")
+            raise SystemExit(1)
+        
+        from eprobe.popgen.filter import parse_taxonomy_names_to_taxids
+        outgroup_name_list = [n.strip() for n in tx_outgroup_names.split(",")]
+        og_result = parse_taxonomy_names_to_taxids(tx_names, outgroup_name_list)
+        if og_result.is_err():
+            echo_error(f"Failed to parse outgroup names: {og_result.unwrap_err()}")
+            raise SystemExit(1)
+        
+        og_taxids = og_result.unwrap()
+        echo_info(f"Converted outgroup names to IDs: {dict(zip(outgroup_name_list, og_taxids))}")
+        
+        if parsed_outgroup_ids is None:
+            parsed_outgroup_ids = og_taxids
+        else:
+            parsed_outgroup_ids.extend(og_taxids)
+            parsed_outgroup_ids = list(set(parsed_outgroup_ids))
+    
+    # Validate best-hit mode requirements
+    if tx_mode == "besthit" and tx_db:
+        if not tx_acc2tax:
+            echo_error("Best-hit mode requires --tx_acc2tax (accession→taxid mapping)")
+            raise SystemExit(1)
+        if not tx_names:
+            echo_error("Best-hit mode requires --tx_names (names.dmp)")
+            raise SystemExit(1)
+        if not tx_nodes:
+            echo_error("Best-hit mode requires --tx_nodes (nodes.dmp)")
+            raise SystemExit(1)
+        if tx_ids is None:
+            echo_error("Best-hit mode requires --tx_taxid or --tx_target_names to identify target taxa")
+            raise SystemExit(1)
+    
     # Determine which filters to apply
     filters = []
     if bg_db:
@@ -501,11 +616,19 @@ def filter(
         tx_min_edit=tx_minedit,
         tx_max_edit=tx_maxedit,
         tx_keep_hits=tx_keep_hits,
+        tx_mode=tx_mode,
+        tx_outgroup_ids=parsed_outgroup_ids,
+        tx_exclude_mode=tx_exclude_mode,
+        tx_exclude_val=tx_exclude_val,
+        tx_target_min_sim=tx_target_min_sim,
+        tx_target_max_nm=tx_target_max_nm,
         gc_range=(gc_min, gc_max),
         tm_range=(tm_min, tm_max),
         max_complexity=complexity,
         max_hairpin=hairpin,
         max_dimer=dimer,
+        nn_table=nn_table,
+        na_conc=na_conc,
         verbose=verbose,
         keep_temp=keep_temp,
     )
@@ -582,49 +705,38 @@ def filter(
     help="Input filtered SNPs TSV file.",
 )
 @click.option(
-    "-r", "--reference",
-    required=True,
-    type=click.Path(exists=True, path_type=Path),
-    help="Reference genome FASTA file.",
-)
-@click.option(
     "-o", "--output",
     required=True,
     type=click.Path(path_type=Path),
     help="Output prefix.",
 )
 @click.option(
-    "-t", "--threads",
-    default=1,
-    type=int,
-    help="Number of threads (default: 1).",
-)
-@click.option(
     "--window_size",
     default=10000,
     type=int,
-    help="Window size for SNP selection (default: 10000).",
+    help="Window size for SNP selection in bp (default: 10000).",
 )
 @click.option(
     "--strategy",
-    type=click.Choice(["random", "weighted", "priority"]),
+    type=click.Choice(["random", "uniform", "weighted", "priority"]),
     default="random",
-    help="Selection strategy within windows (default: random).",
+    help="Selection strategy: random (default), uniform (even distribution), "
+         "weighted (biophysical score), priority (BED regions first).",
 )
 @click.option(
     "--weights",
     type=str,
-    help="Weights for biophysical features (gc,tm,complexity,hairpin,dimer).",
+    help="Weights for biophysical features: gc,tm,complexity,hairpin,dimer (default: 1,1,1,1,1).",
 )
 @click.option(
     "--priority_bed",
     type=click.Path(exists=True, path_type=Path),
-    help="BED file of priority regions (e.g., exons).",
+    help="BED file of priority regions (e.g., exons). Required for 'priority' strategy.",
 )
 @click.option(
     "--target_count",
     type=int,
-    help="Target number of SNPs (random subsample if exceeded).",
+    help="Target number of SNPs to select. If not specified, keeps all SNPs.",
 )
 @click.option(
     "--seed",
@@ -632,36 +744,41 @@ def filter(
     type=int,
     help="Random seed for reproducibility (default: 42).",
 )
+@click.option(
+    "--keep_biophysical",
+    is_flag=True,
+    default=False,
+    help="Keep biophysical columns (gc, tm, complexity, hairpin, dimer) in output. Default: False.",
+)
 @click.pass_context
 def select(
     ctx: click.Context,
     input: Path,
-    reference: Path,
     output: Path,
-    threads: int,
     window_size: int,
     strategy: str,
     weights: Optional[str],
     priority_bed: Optional[Path],
     target_count: Optional[int],
     seed: int,
+    keep_biophysical: bool,
 ) -> None:
     """
     Select optimal SNPs using window-based sampling.
     
     Ensures even distribution of probes across the genome by selecting
-    one SNP per non-overlapping window.
+    SNPs with specified strategy.
     
     \b
     Selection strategies:
-      random   - Random selection within each window
+      random   - Random selection (default)
+      uniform  - Uniform distribution across windows
       weighted - Select SNP with best biophysical score (use --weights)
       priority - Prioritize SNPs in BED regions (use --priority_bed)
     
     \b
     Output files:
-      {output}.snps.tsv     - Selected SNPs
-      {output}.select.log   - Selection statistics
+      {output}.selected.tsv  - Selected SNPs
     """
     from eprobe.popgen.select import run_select
     
@@ -671,21 +788,25 @@ def select(
     weight_values = None
     if weights:
         weight_values = list(map(float, weights.split(",")))
+        if len(weight_values) != 5:
+            echo_error("Weights must have 5 values: gc,tm,complexity,hairpin,dimer")
+            raise SystemExit(1)
     
     echo_info(f"Selecting SNPs from {input}")
     echo_info(f"Window size: {window_size}bp, Strategy: {strategy}")
+    if target_count:
+        echo_info(f"Target count: {target_count}")
     
     result = run_select(
         input_path=input,
-        reference_path=reference,
         output_prefix=output,
-        threads=threads,
         window_size=window_size,
         strategy=strategy,
         weights=weight_values,
         priority_bed=priority_bed,
         target_count=target_count,
         seed=seed,
+        keep_biophysical=keep_biophysical,
         verbose=verbose,
     )
     
@@ -694,7 +815,12 @@ def select(
         raise SystemExit(1)
     
     stats = result.unwrap()
-    echo_success(f"Selected {stats['selected']} SNPs from {stats['windows']} windows")
+    echo_success(f"\n→ Selection Summary:")
+    echo_info(f"    ├─ Input: {stats['initial_count']} SNPs")
+    echo_info(f"    ├─ Selected: {stats['selected']} SNPs")
+    echo_info(f"    ├─ Windows covered: {stats['windows']}")
+    echo_info(f"    ├─ Strategy: {stats['strategy']}")
+    echo_info(f"    └─ Output: {stats['output_file']}")
 
 
 @popgen.command()
@@ -724,15 +850,21 @@ def select(
 )
 @click.option(
     "-s", "--snp_position",
-    type=click.Choice(["center", "left", "right"]),
+    type=click.Choice(["center", "left", "right", "tiling"]),
     default="center",
-    help="SNP position within probe (default: center).",
+    help="SNP position within probe (default: center). 'tiling' generates 3 probes per SNP.",
 )
 @click.option(
     "--offset",
     default=0,
     type=int,
     help="Position offset from center (-/+ for left/right shift).",
+)
+@click.option(
+    "--tiling_offset",
+    default=15,
+    type=int,
+    help="Shift for tiling left/right probes (default: 15bp). Only used with -s tiling.",
 )
 @click.option(
     "--replace_snp/--no_replace_snp",
@@ -754,6 +886,7 @@ def build(
     length: int,
     snp_position: str,
     offset: int,
+    tiling_offset: int,
     replace_snp: bool,
     mutation_type: str,
 ) -> None:
@@ -764,9 +897,10 @@ def build(
     
     \b
     SNP position options:
-      center - SNP at probe center (recommended for hybridization)
-      left   - SNP shifted toward 5' end
-      right  - SNP shifted toward 3' end
+      center  - SNP at probe center (recommended for hybridization)
+      left    - SNP shifted toward 5' end
+      right   - SNP shifted toward 3' end
+      tiling  - 3 probes per SNP: center + left-shifted + right-shifted
     
     \b
     Replace SNP option:
@@ -775,9 +909,8 @@ def build(
     
     \b
     Output files:
-      {output}.probes.fa    - Probe sequences in FASTA format
-      {output}.probes.tsv   - Probe metadata
-      {output}.build.log    - Build statistics
+      {output}.probes.fa          - Probe sequences in FASTA format
+      {output}.build_summary.txt  - Build statistics
     """
     from eprobe.popgen.build import run_build
     
@@ -785,6 +918,12 @@ def build(
     
     echo_info(f"Building probes from {input}")
     echo_info(f"Length: {length}bp, SNP position: {snp_position}")
+    if snp_position == "tiling":
+        echo_info(f"Tiling mode: 3 probes/SNP, offset=±{tiling_offset}bp")
+    if replace_snp:
+        echo_info("Replace SNP: ON (third-base replacement)")
+    if mutation_type != "both":
+        echo_info(f"Mutation type filter: {mutation_type}")
     
     result = run_build(
         input_path=input,
@@ -795,6 +934,7 @@ def build(
         offset=offset,
         replace_snp=replace_snp,
         mutation_type=mutation_type if mutation_type != "both" else None,
+        tiling_offset=tiling_offset,
         verbose=verbose,
     )
     
@@ -803,8 +943,9 @@ def build(
         raise SystemExit(1)
     
     stats = result.unwrap()
-    echo_success(f"Generated {stats['probe_count']} probes")
-    echo_info(f"Output: {output}.probes.fa")
+    echo_success(f"Generated {stats['probe_count']} probes from {stats['snp_count']} SNPs")
+    echo_info(f"  Transitions: {stats['ts_count']}, Transversions: {stats['tv_count']}")
+    echo_info(f"Output: {stats['fasta_file']}")
 
 
 @popgen.command()
@@ -822,7 +963,7 @@ def build(
 @click.option(
     "-v", "--vcf",
     type=click.Path(exists=True, path_type=Path),
-    help="Original VCF file (required for --mode distance/missing).",
+    help="Original VCF file (required for --mode distance/sfs).",
 )
 @click.option(
     "-o", "--output",
@@ -832,7 +973,7 @@ def build(
 )
 @click.option(
     "--mode",
-    type=click.Choice(["tags", "distance", "missing", "all"]),
+    type=click.Choice(["tags", "distance", "pca", "sfs", "all"]),
     default="tags",
     help="Assessment mode (default: tags).",
 )
@@ -847,6 +988,41 @@ def build(
     default=True,
     help="Generate distribution plots (default: yes).",
 )
+@click.option(
+    "--max_vcf_sites",
+    default=100000,
+    type=int,
+    help="Maximum sites to load from VCF for distance mode (default: 100000).",
+)
+@click.option(
+    "--pop_file",
+    type=click.Path(exists=True, path_type=Path),
+    help="Population file for SFS mode (sample_id<tab>pop_id). Required for --mode sfs.",
+)
+@click.option(
+    "--n_samples_per_pop",
+    default=5,
+    type=int,
+    help="Number of samples per population for SFS (default: 5).",
+)
+@click.option(
+    "--samples",
+    type=str,
+    default=None,
+    help="Specific samples to use (comma-separated). Overrides random subsampling.",
+)
+@click.option(
+    "--projection",
+    type=str,
+    default=None,
+    help="easySFS projection values (e.g., '10,10,10'). Auto-calculated if not specified.",
+)
+@click.option(
+    "--seed",
+    default=42,
+    type=int,
+    help="Random seed for sample subsampling (default: 42).",
+)
 @click.pass_context
 def assess(
     ctx: click.Context,
@@ -857,48 +1033,106 @@ def assess(
     mode: str,
     tags: str,
     plot: bool,
+    max_vcf_sites: int,
+    pop_file: Optional[Path],
+    n_samples_per_pop: int,
+    samples: Optional[str],
+    projection: Optional[str],
+    seed: int,
 ) -> None:
     """
     Assess quality of probe set.
     
     \b
     Assessment modes:
-      tags     - Plot biophysical property distributions
-      distance - Compare IBS distance matrices (probe vs genome-wide)
-      missing  - Simulate missing data tolerance
+      tags     - Plot biophysical property distributions (uses existing
+                 columns from filter step, or calculates with --reference)
+      distance - Compare 1-IBS distance matrices (probe vs full VCF)
+                 Uses PLINK: 1-IBS = 1 - Identity By State (0=identical, 1=different)
+                 Outputs: combined heatmap (lower triangle = probe, upper triangle = full)
+                 Calculates: Pearson r, Spearman rho, Manhattan distance
+      pca      - Compare Principal Component Analysis (probe vs full VCF)
+                 Uses PLINK to compute PCA on both datasets
+                 Supports population-based coloring with --pop_file
+                 Calculates Procrustes similarity between PCAs
+      sfs      - Compare multi-population joint Site Frequency Spectrum
+                 using easySFS. Requires --pop_file with population assignments.
+                 Generates heatmap plots for full VCF and probe set.
+                 NOTE: Recommended for ≤3 populations for better visualization.
       all      - Run all assessments
     
     \b
     Output files (depends on mode):
-      {output}.tags.png         - Biophysical distributions
-      {output}.distance.png     - Distance matrix heatmaps
-      {output}.missing.png      - Missing rate PCA plots
-      {output}.assess.log       - Assessment statistics
+      --mode tags:
+        {output}.tags_summary.txt   - Biophysical statistics
+        {output}.*_dist.jpg         - Distribution plots
+      --mode distance:
+        {output}.ibs_heatmap.png    - Combined heatmap
+        {output}.ibs_full.tsv       - Full VCF 1-IBS matrix
+        {output}.ibs_probe.tsv      - Probe set 1-IBS matrix
+        {output}.distance_summary.txt - Correlation statistics
+      --mode pca:
+        {output}.pca_PC1_PC2.png    - Side-by-side PCA comparison (PC1 vs PC2)
+        {output}.pca_full.tsv       - Full VCF eigenvectors
+        {output}.pca_probe.tsv      - Probe set eigenvectors
+        {output}.pca_summary.txt    - Variance explained and Procrustes similarity
+      --mode sfs:
+        {output}.sfs_full.png       - Full VCF multi-pop SFS heatmap
+        {output}.sfs_probe.png      - Probe set multi-pop SFS heatmap
+        {output}.sfs_summary.txt    - SFS correlations per population
+        {output}_dadi/              - dadi-format SFS files
+    
+    \b
+    SFS mode requires:
+      --pop_file: Population assignment file (sample_id<tab>pop_id)
+      --vcf: Original VCF file
+      External tools: easySFS (set EASYSFS_PATH env var), bcftools
+    
+    \b
+    PCA mode uses:
+      --pop_file: (Optional) Population assignment for coloring
+      --vcf: Original VCF file
+      External tools: plink, bcftools
     """
     from eprobe.popgen.assess import run_assess
     
     verbose = ctx.obj.get("verbose", False)
     
     # Validate required inputs for each mode
-    if mode in ["tags", "all"] and reference is None:
-        echo_error("--reference is required for tags assessment")
+    if mode in ["distance", "pca", "all"] and vcf is None:
+        echo_error("--vcf is required for distance/pca assessment")
         raise SystemExit(1)
     
-    if mode in ["distance", "missing", "all"] and vcf is None:
-        echo_error("--vcf is required for distance/missing assessment")
-        raise SystemExit(1)
+    if mode in ["sfs", "all"]:
+        if vcf is None:
+            echo_error("--vcf is required for SFS assessment")
+            raise SystemExit(1)
+        if pop_file is None:
+            echo_error("--pop_file is required for SFS assessment")
+            raise SystemExit(1)
     
     echo_info(f"Assessing probe set: {input}")
     echo_info(f"Mode: {mode}")
     
+    # Parse specified samples
+    specified_samples = None
+    if samples is not None:
+        specified_samples = [s.strip() for s in samples.split(",")]
+    
     result = run_assess(
         input_path=input,
-        reference_path=reference,
-        vcf_path=vcf,
         output_prefix=output,
         mode=mode,
+        vcf_path=vcf,
+        reference_path=reference,
         tags=tags.split(","),
         generate_plots=plot,
+        max_vcf_sites=max_vcf_sites,
+        pop_file=pop_file,
+        n_samples_per_pop=n_samples_per_pop,
+        specified_samples=specified_samples,
+        projection=projection,
+        seed=seed,
         verbose=verbose,
     )
     
@@ -909,5 +1143,70 @@ def assess(
     stats = result.unwrap()
     echo_success("Assessment complete")
     
+    # Print summary based on mode
+    if "distance" in stats:
+        dist_stats = stats["distance"]
+        corr = dist_stats.get("correlation", {})
+        echo_info(f"\n→ 1-IBS Distance Comparison:")
+        echo_info(f"    ├─ Samples: {dist_stats.get('n_samples', 'N/A')}")
+        echo_info(f"    ├─ Full VCF sites: {dist_stats.get('n_sites_full', 'N/A')}")
+        echo_info(f"    ├─ Probe sites: {dist_stats.get('n_sites_probe', 'N/A')}")
+        echo_info(f"    ├─ Pearson r: {corr.get('pearson_r', 'N/A'):.4f}")
+        echo_info(f"    ├─ Spearman rho: {corr.get('spearman_r', 'N/A'):.4f}")
+        echo_info(f"    └─ Manhattan: {corr.get('manhattan_distance', 'N/A'):.4f}")
+    
+    if "sfs" in stats:
+        sfs_stats = stats["sfs"]
+        echo_info(f"\n→ Site Frequency Spectrum (easySFS):")
+        echo_info(f"    ├─ Populations: {', '.join(sfs_stats.get('populations', []))}")
+        echo_info(f"    ├─ Samples per pop: {sfs_stats.get('n_samples_per_pop', 'N/A')}")
+        echo_info(f"    ├─ Full VCF sites: {sfs_stats.get('n_sites_full', 'N/A'):,}")
+        echo_info(f"    ├─ Probe sites: {sfs_stats.get('n_sites_probe', 'N/A'):,}")
+        
+        # Per-population correlations
+        corrs = sfs_stats.get("sfs_correlations", {})
+        if corrs:
+            echo_info(f"    ├─ SFS correlations:")
+            for pop, corr in corrs.items():
+                echo_info(f"    │     {pop}: {corr:.4f}")
+        
+        avg_corr = sfs_stats.get("avg_correlation")
+        if avg_corr is not None:
+            echo_info(f"    └─ Average correlation: {avg_corr:.4f}")
+        else:
+            echo_info(f"    └─ Average correlation: N/A")
+    
+    if "pca" in stats:
+        pca_stats = stats["pca"]
+        echo_info(f"\n→ Principal Component Analysis (PLINK):")
+        echo_info(f"    ├─ Samples: {pca_stats.get('n_samples', 'N/A')}")
+        echo_info(f"    ├─ Probe positions: {pca_stats.get('n_probe_positions', 'N/A')}")
+        
+        # Variance explained for PC1-3
+        var_full = pca_stats.get("variance_full", {})
+        var_probe = pca_stats.get("variance_probe", {})
+        if var_full and var_probe:
+            echo_info(f"    ├─ Variance explained (PC1/PC2/PC3):")
+            pc1_f = var_full.get("PC1", 0)
+            pc2_f = var_full.get("PC2", 0)
+            pc3_f = var_full.get("PC3", 0)
+            pc1_p = var_probe.get("PC1", 0)
+            pc2_p = var_probe.get("PC2", 0)
+            pc3_p = var_probe.get("PC3", 0)
+            echo_info(f"    │     Full VCF:  {pc1_f:.1f}% / {pc2_f:.1f}% / {pc3_f:.1f}%")
+            echo_info(f"    │     Probe Set: {pc1_p:.1f}% / {pc2_p:.1f}% / {pc3_p:.1f}%")
+        
+        procrustes = pca_stats.get("procrustes_similarity")
+        if procrustes is not None:
+            echo_info(f"    └─ Procrustes similarity: {procrustes:.4f}")
+        else:
+            echo_info(f"    └─ Procrustes similarity: N/A")
+    
+    if "tags" in stats:
+        tag_stats = stats["tags"]
+        echo_info(f"\n→ Biophysical Tags:")
+        echo_info(f"    ├─ Probes analyzed: {tag_stats.get('probe_count', 'N/A')}")
+        echo_info(f"    └─ Summary: {tag_stats.get('summary_file', 'N/A')}")
+    
     if plot:
-        echo_info(f"Plots saved to {output}.*")
+        echo_info(f"\nPlots saved to {output}.*")

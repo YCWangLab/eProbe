@@ -29,13 +29,15 @@ from eprobe.utils.bam_utils import (
     merge_and_namesort_bams,
     get_compressbam_path,
 )
-from eprobe.biophysics import (
-    calculate_gc,
-    calculate_tm,
-    calculate_complexity,
-    calculate_hairpin_score,
+# Use fast biophysical calculators
+from eprobe.biophysics.fast_biophysics import (
+    calculate_gc_fast,
+    calculate_tm_fast,
+    calculate_dust_fast,
+    calculate_hairpin_fast,
+    DimerCalculatorFast,
+    calculate_percentile_threshold,
 )
-from eprobe.biophysics.dimer import DimerCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +52,36 @@ class FilterType(Enum):
 
 @dataclass
 class BiophysicalThresholds:
-    """Thresholds for biophysical filtering."""
+    """
+    Thresholds for biophysical filtering.
+    
+    Attributes:
+        gc_min/gc_max: GC content range (default: 35-65%)
+        tm_min/tm_max: Melting temperature range (default: 55-75°C)
+        complexity_max: Maximum DUST complexity score (default: 2.0)
+        hairpin_percentile: Keep top N% by hairpin score (default: 90%)
+        hairpin_max: Or use absolute hairpin threshold
+        dimer_percentile: Keep top N% by dimer score (default: 90%)
+        dimer_max: Or use absolute dimer threshold
+        nn_table: NN parameter table for Tm calculation. Options:
+            DNA/DNA: "DNA_NN1" to "DNA_NN4" (default: "DNA_NN4")
+            RNA/DNA: "R_DNA_NN1" to "R_DNA_NN4"
+        na_conc: Na+ concentration in mM (default: 50)
+    """
     gc_min: float = 35.0
     gc_max: float = 65.0
     tm_min: float = 55.0
     tm_max: float = 75.0
     complexity_max: float = 2.0
-    hairpin_max: Optional[float] = None  # Optional hairpin threshold
-    dimer_max: Optional[float] = None    # Optional dimer threshold
+    # Hairpin: use percentile or absolute threshold
+    hairpin_percentile: Optional[float] = 90.0  # Keep top 90% (filter worst 10%)
+    hairpin_max: Optional[float] = None         # Or use absolute threshold
+    # Dimer: use percentile or absolute threshold
+    dimer_percentile: Optional[float] = 90.0    # Keep top 90% (filter worst 10%)
+    dimer_max: Optional[float] = None           # Or use absolute threshold
+    # Tm calculation parameters
+    nn_table: str = "DNA_NN4"  # SantaLucia 1998, most widely used
+    na_conc: float = 50.0      # mM Na+ concentration
 
 
 @dataclass
@@ -974,67 +998,55 @@ def filter_accessibility(
 
 
 # =============================================================================
-# Biophysical Filter
+# Biophysical Filter (Optimized)
 # =============================================================================
 
-def calculate_probe_stats(
-    snp: SNP,
-    probe_sequence: str = None,
-) -> Dict[str, float]:
+def calculate_probe_stats_fast(probe_seq: str) -> Dict[str, float]:
     """
-    Calculate biophysical statistics for a SNP probe sequence.
+    Calculate biophysical statistics for a probe sequence (fast version).
+    
+    Uses optimized calculators for GC, Tm, DUST, and hairpin.
     
     Args:
-        snp: SNP object
-        probe_sequence: Complete probe sequence (if None, uses snp.ref as fallback)
+        probe_seq: Probe sequence string
         
     Returns:
         Dictionary of calculated statistics
     """
-    if probe_sequence is None:
-        probe_seq = snp.ref  # Fallback for compatibility
-    else:
-        probe_seq = probe_sequence
-    
     return {
-        "gc": calculate_gc(probe_seq),
-        "tm": calculate_tm(probe_seq),
-        "complexity": calculate_complexity(probe_seq),
-        "hairpin": calculate_hairpin_score(probe_seq),
+        "gc": calculate_gc_fast(probe_seq),
+        "tm": calculate_tm_fast(probe_seq),
+        "complexity": calculate_dust_fast(probe_seq),
+        "hairpin": calculate_hairpin_fast(probe_seq, method="kmer"),
     }
-
-
-def _calculate_batch_stats(snps: List[SNP]) -> List[Dict[str, float]]:
-    """
-    Calculate biophysical stats for a batch of SNPs (for parallel processing).
-    
-    This function is designed to be called by ProcessPoolExecutor.
-    
-    Args:
-        snps: List of SNPs to process
-        
-    Returns:
-        List of statistics dictionaries
-    """
-    return [calculate_probe_stats(snp) for snp in snps]
 
 
 def filter_biophysical(
     snps: List[SNP],
     thresholds: BiophysicalThresholds,
+    probe_sequences: Dict[str, str] = None,
     threads: int = 1,
 ) -> Result[Tuple[List[SNP], Dict[str, Any]], str]:
     """
-    Filter SNPs based on biophysical properties (parallelized).
+    Filter SNPs based on biophysical properties (optimized version).
     
-    Calculates GC content, melting temperature, sequence complexity,
-    and optionally hairpin/dimer scores. Filters based on thresholds.
-    Uses multiprocessing for faster computation on large datasets.
+    Calculates and filters by:
+    1. GC content (35-65% default)
+    2. Melting temperature (55-75°C default)
+    3. DUST complexity score (≤2.0 default)
+    4. Hairpin score (percentile-based, top 90% default)
+    5. Dimer score (percentile-based, top 90% default)
+    
+    Uses fast k-mer based algorithms for hairpin and dimer detection.
+    Percentile-based thresholds are calculated from the distribution
+    of scores across all SNPs.
     
     Args:
         snps: Input SNP list
-        thresholds: Biophysical threshold configuration
-        threads: Number of parallel workers (default: 1)
+        thresholds: BiophysicalThresholds configuration
+        probe_sequences: Dictionary mapping SNP ID to probe sequence.
+                        If None, will use snp.ref (single base) which is not recommended.
+        threads: Number of parallel workers (not used in current implementation)
         
     Returns:
         Result containing (filtered SNPs, statistics dict)
@@ -1042,10 +1054,11 @@ def filter_biophysical(
     if not snps:
         return Ok(([], {}))
     
-    logger.info(f"Running biophysical filter on {len(snps)} SNPs (threads={threads})")
+    n_snps = len(snps)
+    logger.info(f"Running biophysical filter on {n_snps} SNPs")
     logger.info(f"Thresholds: GC={thresholds.gc_min}-{thresholds.gc_max}%, "
-                f"Tm={thresholds.tm_min}-{thresholds.tm_max}°C, "
-                f"Complexity≤{thresholds.complexity_max}")
+                f"Tm={thresholds.tm_min}-{thresholds.tm_max}°C (NN table: {thresholds.nn_table}), "
+                f"DUST≤{thresholds.complexity_max}")
     
     filter_stats = {
         "gc_failed": 0,
@@ -1053,71 +1066,156 @@ def filter_biophysical(
         "complexity_failed": 0,
         "hairpin_failed": 0,
         "dimer_failed": 0,
+        "input_count": n_snps,
     }
     
-    # Parallel computation of biophysical properties
-    if threads > 1:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        
-        # Split into batches to reduce process creation overhead
-        batch_size = max(100, len(snps) // (threads * 4))
-        batches = [snps[i:i + batch_size] for i in range(0, len(snps), batch_size)]
-        
-        logger.info(f"Processing {len(batches)} batches with {threads} workers")
-        
-        all_stats = []
-        with ProcessPoolExecutor(max_workers=threads) as executor:
-            futures = {
-                executor.submit(_calculate_batch_stats, batch): batch
-                for batch in batches
-            }
-            
-            for future in as_completed(futures):
-                try:
-                    batch_stats = future.result()
-                    all_stats.extend(batch_stats)
-                except Exception as e:
-                    logger.error(f"Batch processing failed: {e}")
-                    return Err(f"Biophysical calculation failed: {e}")
+    # Extract probe sequences (from dictionary or SNP.ref as fallback)
+    if probe_sequences is not None:
+        sequences = [probe_sequences.get(snp.id, snp.ref) for snp in snps]
     else:
-        # Serial computation
-        all_stats = [calculate_probe_stats(snp) for snp in snps]
+        # Fallback: use ref allele (single base) - not recommended for actual filtering
+        logger.warning("No probe_sequences provided, using SNP.ref (may be single base)")
+        sequences = [snp.ref for snp in snps]
     
-    # Filter based on thresholds
-    passed_snps = []
-    for snp, stats in zip(snps, all_stats):
-        # GC check
-        if not (thresholds.gc_min <= stats["gc"] <= thresholds.gc_max):
-            filter_stats["gc_failed"] += 1
-            continue
-        
-        # Tm check
-        if not (thresholds.tm_min <= stats["tm"] <= thresholds.tm_max):
-            filter_stats["tm_failed"] += 1
-            continue
-        
-        # Complexity check
-        if stats["complexity"] > thresholds.complexity_max:
-            filter_stats["complexity_failed"] += 1
-            continue
-        
-        # Hairpin check (optional)
-        if thresholds.hairpin_max is not None:
-            if stats["hairpin"] > thresholds.hairpin_max:
-                filter_stats["hairpin_failed"] += 1
+    # =========================================================================
+    # Stage 1: Fast filters (GC, Tm, DUST) - O(n) per sequence
+    # =========================================================================
+    logger.info("Stage 1: Computing GC, Tm, DUST...")
+    
+    passed_stage1 = []
+    passed_stage1_seqs = []
+    
+    for snp, seq in zip(snps, sequences):
+        try:
+            # GC check
+            gc = calculate_gc_fast(seq)
+            if not (thresholds.gc_min <= gc <= thresholds.gc_max):
+                filter_stats["gc_failed"] += 1
                 continue
+            
+            # Tm check (using user-selected NN table)
+            tm = calculate_tm_fast(seq, na_conc=thresholds.na_conc, nn_table=thresholds.nn_table)
+            if not (thresholds.tm_min <= tm <= thresholds.tm_max):
+                filter_stats["tm_failed"] += 1
+                continue
+            
+            # DUST complexity check
+            dust = calculate_dust_fast(seq)
+            if dust > thresholds.complexity_max:
+                filter_stats["complexity_failed"] += 1
+                continue
+            
+            passed_stage1.append(snp)
+            passed_stage1_seqs.append(seq)
+            
+        except Exception as e:
+            logger.warning(f"Error processing SNP {snp.id}: {e}")
+            continue
+    
+    logger.info(f"Stage 1: {len(passed_stage1)}/{n_snps} passed "
+                f"(GC:{filter_stats['gc_failed']}, Tm:{filter_stats['tm_failed']}, "
+                f"DUST:{filter_stats['complexity_failed']} failed)")
+    
+    if not passed_stage1:
+        return Ok(([], filter_stats))
+    
+    # =========================================================================
+    # Stage 2: Hairpin filter (percentile-based)
+    # =========================================================================
+    use_hairpin = (thresholds.hairpin_percentile is not None or 
+                   thresholds.hairpin_max is not None)
+    
+    if use_hairpin:
+        logger.info("Stage 2: Computing hairpin scores...")
         
-        passed_snps.append(snp)
+        hairpin_scores = [calculate_hairpin_fast(seq, method="kmer") 
+                         for seq in passed_stage1_seqs]
+        
+        # Determine threshold
+        if thresholds.hairpin_max is not None:
+            hairpin_threshold = thresholds.hairpin_max
+        else:
+            # Use percentile: higher percentile = more permissive
+            hairpin_threshold = calculate_percentile_threshold(
+                hairpin_scores, 
+                thresholds.hairpin_percentile,
+                higher_is_worse=True
+            )
+        
+        logger.info(f"Hairpin threshold: {hairpin_threshold:.2f} "
+                    f"(percentile: {thresholds.hairpin_percentile}%)")
+        
+        passed_stage2 = []
+        passed_stage2_seqs = []
+        
+        for snp, seq, score in zip(passed_stage1, passed_stage1_seqs, hairpin_scores):
+            if score <= hairpin_threshold:
+                passed_stage2.append(snp)
+                passed_stage2_seqs.append(seq)
+            else:
+                filter_stats["hairpin_failed"] += 1
+        
+        logger.info(f"Stage 2: {len(passed_stage2)}/{len(passed_stage1)} passed "
+                    f"(hairpin:{filter_stats['hairpin_failed']} failed)")
+    else:
+        passed_stage2 = passed_stage1
+        passed_stage2_seqs = passed_stage1_seqs
     
-    removed = len(snps) - len(passed_snps)
-    logger.info(f"Biophysical filter: removed {removed} SNPs")
-    logger.info(f"  GC failed: {filter_stats['gc_failed']}")
-    logger.info(f"  Tm failed: {filter_stats['tm_failed']}")
-    logger.info(f"  Complexity failed: {filter_stats['complexity_failed']}")
-    if thresholds.hairpin_max is not None:
-        logger.info(f"  Hairpin failed: {filter_stats['hairpin_failed']}")
+    if not passed_stage2:
+        return Ok(([], filter_stats))
     
-    return Ok((passed_snps, filter_stats))
+    # =========================================================================
+    # Stage 3: Dimer filter (percentile-based, requires global k-mer index)
+    # =========================================================================
+    use_dimer = (thresholds.dimer_percentile is not None or 
+                 thresholds.dimer_max is not None)
+    
+    if use_dimer:
+        logger.info("Stage 3: Computing dimer scores...")
+        
+        # Build k-mer index from all passed sequences
+        dimer_calc = DimerCalculatorFast(k=11, include_revcomp=True)
+        n_kmers = dimer_calc.build_index(passed_stage2_seqs)
+        logger.info(f"Built dimer index with {n_kmers} unique k-mers")
+        
+        dimer_scores = dimer_calc.calculate_all_scores()
+        
+        # Determine threshold
+        if thresholds.dimer_max is not None:
+            dimer_threshold = thresholds.dimer_max
+        else:
+            dimer_threshold = calculate_percentile_threshold(
+                dimer_scores,
+                thresholds.dimer_percentile,
+                higher_is_worse=True
+            )
+        
+        logger.info(f"Dimer threshold: {dimer_threshold:.4f} "
+                    f"(percentile: {thresholds.dimer_percentile}%)")
+        
+        passed_stage3 = []
+        
+        for snp, score in zip(passed_stage2, dimer_scores):
+            if score <= dimer_threshold:
+                passed_stage3.append(snp)
+            else:
+                filter_stats["dimer_failed"] += 1
+        
+        logger.info(f"Stage 3: {len(passed_stage3)}/{len(passed_stage2)} passed "
+                    f"(dimer:{filter_stats['dimer_failed']} failed)")
+    else:
+        passed_stage3 = passed_stage2
+    
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    removed = n_snps - len(passed_stage3)
+    filter_stats["output_count"] = len(passed_stage3)
+    
+    logger.info(f"Biophysical filter complete: {len(passed_stage3)}/{n_snps} passed "
+                f"({removed} removed)")
+    
+    return Ok((passed_stage3, filter_stats))
 
 
 # =============================================================================
@@ -1706,6 +1804,416 @@ def filter_taxonomy(
 
 
 # =============================================================================
+# Taxonomic Filter — Best-Hit Mode
+# =============================================================================
+
+def parse_bam_besthit(
+    bam_path: Path,
+    acc2taxid_map: Dict[str, str],
+    parent_map: Dict[int, int],
+    id_to_name: Dict[int, str],
+    target_taxids: List[int],
+    outgroup_taxids: Optional[List[int]] = None,
+    exclude_mode: str = "diff",
+    exclude_val: float = 2,
+    target_min_sim: float = 90.0,
+    target_max_nm: int = 5,
+) -> Result[Tuple[Set[str], Dict[str, str]], str]:
+    """
+    Best-hit taxonomic assignment from a name-sorted BAM file.
+    
+    Implements the 3-mode exclusion logic from the BestHit classifier:
+      1. For each read, group all alignments by resolved TaxID.
+      2. Keep only the best hit per TaxID (lowest NM, then highest similarity).
+      3. The overall best hit must belong to the target clade.
+      4. An exclusion check against outgroup taxa must pass.
+    
+    Exclusion modes (mutually exclusive):
+      sim:  Reject if ANY outgroup hit has similarity >= exclude_val (%)
+      nm:   Reject if ANY outgroup hit has NM <= exclude_val
+      diff: Reject if (best_outgroup_NM - target_NM) < exclude_val
+    
+    Args:
+        bam_path:         Name-sorted BAM file
+        acc2taxid_map:    accession (or accession.version) -> taxid string
+        parent_map:       taxid_int -> parent_taxid_int (from nodes.dmp)
+        id_to_name:       taxid_int -> scientific name string
+        target_taxids:    List of target clade taxid ints
+        outgroup_taxids:  Specific outgroup taxid list; None = ALL non-target
+        exclude_mode:     'sim', 'nm', or 'diff'
+        exclude_val:      Threshold value for the chosen mode
+        target_min_sim:   Min similarity (%) for target acceptance
+        target_max_nm:    Max NM for target acceptance (alternative threshold)
+    
+    Returns:
+        Result(  (assigned_ids set, decision_log dict{read_id -> reason})  )
+    """
+    import pysam
+    
+    assigned_ids: Set[str] = set()
+    decision_log: Dict[str, str] = {}
+    
+    target_set = set(target_taxids)
+    outgroup_set = set(outgroup_taxids) if outgroup_taxids else None
+    
+    def _is_target(tid_int: int) -> bool:
+        return is_descendant_of(tid_int, list(target_set), parent_map)
+    
+    def _is_outgroup(tid_int: int) -> bool:
+        if outgroup_set is None:
+            return not _is_target(tid_int)  # all non-target = outgroup
+        for o in outgroup_set:
+            if is_descendant_of(tid_int, [o], parent_map):
+                return True
+        return False
+    
+    try:
+        bam = pysam.AlignmentFile(str(bam_path), "rb")
+    except Exception as e:
+        return Err(f"Failed to open BAM: {e}")
+    
+    # Process reads grouped by query name (BAM must be name-sorted)
+    current_qname: Optional[str] = None
+    current_hits: List[Dict] = []
+    
+    stats = {"total_reads": 0, "assigned": 0, "unassigned_no_taxid": 0,
+             "unassigned_not_target": 0, "unassigned_low_qual": 0,
+             "rejected_ambiguous": 0}
+    
+    def _process_read(qname: str, hits: List[Dict]):
+        """Process all hits for one read and make assignment decision."""
+        # Step 1: Group hits by TaxID, keep best per taxid
+        species_hits: Dict[int, Dict] = {}  # taxid_int -> best hit info
+        
+        for h in hits:
+            ref = h["ref"]
+            tid_str = acc2taxid_map.get(ref) or acc2taxid_map.get(ref.split(".")[0])
+            if tid_str is None:
+                continue
+            try:
+                tid = int(tid_str)
+            except (ValueError, TypeError):
+                continue
+            
+            nm = h["nm"]
+            length = h["len"]
+            sim = (length - nm) / length * 100.0 if length > 0 else 0.0
+            
+            if tid not in species_hits:
+                species_hits[tid] = {"nm": nm, "sim": sim, "ref": ref}
+            else:
+                prev = species_hits[tid]
+                if nm < prev["nm"] or (nm == prev["nm"] and sim > prev["sim"]):
+                    species_hits[tid] = {"nm": nm, "sim": sim, "ref": ref}
+        
+        if not species_hits:
+            stats["unassigned_no_taxid"] += 1
+            return
+        
+        # Step 2: Global best hit
+        sorted_sp = sorted(species_hits.items(), key=lambda x: (x[1]["nm"], -x[1]["sim"]))
+        best_tid, best_data = sorted_sp[0]
+        
+        # Criterion A: Best hit must be target
+        if not _is_target(best_tid):
+            stats["unassigned_not_target"] += 1
+            return
+        
+        # Criterion B: Quality check
+        if not (best_data["sim"] >= target_min_sim or best_data["nm"] <= target_max_nm):
+            stats["unassigned_low_qual"] += 1
+            return
+        
+        # Step 3: Exclusion check
+        if exclude_mode in ("sim", "nm"):
+            for tid, data in species_hits.items():
+                if _is_target(tid):
+                    continue
+                if not _is_outgroup(tid):
+                    continue
+                if exclude_mode == "sim" and data["sim"] >= exclude_val:
+                    stats["rejected_ambiguous"] += 1
+                    return
+                if exclude_mode == "nm" and data["nm"] <= exclude_val:
+                    stats["rejected_ambiguous"] += 1
+                    return
+        
+        elif exclude_mode == "diff":
+            min_og_nm = None
+            for tid, data in species_hits.items():
+                if _is_target(tid):
+                    continue
+                if not _is_outgroup(tid):
+                    continue
+                if min_og_nm is None or data["nm"] < min_og_nm:
+                    min_og_nm = data["nm"]
+            
+            if min_og_nm is not None:
+                delta = min_og_nm - best_data["nm"]
+                if delta < exclude_val:
+                    stats["rejected_ambiguous"] += 1
+                    return
+        
+        # Passed all checks
+        assigned_ids.add(qname)
+        stats["assigned"] += 1
+    
+    for read in bam:
+        if read.is_unmapped:
+            continue
+        try:
+            nm = read.get_tag("NM")
+        except KeyError:
+            nm = 0
+        qlen = read.query_length or read.infer_query_length() or 0
+        
+        hit = {"ref": read.reference_name, "nm": nm, "len": qlen}
+        
+        if current_qname is not None and read.query_name != current_qname:
+            stats["total_reads"] += 1
+            _process_read(current_qname, current_hits)
+            current_hits = []
+        
+        current_qname = read.query_name
+        current_hits.append(hit)
+    
+    # Process last read group
+    if current_qname and current_hits:
+        stats["total_reads"] += 1
+        _process_read(current_qname, current_hits)
+    
+    bam.close()
+    
+    logger.info(f"Best-hit classification: {stats['total_reads']} reads processed")
+    logger.info(f"  Assigned to target: {stats['assigned']}")
+    logger.info(f"  Rejected (ambiguous): {stats['rejected_ambiguous']}")
+    logger.info(f"  Unassigned (not target): {stats['unassigned_not_target']}")
+    logger.info(f"  Unassigned (low quality): {stats['unassigned_low_qual']}")
+    logger.info(f"  Unassigned (no taxid): {stats['unassigned_no_taxid']}")
+    
+    return Ok((assigned_ids, stats))
+
+
+def load_acc2taxid_file(filepath: Path) -> Result[Dict[str, str], str]:
+    """
+    Load NCBI accession2taxid file → {accession: taxid_str}.
+    
+    Standard NCBI format: accession <tab> accession.ver <tab> taxid <tab> gi
+    Also handles 2-column or 3-column variants.
+    """
+    acc_map: Dict[str, str] = {}
+    try:
+        with open(filepath) as f:
+            for line in f:
+                if line.startswith("accession"):
+                    continue
+                parts = line.strip().split()
+                if len(parts) >= 3:
+                    taxid = parts[2]
+                    acc_map[parts[0]] = taxid
+                    if len(parts) > 1 and parts[1] != parts[0]:
+                        acc_map[parts[1]] = taxid
+                elif len(parts) == 2:
+                    acc_map[parts[0]] = parts[1]
+        logger.info(f"Loaded {len(acc_map)} accession→taxid mappings")
+        return Ok(acc_map)
+    except Exception as e:
+        return Err(f"Failed to read acc2taxid: {e}")
+
+
+def build_taxonomy_maps(
+    names_dmp: Path,
+    nodes_dmp: Path,
+) -> Result[Tuple[Dict[int, int], Dict[int, str]], str]:
+    """
+    Build parent_map and id_to_name from NCBI taxonomy dump files.
+    
+    Returns:
+        (parent_map {taxid: parent_taxid}, id_to_name {taxid: sci_name})
+    """
+    parent_result = parse_taxonomy_nodes(nodes_dmp)
+    if parent_result.is_err():
+        return Err(parent_result.unwrap_err())
+    parent_map = parent_result.unwrap()
+    
+    id_to_name: Dict[int, str] = {}
+    try:
+        with open(names_dmp) as f:
+            for line in f:
+                if "scientific name" not in line:
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 4:
+                    tid = int(parts[0])
+                    id_to_name[tid] = parts[1]
+    except Exception as e:
+        return Err(f"Failed to parse names.dmp: {e}")
+    
+    return Ok((parent_map, id_to_name))
+
+
+def filter_taxonomy_besthit(
+    snps: List[SNP],
+    index_paths: List[Path],
+    names_dmp: Path,
+    nodes_dmp: Path,
+    acc2tax: Path,
+    target_taxids: List[int],
+    fasta_path: Path,
+    outgroup_taxids: Optional[List[int]] = None,
+    exclude_mode: str = "diff",
+    exclude_val: float = 2,
+    target_min_sim: float = 90.0,
+    target_max_nm: int = 5,
+    keep_hits: int = 100,
+    threads: int = 1,
+    work_dir: Optional[Path] = None,
+    keep_temp: bool = False,
+) -> Result[Tuple[List[SNP], Dict[str, Any]], str]:
+    """
+    Filter SNPs based on best-hit taxonomic assignment.
+    
+    Workflow:
+      1. Map probes to database(s) with Bowtie2 (multi-hit mode)
+      2. Merge BAMs, name-sort
+      3. Parse BAM: per-read best-hit assignment with 3-mode exclusion
+      4. Keep SNPs assigned to the target clade
+    
+    This is an alternative to the LCA mode (ngsLCA-based).
+    Use when the target organism is closely related to outgroups
+    and LCA tends to collapse assignments to a higher-level node.
+    
+    Args:
+        snps: Input SNP list
+        index_paths: Bowtie2 index path(s)
+        names_dmp: NCBI names.dmp
+        nodes_dmp: NCBI nodes.dmp
+        acc2tax: Accession→taxid mapping file
+        target_taxids: Target clade taxids
+        fasta_path: Probe FASTA
+        outgroup_taxids: Specific outgroup taxids (None = all non-target)
+        exclude_mode: 'sim', 'nm', or 'diff'
+        exclude_val: Threshold for chosen mode
+        target_min_sim: Min similarity (%) for target acceptance
+        target_max_nm: Max NM for target acceptance
+        keep_hits: Bowtie2 -k parameter
+        threads: Threads
+        work_dir: Temp directory location
+        keep_temp: Preserve temp files
+        
+    Returns:
+        Result( (filtered_snps, besthit_stats) )
+    """
+    if not snps:
+        return Ok(([], {}))
+    
+    if not fasta_path.exists():
+        return Err(f"FASTA file not found: {fasta_path}")
+    
+    logger.info(f"Running best-hit taxonomic filter on {len(snps)} SNPs")
+    logger.info(f"Target taxids: {target_taxids}")
+    logger.info(f"Exclusion mode: {exclude_mode}, threshold: {exclude_val}")
+    if outgroup_taxids:
+        logger.info(f"Outgroup taxids: {outgroup_taxids}")
+    else:
+        logger.info(f"Outgroups: ALL non-target taxa")
+    
+    # Load taxonomy data
+    logger.info("Loading taxonomy databases...")
+    tax_result = build_taxonomy_maps(names_dmp, nodes_dmp)
+    if tax_result.is_err():
+        return Err(tax_result.unwrap_err())
+    parent_map, id_to_name = tax_result.unwrap()
+    
+    acc_result = load_acc2taxid_file(acc2tax)
+    if acc_result.is_err():
+        return Err(acc_result.unwrap_err())
+    acc2taxid_map = acc_result.unwrap()
+    
+    # Create temp directory
+    import time
+    import shutil
+    
+    if work_dir is not None:
+        work_dir = Path(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        tx_temp = work_dir / f"eprobe_txbh_{int(time.time())}"
+        tx_temp.mkdir(parents=True, exist_ok=True)
+    else:
+        tx_temp = Path(tempfile.mkdtemp(prefix="eprobe_txbh_"))
+    
+    logger.info(f"Temp directory: {tx_temp}")
+    
+    try:
+        # Step 1: Map to all databases
+        bam_files = []
+        for idx, index_path in enumerate(index_paths, 1):
+            logger.info(f"Mapping to database {idx}/{len(index_paths)}: {index_path.name}")
+            output_prefix = tx_temp / f"mapping_{idx}"
+            
+            sam_result = run_taxonomic_mapping(
+                fasta_path, index_path, output_prefix, keep_hits, threads
+            )
+            if sam_result.is_err():
+                logger.warning(f"Mapping to {index_path} failed: {sam_result.unwrap_err()}")
+                continue
+            
+            bam_result = process_sam_to_bam(sam_result.unwrap(), threads)
+            if bam_result.is_err():
+                logger.warning(f"SAM→BAM failed: {bam_result.unwrap_err()}")
+                continue
+            
+            bam_files.append(bam_result.unwrap())
+        
+        if not bam_files:
+            return Err("No successful alignments from any database")
+        
+        # Step 2: Merge and name-sort
+        logger.info(f"Merging and name-sorting {len(bam_files)} BAM file(s)")
+        sorted_bam = tx_temp / "merged.sorted.bam"
+        merge_result = merge_and_sort_bams(bam_files, sorted_bam, threads)
+        if merge_result.is_err():
+            return Err(merge_result.unwrap_err())
+        
+        # Step 3: Best-hit parsing
+        logger.info("Running best-hit classification...")
+        bh_result = parse_bam_besthit(
+            bam_path=merge_result.unwrap(),
+            acc2taxid_map=acc2taxid_map,
+            parent_map=parent_map,
+            id_to_name=id_to_name,
+            target_taxids=target_taxids,
+            outgroup_taxids=outgroup_taxids,
+            exclude_mode=exclude_mode,
+            exclude_val=exclude_val,
+            target_min_sim=target_min_sim,
+            target_max_nm=target_max_nm,
+        )
+        if bh_result.is_err():
+            return Err(bh_result.unwrap_err())
+        
+        assigned_ids, bh_stats = bh_result.unwrap()
+    
+    finally:
+        if not keep_temp and tx_temp.exists():
+            try:
+                shutil.rmtree(tx_temp, ignore_errors=True)
+            except Exception:
+                pass
+        elif keep_temp:
+            logger.info(f"Keeping temp: {tx_temp}")
+    
+    # Filter SNPs
+    filtered_snps = [snp for snp in snps if snp.id in assigned_ids]
+    removed = len(snps) - len(filtered_snps)
+    
+    logger.info(f"Best-hit TX filter: {len(assigned_ids)} assigned to target")
+    logger.info(f"Best-hit TX filter: removed {removed}, {len(filtered_snps)} remaining")
+    
+    return Ok((filtered_snps, bh_stats))
+
+
+# =============================================================================
 # Main Filter Pipeline
 # =============================================================================
 
@@ -1727,11 +2235,19 @@ def run_filter(
     tx_min_edit: int = 0,
     tx_max_edit: int = 2,
     tx_keep_hits: int = 100,
+    tx_mode: str = "lca",
+    tx_outgroup_ids: Optional[List[int]] = None,
+    tx_exclude_mode: str = "diff",
+    tx_exclude_val: float = 2,
+    tx_target_min_sim: float = 90.0,
+    tx_target_max_nm: int = 5,
     gc_range: Tuple[float, float] = (35.0, 65.0),
     tm_range: Tuple[float, float] = (55.0, 75.0),
     max_complexity: float = 2.0,
     max_hairpin: Optional[float] = None,
     max_dimer: Optional[float] = None,
+    nn_table: str = "DNA_NN4",
+    na_conc: float = 50.0,
     probe_length: int = 100,
     threads: int = 1,
     verbose: bool = False,
@@ -1769,6 +2285,9 @@ def run_filter(
         max_complexity: Maximum DUST complexity score
         max_hairpin: Maximum hairpin score (optional)
         max_dimer: Maximum dimer score (optional)
+        nn_table: Nearest-neighbor thermodynamic table for Tm calculation.
+            Options: DNA_NN1-4 for DNA/DNA, R_DNA_NN1 for RNA/DNA (default: DNA_NN4)
+        na_conc: Sodium ion concentration in mM (default: 50.0)
         probe_length: Length of probe sequences (for flanking calculation)
         threads: Number of threads
         verbose: Enable verbose logging
@@ -1958,42 +2477,73 @@ def run_filter(
             if acc2tax is None:
                 return Err("TX filter requires --tx_acc2tax (accession to taxid mapping)")
             
-            result = filter_taxonomy(
-                snps=snps,
-                index_paths=index_paths,
-                names_dmp=Path(names_dmp),
-                nodes_dmp=Path(nodes_dmp),
-                acc2tax=Path(acc2tax),
-                target_taxids=tx_ids,
-                fasta_path=fasta_path,
-                min_edit=tx_min_edit if tx_min_edit is not None else 0,
-                max_edit=tx_max_edit if tx_max_edit is not None else 2,
-                keep_hits=tx_keep_hits if tx_keep_hits is not None else 100,
-                threads=threads,
-                work_dir=output_prefix.parent,
-                keep_temp=keep_temp,
-            )
-            if result.is_err():
-                return Err(result.unwrap_err())
-            
-            snps, taxid_counts = result.unwrap()
-            stats["filters_applied"].append("TX")
-            stats["tx_remaining"] = len(snps)
-            stats["tx_taxid_counts"] = taxid_counts
+            if tx_mode == "besthit":
+                logger.info("Using best-hit taxonomic classification")
+                result = filter_taxonomy_besthit(
+                    snps=snps,
+                    index_paths=index_paths,
+                    names_dmp=Path(names_dmp),
+                    nodes_dmp=Path(nodes_dmp),
+                    acc2tax=Path(acc2tax),
+                    target_taxids=tx_ids,
+                    fasta_path=fasta_path,
+                    outgroup_taxids=tx_outgroup_ids,
+                    exclude_mode=tx_exclude_mode,
+                    exclude_val=tx_exclude_val,
+                    target_min_sim=tx_target_min_sim,
+                    target_max_nm=tx_target_max_nm,
+                    keep_hits=tx_keep_hits if tx_keep_hits is not None else 100,
+                    threads=threads,
+                    work_dir=output_prefix.parent,
+                    keep_temp=keep_temp,
+                )
+                if result.is_err():
+                    return Err(result.unwrap_err())
+                
+                snps, bh_stats = result.unwrap()
+                stats["filters_applied"].append("TX(besthit)")
+                stats["tx_remaining"] = len(snps)
+                stats["tx_besthit_stats"] = bh_stats
+            else:
+                logger.info("Using LCA taxonomic classification (ngsLCA)")
+                result = filter_taxonomy(
+                    snps=snps,
+                    index_paths=index_paths,
+                    names_dmp=Path(names_dmp),
+                    nodes_dmp=Path(nodes_dmp),
+                    acc2tax=Path(acc2tax),
+                    target_taxids=tx_ids,
+                    fasta_path=fasta_path,
+                    min_edit=tx_min_edit if tx_min_edit is not None else 0,
+                    max_edit=tx_max_edit if tx_max_edit is not None else 2,
+                    keep_hits=tx_keep_hits if tx_keep_hits is not None else 100,
+                    threads=threads,
+                    work_dir=output_prefix.parent,
+                    keep_temp=keep_temp,
+                )
+                if result.is_err():
+                    return Err(result.unwrap_err())
+                
+                snps, taxid_counts = result.unwrap()
+                stats["filters_applied"].append("TX(lca)")
+                stats["tx_remaining"] = len(snps)
+                stats["tx_taxid_counts"] = taxid_counts
         
         # Apply Biophysical filter
         if "biophysical" in filters_normalized:
             thresholds = BiophysicalThresholds(
-            gc_min=gc_range[0],
-            gc_max=gc_range[1],
-            tm_min=tm_range[0],
-            tm_max=tm_range[1],
-            complexity_max=max_complexity,
-            hairpin_max=max_hairpin,
-            dimer_max=max_dimer,
-        )
+                gc_min=gc_range[0],
+                gc_max=gc_range[1],
+                tm_min=tm_range[0],
+                tm_max=tm_range[1],
+                complexity_max=max_complexity,
+                hairpin_max=max_hairpin,
+                dimer_max=max_dimer,
+                nn_table=nn_table,
+                na_conc=na_conc,
+            )
         
-            result = filter_biophysical(snps, thresholds, threads)
+            result = filter_biophysical(snps, thresholds, probe_sequences, threads)
             if result.is_err():
                 return Err(result.unwrap_err())
             
