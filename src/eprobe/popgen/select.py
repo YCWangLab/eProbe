@@ -701,6 +701,7 @@ def run_select(
     seed: int = 42,
     keep_biophysical: bool = False,
     merged_snps: Optional[List[SNP]] = None,
+    merge_details: Optional[Dict[str, Any]] = None,
     verbose: bool = False,
     **kwargs,  # Accept extra kwargs for CLI compatibility
 ) -> Result[Dict[str, Any], str]:
@@ -722,6 +723,7 @@ def run_select(
         seed: Random seed for reproducibility
         keep_biophysical: Keep biophysical columns in output (default: False)
         merged_snps: Pre-merged SNP list (if None, load from input_path)
+        merge_details: Details dictionary for merge operation (mode, file counts, etc.)
         verbose: Enable verbose logging
         
     Returns:
@@ -830,6 +832,10 @@ def run_select(
                     "output_file": str(output_path),
                 }
                 
+                # Add merge details if available
+                if merge_details:
+                    stats["merge_details"] = merge_details
+                
                 logger.info(f"Selection complete: {len(selected)} SNPs selected")
                 logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
                 logger.info(f"Output saved to {output_path}")
@@ -888,6 +894,10 @@ def run_select(
                         "output_file": str(output_path),
                     }
                     
+                    # Add merge details if available
+                    if merge_details:
+                        stats["merge_details"] = merge_details
+                    
                     logger.info(f"Selection complete: {len(selected)} SNPs selected")
                     logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
                     logger.info(f"Output saved to {output_path}")
@@ -930,6 +940,10 @@ def run_select(
         "coverage": coverage_stats,
         "output_file": str(output_path),
     }
+    
+    # Add merge details if available
+    if merge_details:
+        stats["merge_details"] = merge_details
     
     logger.info(f"Selection complete: {len(selected)} SNPs selected")
     logger.info(f"Windows covered: {coverage_stats['windows_covered']}")

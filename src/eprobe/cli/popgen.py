@@ -847,6 +847,7 @@ def select(
             raise SystemExit(1)
     
     # Handle multiple input files
+    merge_details = None
     if len(input) > 1:
         echo_info(f"Merging {len(input)} input files using {merge_mode} mode")
         for i, f in enumerate(input, 1):
@@ -861,6 +862,14 @@ def select(
         echo_info(f"After merge ({merge_mode}): {len(merged_snps)} SNPs")
         input_path = input[0]  # Use first file path as reference
         merged_data = merged_snps
+        
+        # Create merge details for reporting
+        merge_details = {
+            "mode": merge_mode,
+            "file_count": len(input),
+            "files": [str(f) for f in input],
+            "merged_count": len(merged_snps),
+        }
     else:
         input_path = input[0]
         merged_data = None
@@ -881,6 +890,7 @@ def select(
         seed=seed,
         keep_biophysical=keep_biophysical,
         merged_snps=merged_data,
+        merge_details=merge_details,
         verbose=verbose,
     )
     
@@ -890,11 +900,21 @@ def select(
     
     stats = result.unwrap()
     echo_success(f"\n→ Selection Summary:")
-    echo_info(f"    ├─ Input: {stats['initial_count']} SNPs")
-    echo_info(f"    ├─ Selected: {stats['selected']} SNPs")
-    echo_info(f"    ├─ Windows covered: {stats['windows']}")
-    echo_info(f"    ├─ Strategy: {stats['strategy']}")
-    echo_info(f"    └─ Output: {stats['output_file']}")
+    
+    # Show merge info if available in stats
+    if "merge_details" in stats:
+        merge_info = stats["merge_details"]
+        echo_info(f"  Merge (mode: {merge_info['mode']})")
+        echo_info(f"    ├─ Input files: {merge_info['file_count']}")
+        for i, f in enumerate(merge_info['files'], 1):
+            echo_info(f"    │  {i}. {Path(f).name}")
+        echo_info(f"    └─ After merge: {merge_info['merged_count']} SNPs")
+    
+    echo_info(f"  Input: {stats['initial_count']} SNPs")
+    echo_info(f"  Selected: {stats['selected']} SNPs")
+    echo_info(f"  Windows covered: {stats['windows']}")
+    echo_info(f"  Strategy: {stats['strategy']}")
+    echo_info(f"  Output: {stats['output_file']}")
 
 
 @popgen.command()
