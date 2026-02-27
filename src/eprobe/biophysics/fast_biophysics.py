@@ -267,6 +267,51 @@ def _reverse_complement(sequence: str) -> str:
     return sequence.upper().translate(_COMPLEMENT)[::-1]
 
 
+def _calculate_max_stem(seq: str, rev_comp: str, min_loop: int = 3) -> int:
+    """
+    Find the longest consecutive complementary stem between a sequence
+    and its reverse complement (i.e., the longest possible hairpin stem).
+    
+    At each offset k, seq[i] is aligned with rev_comp[k+i], meaning
+    seq[i] pairs with complement(seq[n-1-k-i]) in the original sequence.
+    The offset represents the approximate loop + stem region.
+    
+    Args:
+        seq: Uppercase DNA sequence
+        rev_comp: Reverse complement of seq
+        min_loop: Minimum hairpin loop size (default: 3)
+        
+    Returns:
+        Length of the longest consecutive complementary stem (in bp)
+    """
+    n = len(seq)
+    if n < min_loop + 4:
+        return 0
+    
+    best_stem = 0
+    
+    for offset in range(min_loop, n - 3):
+        overlap_len = n - offset
+        if overlap_len < 4:
+            break
+        
+        current_run = 0
+        max_run = 0
+        
+        for i in range(overlap_len):
+            if seq[i] == rev_comp[offset + i]:
+                current_run += 1
+                if current_run > max_run:
+                    max_run = current_run
+            else:
+                current_run = 0
+        
+        if max_run > best_stem:
+            best_stem = max_run
+    
+    return best_stem
+
+
 def _find_best_local_match(seq: str, rev_comp: str, min_match: int = 4) -> Tuple[int, int, int]:
     """
     Find the best local matching region between seq and its reverse complement.
@@ -326,19 +371,22 @@ def calculate_hairpin_fast(
     Calculate hairpin formation potential.
     
     Three methods available:
-    - "stem": Max consecutive complementary stem length (default, recommended)
+    - "stem": Normalized max stem length (default, recommended)
     - "kmer": K-mer sharing + local match composite score (legacy)
     - "align": Full local alignment (most accurate but slowest)
     
-    The "stem" method finds the longest consecutive run of base pairs
-    that could form a hairpin stem. This is biologically meaningful:
-    a score of 8 means the probe can form a hairpin with an 8bp stem.
+    The "stem" method finds the longest consecutive complementary stem
+    and normalizes by log4(sequence_length). This makes the score
+    stable across different probe lengths:
     
-    Expected scores for 81bp probes (stem method):
-    - Random DNA: 4-5 (baseline, harmless)
-    - Moderate hairpin (7bp stem): 7
-    - Strong hairpin (10+ bp stem): 10+
-    - Perfect inverted repeat: equals stem length
+    Expected scores (stem method, any probe length 40-200bp):
+    - Random DNA: ~1.8 (baseline, always similar)
+    - Moderate hairpin: ~2.5-3.0
+    - Strong hairpin: >3.0
+    - Perfect inverted repeat: >3.5
+    
+    Recommended threshold: 3.0 (filters probes with stems clearly
+    longer than expected by chance, works for any probe length).
     
     The "kmer" method (legacy) produces inflated, hard-to-interpret scores
     for long sequences (81bp random DNA scores ~66). Not recommended.
@@ -355,7 +403,7 @@ def calculate_hairpin_fast(
         
     Returns:
         Hairpin score (higher = more likely to form hairpin).
-        For "stem" method: max consecutive stem length in bp.
+        For "stem" method: normalized stem score (raw_stem / log4(L)).
         For "kmer"/"align": composite score (legacy).
     """
     if not sequence:
@@ -366,42 +414,12 @@ def calculate_hairpin_fast(
     
     if method == "stem":
         # Biologically meaningful method: find longest consecutive
-        # complementary stem that could form a hairpin structure.
-        #
-        # A hairpin forms when a single-stranded DNA folds back on itself.
-        # At offset k, seq[i] aligns with rev_comp[k+i], meaning
-        # seq[i] is complementary to seq[n-1-k-i] in the original.
-        # The offset represents the approximate loop + stem region.
-        #
-        # Expected max stem for random DNA (p=0.25 per position):
-        #   - Single offset, L positions: ~log(L)/log(4) ≈ 3
-        #   - Max across ~n offsets: ~4-5 for 81bp sequences
-        n = len(seq)
-        if n < min_loop + 4:  # need at least min_loop + 2*2bp stem
-            return 0.0
-        
-        best_stem = 0
-        
-        for offset in range(min_loop, n - 3):
-            overlap_len = n - offset
-            if overlap_len < 4:
-                break
-            
-            current_run = 0
-            max_run = 0
-            
-            for i in range(overlap_len):
-                if seq[i] == rev_comp[offset + i]:
-                    current_run += 1
-                    if current_run > max_run:
-                        max_run = current_run
-                else:
-                    current_run = 0
-            
-            if max_run > best_stem:
-                best_stem = max_run
-        
-        return float(best_stem)
+        # complementary stem, normalized by log4(L) for length-independence.
+        # Random DNA ~ 1.8 at any probe length; real hairpin > 3.0.
+        import math
+        raw_stem = _calculate_max_stem(seq, rev_comp, min_loop)
+        log4_len = math.log(len(seq), 4) if len(seq) > 1 else 1.0
+        return round(raw_stem / log4_len, 2)
     
     elif method == "kmer":
         # Legacy k-mer based method (NOT recommended for long sequences)

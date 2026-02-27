@@ -1147,7 +1147,7 @@ def filter_biophysical(
                 higher_is_worse=True
             )
         
-        logger.info(f"Hairpin threshold: {hairpin_threshold:.0f}bp stem "
+        logger.info(f"Hairpin threshold: {hairpin_threshold:.2f} "
                     f"({'absolute' if thresholds.hairpin_max is not None else f'percentile: {thresholds.hairpin_percentile}%'})")
         
         passed_stage2 = []

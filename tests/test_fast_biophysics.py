@@ -153,10 +153,11 @@ def test_dust():
 
 
 def test_hairpin():
-    """Test hairpin score calculation (stem method)."""
+    """Test hairpin score calculation (stem method, normalized by log4(L))."""
     print("\n" + "="*60)
     print("Testing Hairpin Score Calculation (stem method)")
-    print("  Score = max consecutive complementary stem length in bp")
+    print("  Score = max_stem_bp / log4(probe_length)")
+    print("  Random DNA ~ 1.8, real hairpin > 3.0")
     print("="*60)
     
     # Sequences with different hairpin potential
@@ -176,7 +177,7 @@ def test_hairpin():
         try:
             result = calculate_hairpin_fast(seq)
             scores.append((result, desc))
-            print(f"  ✓ Hairpin('{seq[:25]}...') = {result:.0f}bp stem ({desc})")
+            print(f"  ✓ Hairpin('{seq[:25]}...') = {result:.2f} ({desc})")
         except Exception as e:
             print(f"  ✗ Hairpin('{seq[:25]}...') failed: {e}")
             all_passed = False

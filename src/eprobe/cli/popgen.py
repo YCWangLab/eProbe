@@ -410,8 +410,10 @@ def extract(
 @click.option(
     "--hairpin",
     type=float,
-    default=8.0,
-    help="Maximum hairpin stem length in bp (default: 8). Probes that can form a hairpin with a stem >= this length are filtered. Random DNA typically has max stem 4-5bp.",
+    default=3.0,
+    help="Maximum normalized hairpin score (default: 3.0). "
+         "Score = max_stem_bp / log4(probe_length). "
+         "Stable across probe lengths: random DNA ~ 1.8, real hairpin > 3.0.",
 )
 @click.option(
     "--dimer",
