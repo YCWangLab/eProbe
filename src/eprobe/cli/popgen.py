@@ -726,8 +726,8 @@ def filter(
         echo_info(f"    ├─ GC content failed: {bio_details.get('gc_failed', 0)}")
         echo_info(f"    ├─ Tm failed: {bio_details.get('tm_failed', 0)}")
         echo_info(f"    ├─ Complexity failed: {bio_details.get('complexity_failed', 0)}")
-        if bio_details.get('hairpin_failed', 0) > 0:
-            echo_info(f"    ├─ Hairpin failed: {bio_details['hairpin_failed']}")
+        echo_info(f"    ├─ Hairpin failed: {bio_details.get('hairpin_failed', 0)}")
+        echo_info(f"    ├─ Dimer failed: {bio_details.get('dimer_failed', 0)}")
         echo_info(f"    └─ Passed: {stats.get('biophysical_remaining', final)} SNPs")
     
     # Step 3: Output
