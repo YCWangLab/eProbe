@@ -1498,8 +1498,8 @@ def target(
 @click.option(
     "--hairpin",
     type=float,
-    default=30.0,
-    help="Max hairpin score (default: 30.0).",
+    default=8.0,
+    help="Max hairpin stem length in bp (default: 8). Probes with hairpin stems >= this are filtered. Random DNA: 4-5bp.",
 )
 @click.option(
     "--dimer",

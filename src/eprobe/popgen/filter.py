@@ -61,13 +61,17 @@ class BiophysicalThresholds:
         tm_min/tm_max: Melting temperature range (default: 55-75°C)
         complexity_max: Maximum DUST complexity score (default: 2.0)
         hairpin_percentile: Keep top N% by hairpin score (default: 90%)
-        hairpin_max: Or use absolute hairpin threshold
+        hairpin_max: Or use absolute hairpin threshold (stem method: max stem bp)
         dimer_percentile: Keep top N% by dimer score (default: 90%)
         dimer_max: Or use absolute dimer threshold
         nn_table: NN parameter table for Tm calculation. Options:
             DNA/DNA: "DNA_NN1" to "DNA_NN4" (default: "DNA_NN4")
             RNA/DNA: "R_DNA_NN1" to "R_DNA_NN4"
         na_conc: Na+ concentration in mM (default: 50)
+    
+    Hairpin scoring uses the "stem" method: max consecutive complementary
+    stem length in bp. Random 81bp DNA: ~4-5bp; real hairpin: 8+ bp.
+    Default threshold of 8 means reject probes with >=8bp hairpin stems.
     """
     gc_min: float = 35.0
     gc_max: float = 65.0
@@ -1018,7 +1022,7 @@ def calculate_probe_stats_fast(probe_seq: str) -> Dict[str, float]:
         "gc": calculate_gc_fast(probe_seq),
         "tm": calculate_tm_fast(probe_seq),
         "complexity": calculate_dust_fast(probe_seq),
-        "hairpin": calculate_hairpin_fast(probe_seq, method="kmer"),
+        "hairpin": calculate_hairpin_fast(probe_seq, method="stem"),
     }
 
 
@@ -1129,7 +1133,7 @@ def filter_biophysical(
     if use_hairpin:
         logger.info("Stage 2: Computing hairpin scores...")
         
-        hairpin_scores = [calculate_hairpin_fast(seq, method="kmer") 
+        hairpin_scores = [calculate_hairpin_fast(seq, method="stem") 
                          for seq in passed_stage1_seqs]
         
         # Determine threshold
@@ -1143,8 +1147,8 @@ def filter_biophysical(
                 higher_is_worse=True
             )
         
-        logger.info(f"Hairpin threshold: {hairpin_threshold:.2f} "
-                    f"(percentile: {thresholds.hairpin_percentile}%)")
+        logger.info(f"Hairpin threshold: {hairpin_threshold:.0f}bp stem "
+                    f"({'absolute' if thresholds.hairpin_max is not None else f'percentile: {thresholds.hairpin_percentile}%'})")
         
         passed_stage2 = []
         passed_stage2_seqs = []

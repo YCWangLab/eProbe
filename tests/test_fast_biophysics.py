@@ -153,10 +153,10 @@ def test_dust():
 
 
 def test_hairpin():
-    """Test hairpin score calculation."""
+    """Test hairpin score calculation (stem method)."""
     print("\n" + "="*60)
-    print("Testing Hairpin Score Calculation")
-    print(f"  Using {'parasail (fast)' if HAS_PARASAIL else 'Biopython (fallback)'}")
+    print("Testing Hairpin Score Calculation (stem method)")
+    print("  Score = max consecutive complementary stem length in bp")
     print("="*60)
     
     # Sequences with different hairpin potential
@@ -176,7 +176,7 @@ def test_hairpin():
         try:
             result = calculate_hairpin_fast(seq)
             scores.append((result, desc))
-            print(f"  ✓ Hairpin('{seq[:25]}...') = {result:.2f} ({desc})")
+            print(f"  ✓ Hairpin('{seq[:25]}...') = {result:.0f}bp stem ({desc})")
         except Exception as e:
             print(f"  ✗ Hairpin('{seq[:25]}...') failed: {e}")
             all_passed = False

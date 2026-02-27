@@ -237,10 +237,12 @@ def test_hairpin():
 
 【期望行为】
 - 使用百分位阈值 (默认保留 top 90%)
-- 自互补序列 (AT重复) 会有最高分数
-- 设计的发夹结构 (stem-loop-stem) 会有较高分数
-- 随机序列: 47-94 (平均 66)
-- Poly-A: 0 (没有互补区域)
+- 自互补序列 (AT重复) 会有最高分数 (很长的stem)
+- 设计的发夹结构 (stem-loop-stem) 会有较高分数 (对应stem长度)
+- 随机序列: 4-5 (max stem by chance)
+- Poly-A: 0 (没有互补区域, A的互补是T)
+
+Note: Using "stem" method - score = max consecutive complementary stem length in bp.
 """)
     
     print_subheader("测试用例")
@@ -261,18 +263,18 @@ def test_hairpin():
     hairpin_seq = stem + loop + rc_stem + 'A' * (81 - len(stem + loop + rc_stem))
     
     test_cases = [
-        ("自互补 (AT重复)", "AT" * 40 + "A", "很高 (AT=TA反向互补)", "最高分"),
-        ("设计发夹 (stem-loop)", hairpin_seq, "较高", "高分"),
-        ("随机序列", random_seq, "47-94", "中等"),
+        ("自互补 (AT重复)", "AT" * 40 + "A", "很高 (AT长stem)", "最高分"),
+        ("设计发夹 (stem-loop)", hairpin_seq, "~10 (stem长度)", "高分"),
+        ("随机序列", random_seq, "4-6", "低分"),
         ("Poly-A", "A" * 81, "0 (无互补)", "最低分"),
     ]
     
-    print("分数分布:")
+    print("分数分布 (stem method = max consecutive complementary stem in bp):")
     scores = []
     for name, seq, expected, note in test_cases:
-        score = calculate_hairpin_fast(seq, method="kmer")
+        score = calculate_hairpin_fast(seq, method="stem")
         scores.append((name, score, note))
-        print(f"  {name:25s}: {score:.2f} ({note})")
+        print(f"  {name:25s}: {score:.0f}bp stem ({note})")
     
     # Verify ordering
     print("\n验证分数排序:")
@@ -295,11 +297,11 @@ def test_hairpin():
         print(f"  {status} {desc}")
     
     # Show random distribution
-    print("\n【统计】100个随机序列的分数分布:")
+    print("\n【统计】100个随机序列的分数分布 (stem method):")
     random.seed(42)
-    rand_scores = [calculate_hairpin_fast(''.join(random.choices('ATCG', k=81))) for _ in range(100)]
-    print(f"    范围: {min(rand_scores):.2f} - {max(rand_scores):.2f}")
-    print(f"    平均: {sum(rand_scores)/len(rand_scores):.2f}")
+    rand_scores = [calculate_hairpin_fast(''.join(random.choices('ATCG', k=81)), method="stem") for _ in range(100)]
+    print(f"    范围: {min(rand_scores):.0f} - {max(rand_scores):.0f}bp")
+    print(f"    平均: {sum(rand_scores)/len(rand_scores):.1f}bp")
     
     return all_passed
 

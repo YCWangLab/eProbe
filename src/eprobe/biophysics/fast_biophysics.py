@@ -314,34 +314,49 @@ def _find_best_local_match(seq: str, rev_comp: str, min_match: int = 4) -> Tuple
 
 def calculate_hairpin_fast(
     sequence: str,
-    method: str = "kmer",
+    method: str = "stem",
     match: int = 2,
     mismatch: int = -1,
     gap_open: int = 3,
     gap_extend: int = 1,
     kmer_size: int = 6,
+    min_loop: int = 3,
 ) -> float:
     """
     Calculate hairpin formation potential.
     
-    Two methods available:
-    - "kmer": Fast k-mer based detection (default, ~100x faster)
-    - "align": Full local alignment (more accurate but slower)
+    Three methods available:
+    - "stem": Max consecutive complementary stem length (default, recommended)
+    - "kmer": K-mer sharing + local match composite score (legacy)
+    - "align": Full local alignment (most accurate but slowest)
     
-    The k-mer method counts shared k-mers between sequence and its
-    reverse complement, then combines with longest consecutive match.
+    The "stem" method finds the longest consecutive run of base pairs
+    that could form a hairpin stem. This is biologically meaningful:
+    a score of 8 means the probe can form a hairpin with an 8bp stem.
+    
+    Expected scores for 81bp probes (stem method):
+    - Random DNA: 4-5 (baseline, harmless)
+    - Moderate hairpin (7bp stem): 7
+    - Strong hairpin (10+ bp stem): 10+
+    - Perfect inverted repeat: equals stem length
+    
+    The "kmer" method (legacy) produces inflated, hard-to-interpret scores
+    for long sequences (81bp random DNA scores ~66). Not recommended.
     
     Args:
         sequence: DNA sequence
-        method: "kmer" (fast) or "align" (accurate)
+        method: "stem" (default), "kmer" (legacy), or "align"
         match: Match score for alignment method
         mismatch: Mismatch penalty for alignment method
         gap_open: Gap opening penalty for alignment method
         gap_extend: Gap extension penalty for alignment method
         kmer_size: K-mer size for kmer method (default: 6)
+        min_loop: Minimum hairpin loop size for stem method (default: 3)
         
     Returns:
-        Hairpin score (higher = more likely to form hairpin)
+        Hairpin score (higher = more likely to form hairpin).
+        For "stem" method: max consecutive stem length in bp.
+        For "kmer"/"align": composite score (legacy).
     """
     if not sequence:
         raise ValueError("Empty sequence provided")
@@ -349,8 +364,48 @@ def calculate_hairpin_fast(
     seq = sequence.upper()
     rev_comp = _reverse_complement(seq)
     
-    if method == "kmer":
-        # Fast k-mer based method
+    if method == "stem":
+        # Biologically meaningful method: find longest consecutive
+        # complementary stem that could form a hairpin structure.
+        #
+        # A hairpin forms when a single-stranded DNA folds back on itself.
+        # At offset k, seq[i] aligns with rev_comp[k+i], meaning
+        # seq[i] is complementary to seq[n-1-k-i] in the original.
+        # The offset represents the approximate loop + stem region.
+        #
+        # Expected max stem for random DNA (p=0.25 per position):
+        #   - Single offset, L positions: ~log(L)/log(4) ≈ 3
+        #   - Max across ~n offsets: ~4-5 for 81bp sequences
+        n = len(seq)
+        if n < min_loop + 4:  # need at least min_loop + 2*2bp stem
+            return 0.0
+        
+        best_stem = 0
+        
+        for offset in range(min_loop, n - 3):
+            overlap_len = n - offset
+            if overlap_len < 4:
+                break
+            
+            current_run = 0
+            max_run = 0
+            
+            for i in range(overlap_len):
+                if seq[i] == rev_comp[offset + i]:
+                    current_run += 1
+                    if current_run > max_run:
+                        max_run = current_run
+                else:
+                    current_run = 0
+            
+            if max_run > best_stem:
+                best_stem = max_run
+        
+        return float(best_stem)
+    
+    elif method == "kmer":
+        # Legacy k-mer based method (NOT recommended for long sequences)
+        # Produces inflated scores: random 81bp DNA scores ~66
         if len(seq) < kmer_size * 2:
             return 0.0
         
@@ -395,12 +450,12 @@ def calculate_hairpin_fast(
             return float(max(a.score for a in alignments))
     
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'kmer' or 'align'.")
+        raise ValueError(f"Unknown method: {method}. Use 'stem', 'kmer', or 'align'.")
 
 
 def calculate_hairpin_batch_fast(
     sequences: List[str],
-    method: str = "kmer",
+    method: str = "stem",
     match: int = 2,
     mismatch: int = -1,
     gap_open: int = 3,
@@ -412,11 +467,11 @@ def calculate_hairpin_batch_fast(
     Calculate hairpin scores for multiple sequences.
     
     Uses threading for parallel computation when method="align".
-    The "kmer" method is already fast enough for single-threaded use.
+    The "stem" and "kmer" methods are already fast enough for single-threaded use.
     
     Args:
         sequences: List of DNA sequences
-        method: "kmer" (fast) or "align" (accurate)
+        method: "stem" (default), "kmer" (legacy), or "align"
         match: Match score for alignment method
         mismatch: Mismatch penalty for alignment method
         gap_open: Gap opening penalty for alignment method
@@ -427,7 +482,7 @@ def calculate_hairpin_batch_fast(
     Returns:
         List of hairpin scores
     """
-    if method == "kmer" or threads <= 1:
+    if method in ("stem", "kmer") or threads <= 1:
         return [calculate_hairpin_fast(seq, method, match, mismatch, gap_open, gap_extend, kmer_size) 
                 for seq in sequences]
     

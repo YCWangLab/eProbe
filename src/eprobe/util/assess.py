@@ -93,7 +93,7 @@ def assess_fasta(
         
         if "hairpin" in tags:
             try:
-                row["hairpin"] = round(calculate_hairpin_fast(seq_upper, method="kmer"), 2)
+                row["hairpin"] = round(calculate_hairpin_fast(seq_upper, method="stem"), 2)
             except Exception:
                 row["hairpin"] = None
         
@@ -160,7 +160,7 @@ def filter_fasta(
     # Stage 2: Hairpin (percentile)
     if stage1_passed:
         hairpin_scores = {
-            sid: calculate_hairpin_fast(seq.upper(), method="kmer")
+            sid: calculate_hairpin_fast(seq.upper(), method="stem")
             for sid, seq in stage1_passed.items()
         }
         
