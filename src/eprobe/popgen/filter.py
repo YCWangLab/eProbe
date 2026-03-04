@@ -1022,7 +1022,7 @@ def calculate_probe_stats_fast(probe_seq: str) -> Dict[str, float]:
         "gc": calculate_gc_fast(probe_seq),
         "tm": calculate_tm_fast(probe_seq),
         "complexity": calculate_dust_fast(probe_seq),
-        "hairpin": calculate_hairpin_fast(probe_seq, method="stem"),
+        "hairpin": calculate_hairpin_fast(probe_seq),
     }
 
 
@@ -1133,7 +1133,7 @@ def filter_biophysical(
     if use_hairpin:
         logger.info("Stage 2: Computing hairpin scores...")
         
-        hairpin_scores = [calculate_hairpin_fast(seq, method="stem") 
+        hairpin_scores = [calculate_hairpin_fast(seq) 
                          for seq in passed_stage1_seqs]
         
         # Determine threshold

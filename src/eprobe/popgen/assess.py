@@ -94,7 +94,7 @@ def assess_single_probe(
         result.complexity = calculate_dust_fast(sequence)
     
     if "hairpin" in tags:
-        result.hairpin = calculate_hairpin_fast(sequence, method="stem")
+        result.hairpin = calculate_hairpin_fast(sequence)
     
     if "entropy" in tags:
         result.entropy = calculate_entropy(sequence)

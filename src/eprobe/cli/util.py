@@ -1498,10 +1498,11 @@ def target(
 @click.option(
     "--hairpin",
     type=float,
-    default=3.0,
-    help="Max normalized hairpin score (default: 3.0). "
-         "Score = max_stem_bp / log4(probe_length). "
-         "Stable across lengths: random DNA ~ 1.8, real hairpin > 3.0.",
+    default=18.0,
+    help="Max normalized hairpin score (default: 18.0). "
+         "Uses exponential k-mer continuity scoring: max stem's consecutive "
+         "4-mer matches get 4^(n-1) bonus, normalized by log4(L). "
+         "Random DNA ~1-6, 6bp stem ~5, 7bp+ stem ≥18, 8bp stem ≥74.",
 )
 @click.option(
     "--dimer",

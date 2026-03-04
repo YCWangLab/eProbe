@@ -312,6 +312,198 @@ def _calculate_max_stem(seq: str, rev_comp: str, min_loop: int = 3) -> int:
     return best_stem
 
 
+# =============================================================================
+# Hairpin: Exponential Bonus Algorithm (k-mer + spatial continuity)
+# =============================================================================
+
+# 2-bit encoding lookup: A=00, C=01, G=10, T=11
+# Complement: XOR with 0b11 → A(00)↔T(11), C(01)↔G(10)
+_BASE_TO_2BIT = [4] * 256  # 4 = invalid sentinel
+_BASE_TO_2BIT[ord('A')] = 0b00
+_BASE_TO_2BIT[ord('a')] = 0b00
+_BASE_TO_2BIT[ord('C')] = 0b01
+_BASE_TO_2BIT[ord('c')] = 0b01
+_BASE_TO_2BIT[ord('G')] = 0b10
+_BASE_TO_2BIT[ord('g')] = 0b10
+_BASE_TO_2BIT[ord('T')] = 0b11
+_BASE_TO_2BIT[ord('t')] = 0b11
+
+
+def _rc_hash(h: int, k: int) -> int:
+    """
+    Compute reverse-complement k-mer hash via bit manipulation.
+    
+    Each base is 2-bit encoded. Complement = XOR 0b11 per base,
+    then reverse the order of 2-bit chunks.
+    
+    Time: O(k). Called once per k-mer position.
+    """
+    rc = 0
+    for _ in range(k):
+        rc = (rc << 2) | ((h & 0b11) ^ 0b11)
+        h >>= 2
+    return rc
+
+
+def _calculate_hairpin_exponential(
+    seq: str,
+    k: int = 4,
+    min_loop: int = 3,
+    base: float = 4.0,
+    early_stop_raw: float = None,
+) -> float:
+    """
+    Calculate hairpin raw score using exponential bonus for consecutive
+    k-mer reverse-complement matches — reports the MAXIMUM single-run
+    score across all potential stem positions.
+    
+    Algorithm overview:
+    ──────────────────
+    1. Encode the probe sequence as 2-bit integers (A=00, C=01, G=10, T=11).
+    2. Compute forward k-mer hashes using rolling bit-shift: O(L).
+    3. Compute reverse-complement hashes via XOR + bit reversal: O(L).
+    4. Build a hash→positions index for forward k-mers: O(L).
+    5. For each position j, look up rc_hash[j] in the forward index.
+       Each hit (i, j) means kmer[i] = revcomp(kmer[j]), indicating
+       a potential stem pairing. Group by anti-diagonal d = i + j
+       (consecutive stem extension keeps d constant): O(L + M).
+    6. For each anti-diagonal, find the longest consecutive run of
+       positions and apply exponential scoring: n consecutive → base^(n−1).
+       Report the MAXIMUM single-run score across all diagonals.
+    
+    Why MAX instead of SUM:
+    ───────────────────────
+    A probe is problematic if it contains even ONE strong stem. Summing
+    all matches (including scattered isolated ones) adds O(L²/4^k) noise
+    that grows quadratically with probe length. Reporting the MAX run
+    score captures only the strongest local structure — exactly what
+    determines thermodynamic stability of the worst-case hairpin fold.
+    
+    Scoring:
+    ────────
+    n consecutive k-mer matches → stem of (n + k − 1) bases → base^(n−1) points.
+    
+    - Stem 4bp (n=1) → 4^0 =     1
+    - Stem 5bp (n=2) → 4^1 =     4
+    - Stem 6bp (n=3) → 4^2 =    16
+    - Stem 7bp (n=4) → 4^3 =    64
+    - Stem 8bp (n=5) → 4^4 =   256
+    - Stem 10bp(n=7) → 4^6 = 4,096
+    
+    The exponential scaling ensures the score is DOMINATED by the longest
+    contiguous stem. A 7bp stem (score 64) dwarfs any background from
+    random 4-mer matches (score 1 each).
+    
+    Time complexity:
+    ────────────────
+    O(L + M), where L = sequence length, M = total k-mer matches.
+    For random DNA with k=4: M ≈ L²/256 ≈ 50 for 120bp probe.
+    Early stopping further reduces computation for bad probes.
+    
+    Args:
+        seq: DNA sequence (uppercase, no ambiguous bases expected)
+        k: k-mer size (default: 4, giving 256 possible k-mers)
+        min_loop: minimum loop size between stem arms (default: 3bp)
+        base: exponential base for consecutive bonus (default: 4.0)
+        early_stop_raw: if set, return immediately when max >= this value
+        
+    Returns:
+        Max exponential hairpin score (largest single stem contribution)
+    """
+    L = len(seq)
+    n_kmers = L - k + 1
+    
+    if n_kmers <= 0:
+        return 0.0
+    
+    # ─── Step 1: 2-bit encode ─────────────────────────────────────────
+    encoded = [_BASE_TO_2BIT[ord(c)] for c in seq]
+    
+    # ─── Step 2: Rolling forward k-mer hashes via bit-shift ──────────
+    mask = (1 << (2 * k)) - 1  # e.g. k=4 → 0xFF
+    fwd_hashes = [0] * n_kmers
+    
+    h = 0
+    for i in range(k):
+        h = (h << 2) | encoded[i]
+    fwd_hashes[0] = h & mask
+    
+    for i in range(1, n_kmers):
+        h = ((h << 2) | encoded[i + k - 1]) & mask
+        fwd_hashes[i] = h
+    
+    # ─── Step 3: Reverse-complement hashes ────────────────────────────
+    rc_hashes = [_rc_hash(fh, k) for fh in fwd_hashes]
+    
+    # ─── Step 4: Build forward position index ─────────────────────────
+    fwd_index: Dict[int, List[int]] = {}
+    for i, fh in enumerate(fwd_hashes):
+        if fh in fwd_index:
+            fwd_index[fh].append(i)
+        else:
+            fwd_index[fh] = [i]
+    
+    # ─── Step 5: Match k-mer pairs, group by anti-diagonal ───────────
+    #
+    # A hairpin stem pairs position i (5′ arm) with position j (3′ arm):
+    #   kmer[i] == revcomp(kmer[j])
+    # Consecutive stem extension: i→i+1, j→j−1, so d = i + j is constant.
+    #
+    # min_gap ensures stem arms don't overlap and loop is ≥ min_loop:
+    #   |i − j| ≥ k + min_loop
+    #
+    min_gap = k + min_loop
+    
+    diagonal_positions: Dict[int, List[int]] = {}
+    
+    for j in range(n_kmers):
+        rc_h = rc_hashes[j]
+        if rc_h not in fwd_index:
+            continue
+        for i in fwd_index[rc_h]:
+            if abs(i - j) >= min_gap:
+                d = i + j
+                if d in diagonal_positions:
+                    diagonal_positions[d].append(i)
+                else:
+                    diagonal_positions[d] = [i]
+    
+    # ─── Step 6: Find MAX run score across all diagonals ──────────────
+    #
+    # For each anti-diagonal (= one potential stem), find the longest
+    # consecutive run of k-mer matches and compute its exponential score.
+    # Return the MAXIMUM across all diagonals — this is the strongest
+    # potential hairpin stem in the probe.
+    #
+    max_run_score = 0.0
+    
+    for d in diagonal_positions:
+        # Deduplicate & sort (usually very short lists for real probes)
+        positions = sorted(set(diagonal_positions[d]))
+        
+        run_length = 1
+        for idx in range(1, len(positions)):
+            if positions[idx] == positions[idx - 1] + 1:
+                run_length += 1
+            else:
+                # Settle current run: n consecutive k-mer matches → base^(n−1)
+                run_score = base ** (run_length - 1)
+                if run_score > max_run_score:
+                    max_run_score = run_score
+                run_length = 1
+        
+        # Settle last run on this diagonal
+        run_score = base ** (run_length - 1)
+        if run_score > max_run_score:
+            max_run_score = run_score
+        
+        # Early stopping: if max is already above threshold, no need to check more
+        if early_stop_raw is not None and max_run_score >= early_stop_raw:
+            return max_run_score
+    
+    return max_run_score
+
+
 def _find_best_local_match(seq: str, rev_comp: str, min_match: int = 4) -> Tuple[int, int, int]:
     """
     Find the best local matching region between seq and its reverse complement.
@@ -359,95 +551,107 @@ def _find_best_local_match(seq: str, rev_comp: str, min_match: int = 4) -> Tuple
 
 def calculate_hairpin_fast(
     sequence: str,
-    method: str = "stem",
+    method: str = "exp",
     match: int = 2,
     mismatch: int = -1,
     gap_open: int = 3,
     gap_extend: int = 1,
     kmer_size: int = 6,
     min_loop: int = 3,
+    early_stop_raw: float = None,
 ) -> float:
     """
-    Calculate hairpin formation potential.
+    Calculate hairpin formation potential of a probe sequence.
     
-    Three methods available:
-    - "stem": Normalized max stem length (default, recommended)
+    Methods available:
+    - "exp": Exponential bonus for consecutive k-mer matches (default, recommended)
+    - "stem": Normalized max stem length (legacy simple method)
     - "kmer": K-mer sharing + local match composite score (legacy)
     - "align": Full local alignment (most accurate but slowest)
     
-    The "stem" method finds the longest consecutive complementary stem
-    and normalizes by log4(sequence_length). This makes the score
-    stable across different probe lengths:
+    The "exp" method (RECOMMENDED):
+    ───────────────────────────────
+    Scans all 4-mer reverse-complement matches across the probe, then
+    rewards spatially CONSECUTIVE matches exponentially (4^(n-1) for n
+    consecutive k-mer matches, corresponding to an (n+3)bp stem).
     
-    Expected scores (stem method, any probe length 40-200bp):
-    - Random DNA: ~1.8 (baseline, always similar)
-    - Moderate hairpin: ~2.5-3.0
-    - Strong hairpin: >3.0
-    - Perfect inverted repeat: >3.5
+    This captures the biophysics of hairpin stability: a continuous stem
+    has much higher binding energy than scattered random matches. The
+    exponential scoring ensures that even in long probes, a real stem
+    produces a score orders of magnitude above background noise.
     
-    Recommended threshold: 3.0 (filters probes with stems clearly
-    longer than expected by chance, works for any probe length).
+    Score interpretation (exp method):
+    - Random DNA: normalized ~1-6 (max chance stem rarely exceeds 6bp)
+    - 6bp stem: normalized ~5 (marginally stable, usually passes)
+    - 7bp stem: normalized ~18-22 (thermodynamically stable)
+    - 8bp+ stem: normalized ≥74 (always caught)
     
-    The "kmer" method (legacy) produces inflated, hard-to-interpret scores
-    for long sequences (81bp random DNA scores ~66). Not recommended.
+    Default threshold: 18.0 (normalized). This catches stems ≥ 7bp
+    (biologically stable hairpins) at probe lengths 40-120bp.
     
     Args:
         sequence: DNA sequence
-        method: "stem" (default), "kmer" (legacy), or "align"
+        method: "exp" (default), "stem" (legacy), "kmer" (legacy), or "align"
         match: Match score for alignment method
         mismatch: Mismatch penalty for alignment method
         gap_open: Gap opening penalty for alignment method
         gap_extend: Gap extension penalty for alignment method
         kmer_size: K-mer size for kmer method (default: 6)
-        min_loop: Minimum hairpin loop size for stem method (default: 3)
+        min_loop: Minimum hairpin loop size (default: 3)
+        early_stop_raw: For "exp" method: stop immediately when raw score
+                       exceeds this value (saves time on bad probes)
         
     Returns:
         Hairpin score (higher = more likely to form hairpin).
-        For "stem" method: normalized stem score (raw_stem / log4(L)).
+        For "exp": normalized score = raw_exponential / log4(L).
+        For "stem": normalized stem score = raw_stem / log4(L).
         For "kmer"/"align": composite score (legacy).
     """
     if not sequence:
         raise ValueError("Empty sequence provided")
     
     seq = sequence.upper()
-    rev_comp = _reverse_complement(seq)
     
-    if method == "stem":
-        # Biologically meaningful method: find longest consecutive
-        # complementary stem, normalized by log4(L) for length-independence.
-        # Random DNA ~ 1.8 at any probe length; real hairpin > 3.0.
-        import math
+    if method == "exp":
+        # Exponential bonus method: k-mer scan with spatial continuity weighting.
+        # Consecutive k-mer matches (stem structure) get exponential bonus:
+        #   n consecutive 4-mer matches → 4^(n-1) points
+        # Normalized by log4(L) for cross-length comparability.
+        raw = _calculate_hairpin_exponential(
+            seq, k=4, min_loop=min_loop, base=4.0,
+            early_stop_raw=early_stop_raw,
+        )
+        log4_len = math.log(len(seq), 4) if len(seq) > 1 else 1.0
+        return round(raw / log4_len, 2)
+    
+    elif method == "stem":
+        # Legacy simple method: max consecutive stem length / log4(L)
+        rev_comp = _reverse_complement(seq)
         raw_stem = _calculate_max_stem(seq, rev_comp, min_loop)
         log4_len = math.log(len(seq), 4) if len(seq) > 1 else 1.0
         return round(raw_stem / log4_len, 2)
     
     elif method == "kmer":
         # Legacy k-mer based method (NOT recommended for long sequences)
-        # Produces inflated scores: random 81bp DNA scores ~66
+        rev_comp = _reverse_complement(seq)
         if len(seq) < kmer_size * 2:
             return 0.0
         
-        # Extract k-mers from sequence
         seq_kmers = set(seq[i:i+kmer_size] for i in range(len(seq) - kmer_size + 1))
-        
-        # Extract k-mers from reverse complement
         rc_kmers = set(rev_comp[i:i+kmer_size] for i in range(len(rev_comp) - kmer_size + 1))
         
-        # Count shared k-mers
         shared = len(seq_kmers & rc_kmers)
         total = len(seq_kmers)
         
-        # Find longest consecutive match
         score, _, _ = _find_best_local_match(seq, rev_comp, min_match=kmer_size)
         
-        # Combine metrics: shared k-mer ratio + consecutive match score
         kmer_score = (shared / total * 50) if total > 0 else 0
         hairpin_score = kmer_score + score
         
         return round(hairpin_score, 2)
     
     elif method == "align":
-        # Full alignment method (original, slower)
+        rev_comp = _reverse_complement(seq)
         if HAS_PARASAIL:
             matrix = parasail.matrix_create("ACGTN", match, mismatch)
             result = parasail.sw_striped_16(seq, rev_comp, gap_open, gap_extend, matrix)
@@ -468,7 +672,7 @@ def calculate_hairpin_fast(
             return float(max(a.score for a in alignments))
     
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'stem', 'kmer', or 'align'.")
+        raise ValueError(f"Unknown method: {method}. Use 'exp', 'stem', 'kmer', or 'align'.")
 
 
 def calculate_hairpin_batch_fast(
