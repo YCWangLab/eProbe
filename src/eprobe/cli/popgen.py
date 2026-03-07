@@ -411,16 +411,18 @@ def extract(
     "--hairpin",
     type=float,
     default=18.0,
-    help="Maximum normalized hairpin score (default: 18.0). "
-         "Uses exponential k-mer continuity scoring: max stem's consecutive "
-         "4-mer matches get 4^(n-1) bonus, normalized by log4(L). "
-         "Random DNA ~1-6, 6bp stem ~5, 7bp+ stem ≥18, 8bp stem ≥74.",
+    help="Hairpin filter threshold (default: 18.0 absolute). "
+         ">=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
+         "Uses exponential k-mer continuity scoring: 4^(n-1) bonus, normalized by log4(L). "
+         "Random DNA ~1-6, 7bp stem ~18, 8bp stem ~74. Set 0 to disable.",
 )
 @click.option(
     "--dimer",
     type=float,
-    default=50.0,
-    help="Maximum dimer score (default: 50.0).",
+    default=0.95,
+    help="Dimer filter threshold (default: 0.95 = top 5%% removed). "
+         "Scores 1-to-many 11-mer sharing in the probe pool. "
+         ">=1: absolute; <1: percentile (e.g. 0.95 keeps 95%%). Set 0 to disable.",
 )
 @click.option(
     "--nn-table",
@@ -727,8 +729,24 @@ def filter(
         echo_info(f"    ├─ GC content failed: {bio_details.get('gc_failed', 0)}")
         echo_info(f"    ├─ Tm failed: {bio_details.get('tm_failed', 0)}")
         echo_info(f"    ├─ Complexity failed: {bio_details.get('complexity_failed', 0)}")
-        echo_info(f"    ├─ Hairpin failed: {bio_details.get('hairpin_failed', 0)}")
-        echo_info(f"    ├─ Dimer failed: {bio_details.get('dimer_failed', 0)}")
+        # Hairpin with distribution stats
+        hp_stats = bio_details.get('hairpin_stats', {})
+        hp_failed = bio_details.get('hairpin_failed', 0)
+        if hp_stats:
+            echo_info(f"    ├─ Hairpin failed: {hp_failed} "
+                     f"(threshold={hp_stats['threshold']}, {hp_stats['mode']}, "
+                     f"median={hp_stats['median']}, P95={hp_stats['p95']})")
+        else:
+            echo_info(f"    ├─ Hairpin failed: {hp_failed}")
+        # Dimer with distribution stats
+        dm_stats = bio_details.get('dimer_stats', {})
+        dm_failed = bio_details.get('dimer_failed', 0)
+        if dm_stats:
+            echo_info(f"    ├─ Dimer failed: {dm_failed} "
+                     f"(threshold={dm_stats['threshold']}, {dm_stats['mode']}, "
+                     f"mean={dm_stats['mean']}, P95={dm_stats['p95']}, max={dm_stats['max']})")
+        else:
+            echo_info(f"    ├─ Dimer failed: {dm_failed}")
         echo_info(f"    └─ Passed: {stats.get('biophysical_remaining', final)} SNPs")
     
     # Step 3: Output

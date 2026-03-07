@@ -56,34 +56,35 @@ class BiophysicalThresholds:
     """
     Thresholds for biophysical filtering.
     
+    Dual-mode threshold interpretation (applies to hairpin and dimer):
+    - Value >= 1.0: absolute threshold (remove probes with score > value)
+    - Value 0 < x < 1.0: percentile mode (e.g. 0.95 → keep 95%, remove top 5%)
+    - Value == 0: skip this filter
+    
     Attributes:
         gc_min/gc_max: GC content range (default: 35-65%)
         tm_min/tm_max: Melting temperature range (default: 55-75°C)
         complexity_max: Maximum DUST complexity score (default: 2.0)
-        hairpin_percentile: Keep top N% by hairpin score (default: 90%)
-        hairpin_max: Or use absolute hairpin threshold (stem method: max stem bp)
-        dimer_percentile: Keep top N% by dimer score (default: 90%)
-        dimer_max: Or use absolute dimer threshold
+        hairpin: Hairpin threshold (default: 18.0 absolute).
+            Uses exponential k-mer continuity scoring (see calculate_hairpin_fast).
+            >=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%)
+        dimer: Dimer threshold (default: 0.95 percentile → remove top 5%).
+            Scores 1-to-many k-mer sharing in the probe pool.
+            >=1: absolute score threshold; <1: percentile
         nn_table: NN parameter table for Tm calculation. Options:
             DNA/DNA: "DNA_NN1" to "DNA_NN4" (default: "DNA_NN4")
             RNA/DNA: "R_DNA_NN1" to "R_DNA_NN4"
         na_conc: Na+ concentration in mM (default: 50)
-    
-    Hairpin scoring uses the "stem" method: max consecutive complementary
-    stem length in bp. Random 81bp DNA: ~4-5bp; real hairpin: 8+ bp.
-    Default threshold of 8 means reject probes with >=8bp hairpin stems.
     """
     gc_min: float = 35.0
     gc_max: float = 65.0
     tm_min: float = 55.0
     tm_max: float = 75.0
     complexity_max: float = 2.0
-    # Hairpin: use percentile or absolute threshold
-    hairpin_percentile: Optional[float] = 90.0  # Keep top 90% (filter worst 10%)
-    hairpin_max: Optional[float] = None         # Or use absolute threshold
-    # Dimer: use percentile or absolute threshold
-    dimer_percentile: Optional[float] = 90.0    # Keep top 90% (filter worst 10%)
-    dimer_max: Optional[float] = None           # Or use absolute threshold
+    # Hairpin: >=1 absolute, 0<x<1 percentile, 0 skip
+    hairpin: float = 18.0
+    # Dimer: >=1 absolute, 0<x<1 percentile, 0 skip
+    dimer: float = 0.95
     # Tm calculation parameters
     nn_table: str = "DNA_NN4"  # SantaLucia 1998, most widely used
     na_conc: float = 50.0      # mM Na+ concentration
@@ -98,6 +99,44 @@ class FilterConfig:
     tx_db: Optional[Path] = None
     tx_ids: Optional[List[int]] = None
     biophysical: BiophysicalThresholds = field(default_factory=BiophysicalThresholds)
+
+
+def _resolve_threshold(
+    value: float,
+    scores: List[float],
+) -> Optional[float]:
+    """
+    Interpret a dual-mode threshold value.
+    
+    Args:
+        value: Threshold specification:
+            0       → None (skip filter)
+            0<x<1   → percentile mode (e.g. 0.95 → 95th percentile)
+            >=1     → absolute threshold
+        scores: List of all scores (needed for percentile calculation)
+        
+    Returns:
+        Resolved threshold value, or None if filter should be skipped
+    """
+    if value <= 0:
+        return None
+    elif value < 1.0:
+        percentile = value * 100  # 0.95 → 95
+        return calculate_percentile_threshold(
+            scores, percentile, higher_is_worse=True
+        )
+    else:
+        return value
+
+
+def _threshold_mode_label(value: float) -> str:
+    """Return a human-readable label for the threshold mode."""
+    if value <= 0:
+        return "disabled"
+    elif value < 1.0:
+        return f"percentile({value * 100:.0f}%)"
+    else:
+        return f"absolute(>{value})"
     threads: int = 1
 
 
@@ -1125,10 +1164,9 @@ def filter_biophysical(
         return Ok(([], filter_stats))
     
     # =========================================================================
-    # Stage 2: Hairpin filter (percentile-based)
+    # Stage 2: Hairpin filter (dual-mode: absolute or percentile)
     # =========================================================================
-    use_hairpin = (thresholds.hairpin_percentile is not None or 
-                   thresholds.hairpin_max is not None)
+    use_hairpin = thresholds.hairpin > 0
     
     if use_hairpin:
         logger.info("Stage 2: Computing hairpin scores...")
@@ -1136,19 +1174,24 @@ def filter_biophysical(
         hairpin_scores = [calculate_hairpin_fast(seq) 
                          for seq in passed_stage1_seqs]
         
-        # Determine threshold
-        if thresholds.hairpin_max is not None:
-            hairpin_threshold = thresholds.hairpin_max
-        else:
-            # Use percentile: higher percentile = more permissive
-            hairpin_threshold = calculate_percentile_threshold(
-                hairpin_scores, 
-                thresholds.hairpin_percentile,
-                higher_is_worse=True
-            )
+        # Resolve threshold via dual-mode interpretation
+        hairpin_threshold = _resolve_threshold(thresholds.hairpin, hairpin_scores)
+        mode_label = _threshold_mode_label(thresholds.hairpin)
         
-        logger.info(f"Hairpin threshold: {hairpin_threshold:.2f} "
-                    f"({'absolute' if thresholds.hairpin_max is not None else f'percentile: {thresholds.hairpin_percentile}%'})")
+        logger.info(f"Hairpin threshold: {hairpin_threshold:.2f} ({mode_label})")
+        
+        # Store distribution stats
+        if hairpin_scores:
+            sorted_hp = sorted(hairpin_scores)
+            n_hp = len(sorted_hp)
+            filter_stats["hairpin_stats"] = {
+                "mean": round(sum(sorted_hp) / n_hp, 2),
+                "median": round(sorted_hp[n_hp // 2], 2),
+                "p95": round(sorted_hp[min(int(n_hp * 0.95), n_hp - 1)], 2),
+                "max": round(sorted_hp[-1], 2),
+                "threshold": round(hairpin_threshold, 2),
+                "mode": mode_label,
+            }
         
         passed_stage2 = []
         passed_stage2_seqs = []
@@ -1170,33 +1213,50 @@ def filter_biophysical(
         return Ok(([], filter_stats))
     
     # =========================================================================
-    # Stage 3: Dimer filter (percentile-based, requires global k-mer index)
+    # Stage 3: Dimer filter (dual-mode: absolute or percentile)
+    #
+    # Dimer score = how much one probe shares 11-mer content with the entire
+    # pool (1-to-many). High scores mean this probe is likely to form dimers
+    # with many other probes, reducing capture efficiency.
+    # Default: percentile-based (0.95 → remove worst 5%) because the
+    # absolute score distribution depends on pool size and composition.
     # =========================================================================
-    use_dimer = (thresholds.dimer_percentile is not None or 
-                 thresholds.dimer_max is not None)
+    use_dimer = thresholds.dimer > 0
     
     if use_dimer:
-        logger.info("Stage 3: Computing dimer scores...")
+        logger.info("Stage 3: Computing dimer scores (1-to-many k-mer sharing)...")
         
         # Build k-mer index from all passed sequences
         dimer_calc = DimerCalculatorFast(k=11, include_revcomp=True)
         n_kmers = dimer_calc.build_index(passed_stage2_seqs)
-        logger.info(f"Built dimer index with {n_kmers} unique k-mers")
+        logger.info(f"Built dimer index: {n_kmers} unique 11-mers from "
+                    f"{len(passed_stage2_seqs)} probes")
         
         dimer_scores = dimer_calc.calculate_all_scores()
         
-        # Determine threshold
-        if thresholds.dimer_max is not None:
-            dimer_threshold = thresholds.dimer_max
-        else:
-            dimer_threshold = calculate_percentile_threshold(
-                dimer_scores,
-                thresholds.dimer_percentile,
-                higher_is_worse=True
-            )
+        # Resolve threshold via dual-mode interpretation
+        dimer_threshold = _resolve_threshold(thresholds.dimer, dimer_scores)
+        mode_label = _threshold_mode_label(thresholds.dimer)
         
-        logger.info(f"Dimer threshold: {dimer_threshold:.4f} "
-                    f"(percentile: {thresholds.dimer_percentile}%)")
+        # Store distribution stats
+        if dimer_scores:
+            sorted_ds = sorted(dimer_scores)
+            n_ds = len(sorted_ds)
+            filter_stats["dimer_stats"] = {
+                "mean": round(sum(sorted_ds) / n_ds, 4),
+                "median": round(sorted_ds[n_ds // 2], 4),
+                "p95": round(sorted_ds[min(int(n_ds * 0.95), n_ds - 1)], 4),
+                "max": round(sorted_ds[-1], 4),
+                "threshold": round(dimer_threshold, 4),
+                "mode": mode_label,
+            }
+        
+        logger.info(f"Dimer threshold: {dimer_threshold:.4f} ({mode_label})")
+        if dimer_scores:
+            logger.info(f"Dimer distribution: mean={filter_stats['dimer_stats']['mean']}, "
+                       f"median={filter_stats['dimer_stats']['median']}, "
+                       f"P95={filter_stats['dimer_stats']['p95']}, "
+                       f"max={filter_stats['dimer_stats']['max']}")
         
         passed_stage3 = []
         
@@ -2675,8 +2735,8 @@ def run_filter(
                 tm_min=tm_range[0],
                 tm_max=tm_range[1],
                 complexity_max=max_complexity,
-                hairpin_max=max_hairpin,
-                dimer_max=max_dimer,
+                hairpin=max_hairpin if max_hairpin is not None else 18.0,
+                dimer=max_dimer if max_dimer is not None else 0.95,
                 nn_table=nn_table,
                 na_conc=na_conc,
             )

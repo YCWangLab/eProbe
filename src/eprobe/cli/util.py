@@ -946,12 +946,14 @@ def rename(
     help="Max DUST complexity (filter mode, default: 2.0).",
 )
 @click.option(
-    "--hairpin_percentile", default=90.0, type=float,
-    help="Hairpin percentile cutoff (filter mode, default: 90).",
+    "--hairpin", default=18.0, type=float,
+    help="Hairpin threshold (filter mode, default: 18.0 absolute). "
+         ">=1: absolute; <1: percentile (e.g. 0.95 keeps 95%%). Set 0 to disable.",
 )
 @click.option(
-    "--dimer_percentile", default=90.0, type=float,
-    help="Dimer percentile cutoff (filter mode, default: 90).",
+    "--dimer", default=0.95, type=float,
+    help="Dimer threshold (filter mode, default: 0.95 = top 5%% removed). "
+         ">=1: absolute; <1: percentile. Set 0 to disable.",
 )
 @click.option(
     "--no_plots",
@@ -971,8 +973,8 @@ def assess(
     tm_min: float,
     tm_max: float,
     complexity_max: float,
-    hairpin_percentile: float,
-    dimer_percentile: float,
+    hairpin: float,
+    dimer: float,
     no_plots: bool,
 ) -> None:
     """
@@ -1026,8 +1028,8 @@ def assess(
         tm_min=tm_min,
         tm_max=tm_max,
         complexity_max=complexity_max,
-        hairpin_percentile=hairpin_percentile,
-        dimer_percentile=dimer_percentile,
+        hairpin=hairpin,
+        dimer=dimer,
         generate_plots=not no_plots,
         verbose=verbose,
     )
@@ -1499,16 +1501,16 @@ def target(
     "--hairpin",
     type=float,
     default=18.0,
-    help="Max normalized hairpin score (default: 18.0). "
-         "Uses exponential k-mer continuity scoring: max stem's consecutive "
-         "4-mer matches get 4^(n-1) bonus, normalized by log4(L). "
-         "Random DNA ~1-6, 6bp stem ~5, 7bp+ stem ≥18, 8bp stem ≥74.",
+    help="Hairpin filter threshold (default: 18.0 absolute). "
+         ">=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
+         "Uses exponential k-mer continuity scoring. Set 0 to disable.",
 )
 @click.option(
     "--dimer",
     type=float,
-    default=50.0,
-    help="Max dimer score (default: 50.0).",
+    default=0.95,
+    help="Dimer filter threshold (default: 0.95 = top 5%% removed). "
+         ">=1: absolute; <1: percentile. Set 0 to disable.",
 )
 @click.option(
     "--nn-table",

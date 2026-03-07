@@ -133,8 +133,8 @@ def test_filter_biophysical():
     print(f"GC: {thresholds.gc_min}-{thresholds.gc_max}%")
     print(f"Tm: {thresholds.tm_min}-{thresholds.tm_max}°C")
     print(f"DUST: ≤{thresholds.complexity_max}")
-    print(f"Hairpin percentile: {thresholds.hairpin_percentile}%")
-    print(f"Dimer percentile: {thresholds.dimer_percentile}%")
+    print(f"Hairpin: {thresholds.hairpin}")
+    print(f"Dimer: {thresholds.dimer}")
     
     result = filter_biophysical(snps, thresholds, probe_sequences)
     
@@ -165,8 +165,8 @@ def test_filter_biophysical():
         tm_min=60.0,
         tm_max=80.0,
         complexity_max=1.0,
-        hairpin_percentile=None,  # Disable hairpin filter
-        dimer_percentile=None,    # Disable dimer filter
+        hairpin=0,  # Disable hairpin filter
+        dimer=0,    # Disable dimer filter
     )
     
     result = filter_biophysical(snps, strict_thresholds, probe_sequences)
@@ -200,8 +200,8 @@ def test_filter_biophysical():
         tm_min=0.0,
         tm_max=200.0,
         complexity_max=100.0,
-        hairpin_percentile=None,
-        dimer_percentile=None,
+        hairpin=0,
+        dimer=0,
     )
     
     result = filter_biophysical(snps, gc_only, probe_sequences)

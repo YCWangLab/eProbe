@@ -31,16 +31,38 @@ logger = logging.getLogger(__name__)
 AVAILABLE_TAGS = ["gc", "tm", "complexity", "hairpin", "dimer"]
 
 
+def _resolve_threshold_assess(value: float, scores: list) -> float:
+    """
+    Interpret dual-mode threshold: >=1 absolute, 0<x<1 percentile, 0 skip.
+    
+    Returns float('inf') if value <= 0 (effectively disabling the filter).
+    """
+    if value <= 0:
+        return float('inf')
+    elif value < 1.0:
+        return calculate_percentile_threshold(
+            scores, value * 100, higher_is_worse=True
+        )
+    else:
+        return value
+
+
 @dataclass
 class FilterThresholds:
-    """Biophysical filtering thresholds."""
+    """Biophysical filtering thresholds.
+    
+    Dual-mode for hairpin/dimer:
+    - >=1: absolute threshold
+    - 0<x<1: percentile (e.g. 0.95 keeps 95%)
+    - 0: skip filter
+    """
     gc_min: float = 35.0
     gc_max: float = 65.0
     tm_min: float = 55.0
     tm_max: float = 75.0
     complexity_max: float = 2.0
-    hairpin_percentile: float = 90.0
-    dimer_percentile: float = 90.0
+    hairpin: float = 18.0
+    dimer: float = 0.95
 
 
 def assess_fasta(
@@ -157,17 +179,15 @@ def filter_fasta(
             failed[sid] = seq
             continue
     
-    # Stage 2: Hairpin (percentile)
-    if stage1_passed:
+    # Stage 2: Hairpin (dual-mode)
+    if stage1_passed and thresholds.hairpin > 0:
         hairpin_scores = {
             sid: calculate_hairpin_fast(seq.upper())
             for sid, seq in stage1_passed.items()
         }
         
-        threshold = calculate_percentile_threshold(
-            list(hairpin_scores.values()),
-            thresholds.hairpin_percentile,
-            higher_is_worse=True,
+        threshold = _resolve_threshold_assess(
+            thresholds.hairpin, list(hairpin_scores.values())
         )
         
         stage2_passed: Dict[str, str] = OrderedDict()
@@ -178,10 +198,10 @@ def filter_fasta(
                 stats["hairpin_failed"] += 1
                 failed[sid] = seq
     else:
-        stage2_passed = OrderedDict()
+        stage2_passed = stage1_passed
     
-    # Stage 3: Dimer (percentile)
-    if len(stage2_passed) > 1:
+    # Stage 3: Dimer (dual-mode)
+    if len(stage2_passed) > 1 and thresholds.dimer > 0:
         calc = DimerCalculatorFast(k=11, include_revcomp=True)
         seq_list = list(stage2_passed.values())
         calc.build_index(seq_list)
@@ -190,10 +210,8 @@ def filter_fasta(
         ids = list(stage2_passed.keys())
         dimer_scores = dict(zip(ids, dimer_scores_list))
         
-        threshold = calculate_percentile_threshold(
-            dimer_scores_list,
-            thresholds.dimer_percentile,
-            higher_is_worse=True,
+        threshold = _resolve_threshold_assess(
+            thresholds.dimer, dimer_scores_list
         )
         
         for sid, seq in stage2_passed.items():
@@ -260,8 +278,8 @@ def run_assess(
     tm_min: float = 55.0,
     tm_max: float = 75.0,
     complexity_max: float = 2.0,
-    hairpin_percentile: float = 90.0,
-    dimer_percentile: float = 90.0,
+    hairpin: float = 18.0,
+    dimer: float = 0.95,
     generate_plots: bool = True,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
@@ -280,8 +298,8 @@ def run_assess(
         gc_min/gc_max: GC range (for filter mode)
         tm_min/tm_max: Tm range (for filter mode)
         complexity_max: DUST max (for filter mode)
-        hairpin_percentile: Hairpin threshold percentile
-        dimer_percentile: Dimer threshold percentile
+        hairpin: Hairpin threshold (>=1 absolute, <1 percentile)
+        dimer: Dimer threshold (>=1 absolute, <1 percentile)
         generate_plots: Generate distribution plots
         verbose: Verbose logging
     """
@@ -356,8 +374,8 @@ def run_assess(
             gc_min=gc_min, gc_max=gc_max,
             tm_min=tm_min, tm_max=tm_max,
             complexity_max=complexity_max,
-            hairpin_percentile=hairpin_percentile,
-            dimer_percentile=dimer_percentile,
+            hairpin=hairpin,
+            dimer=dimer,
         )
         
         logger.info(
