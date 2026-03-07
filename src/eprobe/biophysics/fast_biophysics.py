@@ -862,6 +862,166 @@ def calculate_dimer_batch_fast(
 
 
 # =============================================================================
+# Smart Dimer Filter - Graph-Based Deduplication
+# =============================================================================
+
+class SmartDimerFilter:
+    """
+    Graph-based dimer filter: identifies groups of complementary probes
+    and keeps only the best probe from each dimer-risk group.
+    
+    Instead of removing all probes above a score threshold, this approach:
+    1. Builds a canonical k-mer index (canonical = min(kmer, rc(kmer)))
+    2. Finds probe pairs sharing significant k-mer content (potential dimers)
+    3. Groups connected probes via Union-Find
+    4. Keeps one representative (the least-connected) from each group
+    
+    This maximizes retained probe count while eliminating dimer risk clusters.
+    
+    Args:
+        k: K-mer size for fingerprinting (default: 11)
+        min_shared_fraction: Minimum fraction of shared canonical k-mers
+            to consider two probes "dimer partners" (default: 0.15 = 15%).
+            For 81bp probes with ~60 unique canonical 11-mers, 0.15 means
+            ~9 shared k-mers ≈ a 19bp complementary stretch.
+        max_kmer_freq: Skip canonical k-mers appearing in more probes than
+            this (likely repetitive, not informative). Default: 100.
+    """
+    
+    def __init__(self, k: int = 11, min_shared_fraction: float = 0.15,
+                 max_kmer_freq: int = 100):
+        self.k = k
+        self.min_shared_fraction = min_shared_fraction
+        self.max_kmer_freq = max_kmer_freq
+    
+    def filter(self, sequences: List[str]) -> Tuple[List[int], Dict]:
+        """
+        Identify dimer-risk groups and return indices of probes to keep.
+        
+        Args:
+            sequences: List of probe sequences
+            
+        Returns:
+            Tuple of:
+            - Sorted list of indices to keep
+            - Stats dict with dimer group information
+        """
+        from collections import defaultdict
+        
+        n = len(sequences)
+        if n == 0:
+            return [], {
+                "dimer_failed": 0, "dimer_groups": 0,
+                "dimer_edges": 0, "max_group_size": 0,
+                "mean_group_size": 0,
+                "mode": f"smart(k={self.k}, shared≥{self.min_shared_fraction:.0%})",
+            }
+        
+        # Step 1: Build canonical k-mer inverted index
+        # canonical(K) = min(K, rc(K)) — groups forward and RC together
+        kmer_to_probes: Dict[str, set] = defaultdict(set)
+        probe_n_kmers: List[int] = []  # unique canonical k-mers per probe
+        
+        for i, seq in enumerate(sequences):
+            seq_upper = seq.upper()
+            seen: set = set()
+            for j in range(len(seq_upper) - self.k + 1):
+                kmer = seq_upper[j:j + self.k]
+                if 'N' in kmer:
+                    continue
+                rc = _reverse_complement(kmer)
+                canonical = kmer if kmer <= rc else rc
+                if canonical not in seen:
+                    kmer_to_probes[canonical].add(i)
+                    seen.add(canonical)
+            probe_n_kmers.append(max(len(seen), 1))
+        
+        # Step 2: Count pairwise shared canonical k-mers
+        pair_sharing: Counter = Counter()
+        
+        for _kmer, probe_set in kmer_to_probes.items():
+            ps = len(probe_set)
+            if ps < 2 or ps > self.max_kmer_freq:
+                continue
+            probes = sorted(probe_set)
+            for a_idx in range(ps):
+                for b_idx in range(a_idx + 1, ps):
+                    pair_sharing[(probes[a_idx], probes[b_idx])] += 1
+        
+        # Step 3: Build adjacency from significant pairs
+        adj: Dict[int, set] = defaultdict(set)
+        n_edges = 0
+        
+        for (i, j), count in pair_sharing.items():
+            frac = count / min(probe_n_kmers[i], probe_n_kmers[j])
+            if frac >= self.min_shared_fraction:
+                adj[i].add(j)
+                adj[j].add(i)
+                n_edges += 1
+        
+        # Free memory — pair_sharing can be large
+        del pair_sharing
+        
+        # Step 4: Union-Find for connected components
+        parent = list(range(n))
+        uf_rank = [0] * n
+        
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]  # path compression
+                x = parent[x]
+            return x
+        
+        def union(x: int, y: int) -> None:
+            px, py = find(x), find(y)
+            if px == py:
+                return
+            if uf_rank[px] < uf_rank[py]:
+                px, py = py, px
+            parent[py] = px
+            if uf_rank[px] == uf_rank[py]:
+                uf_rank[px] += 1
+        
+        for i, neighbors in adj.items():
+            for j in neighbors:
+                union(i, j)
+        
+        # Step 5: Group by connected component
+        components: Dict[int, List[int]] = defaultdict(list)
+        for i in range(n):
+            components[find(i)].append(i)
+        
+        # Step 6: Keep best from each group
+        # "Best" = fewest dimer edges (least cross-hybridization risk)
+        keep_indices: set = set()
+        n_groups = 0
+        group_sizes: List[int] = []
+        
+        for _root, members in components.items():
+            if len(members) == 1:
+                keep_indices.add(members[0])
+            else:
+                n_groups += 1
+                group_sizes.append(len(members))
+                best = min(members, key=lambda idx: len(adj.get(idx, set())))
+                keep_indices.add(best)
+        
+        keep_sorted = sorted(keep_indices)
+        n_removed = n - len(keep_sorted)
+        
+        stats = {
+            "dimer_failed": n_removed,
+            "dimer_groups": n_groups,
+            "dimer_edges": n_edges,
+            "max_group_size": max(group_sizes) if group_sizes else 0,
+            "mean_group_size": round(sum(group_sizes) / len(group_sizes), 1) if group_sizes else 0,
+            "mode": f"smart(k={self.k}, shared≥{self.min_shared_fraction:.0%})",
+        }
+        
+        return keep_sorted, stats
+
+
+# =============================================================================
 # Unified Batch Calculator
 # =============================================================================
 

@@ -930,30 +930,31 @@ def rename(
     help="Tags to compute (comma-separated: gc,tm,complexity,hairpin,dimer).",
 )
 @click.option(
-    "--gc_min", default=35.0, type=float, help="Min GC%% (filter mode, default: 35).",
+    "--gc_min", default=35.0, type=float, help="Min GC%% (filter mode, default: 35). Set -1 to disable GC.",
 )
 @click.option(
-    "--gc_max", default=65.0, type=float, help="Max GC%% (filter mode, default: 65).",
+    "--gc_max", default=65.0, type=float, help="Max GC%% (filter mode, default: 65). Set -1 to disable GC.",
 )
 @click.option(
-    "--tm_min", default=55.0, type=float, help="Min Tm (filter mode, default: 55).",
+    "--tm_min", default=55.0, type=float, help="Min Tm (filter mode, default: 55). Set -1 to disable Tm.",
 )
 @click.option(
-    "--tm_max", default=75.0, type=float, help="Max Tm (filter mode, default: 75).",
+    "--tm_max", default=75.0, type=float, help="Max Tm (filter mode, default: 75). Set -1 to disable Tm.",
 )
 @click.option(
     "--complexity_max", default=2.0, type=float,
-    help="Max DUST complexity (filter mode, default: 2.0).",
+    help="Max DUST complexity (filter mode, default: 2.0). Set -1 to disable.",
 )
 @click.option(
     "--hairpin", default=0.95, type=float,
     help="Hairpin threshold (filter mode, default: 0.95 = top 5%% removed). "
-         ">=1: absolute; <1: percentile (e.g. 0.95 keeps 95%%). Set 0 to disable.",
+         ">=1: absolute; <1: percentile (e.g. 0.95 keeps 95%%). Set -1 to disable.",
 )
 @click.option(
-    "--dimer", default=0.95, type=float,
-    help="Dimer threshold (filter mode, default: 0.95 = top 5%% removed). "
-         ">=1: absolute; <1: percentile. Set 0 to disable.",
+    "--dimer", default=0.15, type=float,
+    help="Smart dimer filter sensitivity (default: 0.15). "
+         "Graph-based: identifies cross-hybridizing groups, keeps one per group. "
+         "Value = min fraction of shared k-mers for dimer edge. Set -1 to disable.",
 )
 @click.option(
     "--no_plots",
@@ -1483,19 +1484,19 @@ def target(
     "--gc",
     type=str,
     default="35,65",
-    help="GC content range (min,max, default: 35,65).",
+    help="GC content range (min,max, default: 35,65). Set -1 to disable.",
 )
 @click.option(
     "--tm",
     type=str,
     default="65,85",
-    help="Melting temperature range (min,max, default: 65,85).",
+    help="Melting temperature range (min,max, default: 65,85). Set -1 to disable.",
 )
 @click.option(
     "--complexity",
     type=float,
     default=2.0,
-    help="Max DUST complexity score (default: 2.0).",
+    help="Max DUST complexity score (default: 2.0). Set -1 to disable.",
 )
 @click.option(
     "--hairpin",
@@ -1503,14 +1504,15 @@ def target(
     default=0.95,
     help="Hairpin filter threshold (default: 0.95 = top 5%% removed). "
          ">=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
-         "Uses exponential k-mer continuity scoring. Set 0 to disable.",
+         "Uses exponential k-mer continuity scoring. Set -1 to disable.",
 )
 @click.option(
     "--dimer",
     type=float,
-    default=0.95,
-    help="Dimer filter threshold (default: 0.95 = top 5%% removed). "
-         ">=1: absolute; <1: percentile. Set 0 to disable.",
+    default=0.15,
+    help="Smart dimer filter sensitivity (default: 0.15). "
+         "Graph-based: identifies cross-hybridizing groups, keeps one per group. "
+         "Value = min fraction of shared k-mers for dimer edge. Set -1 to disable.",
 )
 @click.option(
     "--nn-table",
@@ -1594,9 +1596,16 @@ def filter_cmd(
 
     verbose = ctx.obj.get("verbose", False)
 
-    # Parse ranges
-    gc_min, gc_max = map(float, gc.split(","))
-    tm_min, tm_max = map(float, tm.split(","))
+    # Parse ranges (support -1 to disable)
+    if gc.strip() == "-1":
+        gc_min, gc_max = -1.0, -1.0
+    else:
+        gc_min, gc_max = map(float, gc.split(","))
+    
+    if tm.strip() == "-1":
+        tm_min, tm_max = -1.0, -1.0
+    else:
+        tm_min, tm_max = map(float, tm.split(","))
 
     # Parse target taxonomy IDs
     tx_ids = None

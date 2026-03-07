@@ -56,33 +56,39 @@ class BiophysicalThresholds:
     """
     Thresholds for biophysical filtering.
     
-    Dual-mode threshold interpretation (applies to hairpin and dimer):
+    Universal disable sentinel: set any parameter to -1 to skip that filter.
+    
+    Hairpin dual-mode threshold:
     - Value >= 1.0: absolute threshold (remove probes with score > value)
     - Value 0 < x < 1.0: percentile mode (e.g. 0.95 → keep 95%, remove top 5%)
-    - Value == 0: skip this filter
+    - Value <= 0: skip hairpin filter
+    
+    Dimer smart filter:
+    - Value > 0: min canonical k-mer sharing fraction to form dimer edge.
+      Graph-based approach identifies groups of cross-hybridizing probes
+      and keeps only one representative per group. (default: 0.15 = 15%)
+    - Value <= 0: skip dimer filter
     
     Attributes:
-        gc_min/gc_max: GC content range (default: 35-65%)
-        tm_min/tm_max: Melting temperature range (default: 55-75°C)
-        complexity_max: Maximum DUST complexity score (default: 2.0)
-        hairpin: Hairpin threshold (default: 0.95 percentile mode).
-            Uses exponential k-mer continuity scoring.
-        dimer: Dimer threshold (default: 0.95 percentile mode).
-            Scores 1-to-many k-mer sharing in the probe pool.
-        nn_table: NN parameter table for Tm calculation. Options:
-            DNA/DNA: "DNA_NN1" to "DNA_NN4" (default: "DNA_NN4")
-            RNA/DNA: "R_DNA_NN1" to "R_DNA_NN4"
-        na_conc: Na+ concentration in mM (default: 50)
+        gc_min/gc_max: GC content range (default: 35-65%). Set -1 to disable.
+        tm_min/tm_max: Melting temp range (default: 55-75°C). Set -1 to disable.
+        complexity_max: Max DUST complexity score (default: 2.0). Set -1 to disable.
+        hairpin: Hairpin threshold (default: 0.95 percentile). Set -1 to disable.
+        dimer: Smart dimer sensitivity (default: 0.15 = 15% k-mer sharing).
+            Lower = more sensitive (more groups detected, more removed).
+            Higher = more conservative. Set -1 to disable.
+        nn_table: NN parameter table for Tm. Default: DNA_NN4 (SantaLucia 1998).
+        na_conc: Na+ concentration in mM (default: 50).
     """
     gc_min: float = 35.0
     gc_max: float = 65.0
     tm_min: float = 55.0
     tm_max: float = 75.0
     complexity_max: float = 2.0
-    # Hairpin: >=1 absolute, 0<x<1 percentile, 0 skip
+    # Hairpin: >=1 absolute, 0<x<1 percentile, <=0 skip
     hairpin: float = 0.95
-    # Dimer: >=1 absolute, 0<x<1 percentile, 0 skip
-    dimer: float = 0.95
+    # Dimer: >0 smart filter sensitivity (k-mer sharing fraction), <=0 skip
+    dimer: float = 0.15
     # Tm calculation parameters
     nn_table: str = "DNA_NN4"  # SantaLucia 1998, most widely used
     na_conc: float = 50.0      # mM Na+ concentration
@@ -1098,9 +1104,24 @@ def filter_biophysical(
     
     n_snps = len(snps)
     logger.info(f"Running biophysical filter on {n_snps} SNPs")
-    logger.info(f"Thresholds: GC={thresholds.gc_min}-{thresholds.gc_max}%, "
-                f"Tm={thresholds.tm_min}-{thresholds.tm_max}°C (NN table: {thresholds.nn_table}), "
-                f"DUST≤{thresholds.complexity_max}")
+    
+    # Determine which sub-filters are active
+    skip_gc = thresholds.gc_min < 0
+    skip_tm = thresholds.tm_min < 0
+    skip_dust = thresholds.complexity_max < 0
+    
+    if not skip_gc:
+        logger.info(f"GC: {thresholds.gc_min}-{thresholds.gc_max}%")
+    else:
+        logger.info("GC: disabled")
+    if not skip_tm:
+        logger.info(f"Tm: {thresholds.tm_min}-{thresholds.tm_max}°C (NN table: {thresholds.nn_table})")
+    else:
+        logger.info("Tm: disabled")
+    if not skip_dust:
+        logger.info(f"DUST: ≤{thresholds.complexity_max}")
+    else:
+        logger.info("DUST: disabled")
     
     filter_stats = {
         "gc_failed": 0,
@@ -1135,21 +1156,21 @@ def filter_biophysical(
             # GC check
             gc = calculate_gc_fast(seq)
             gc_scores.append(gc)
-            if not (thresholds.gc_min <= gc <= thresholds.gc_max):
+            if not skip_gc and not (thresholds.gc_min <= gc <= thresholds.gc_max):
                 filter_stats["gc_failed"] += 1
                 continue
             
             # Tm check (using user-selected NN table)
             tm = calculate_tm_fast(seq, na_conc=thresholds.na_conc, nn_table=thresholds.nn_table)
             tm_scores.append(tm)
-            if not (thresholds.tm_min <= tm <= thresholds.tm_max):
+            if not skip_tm and not (thresholds.tm_min <= tm <= thresholds.tm_max):
                 filter_stats["tm_failed"] += 1
                 continue
             
             # DUST complexity check
             dust = calculate_dust_fast(seq)
             dust_scores.append(dust)
-            if dust > thresholds.complexity_max:
+            if not skip_dust and dust > thresholds.complexity_max:
                 filter_stats["complexity_failed"] += 1
                 continue
             
@@ -1235,61 +1256,33 @@ def filter_biophysical(
         return Ok(([], filter_stats))
     
     # =========================================================================
-    # Stage 3: Dimer filter (dual-mode: absolute or percentile)
+    # Stage 3: Smart Dimer Filter (graph-based deduplication)
     #
-    # Dimer score = how much one probe shares 11-mer content with the entire
-    # pool (1-to-many). High scores mean this probe is likely to form dimers
-    # with many other probes, reducing capture efficiency.
-    # Default: percentile-based (0.95 → remove worst 5%) because the
-    # absolute score distribution depends on pool size and composition.
+    # Identifies groups of probes with high canonical k-mer sharing
+    # (potential dimer partners) and keeps only one representative per group.
+    # This is more efficient than score-based removal: it retains maximum
+    # probe count while eliminating all detected dimer risk clusters.
     # =========================================================================
     use_dimer = thresholds.dimer > 0
     
     if use_dimer:
-        logger.info("Stage 3: Computing dimer scores (1-to-many k-mer sharing)...")
+        from eprobe.biophysics.fast_biophysics import SmartDimerFilter
         
-        # Build k-mer index from all passed sequences
-        dimer_calc = DimerCalculatorFast(k=11, include_revcomp=True)
-        n_kmers = dimer_calc.build_index(passed_stage2_seqs)
-        logger.info(f"Built dimer index: {n_kmers} unique 11-mers from "
-                    f"{len(passed_stage2_seqs)} probes")
+        min_shared = thresholds.dimer if thresholds.dimer < 1.0 else 0.15
+        logger.info(f"Stage 3: Smart dimer filter (k=11, min_shared≥{min_shared:.0%})...")
         
-        dimer_scores = dimer_calc.calculate_all_scores()
+        smart_dimer = SmartDimerFilter(k=11, min_shared_fraction=min_shared)
+        keep_indices, dimer_stats = smart_dimer.filter(passed_stage2_seqs)
         
-        # Resolve threshold via dual-mode interpretation
-        dimer_threshold = _resolve_threshold(thresholds.dimer, dimer_scores)
-        mode_label = _threshold_mode_label(thresholds.dimer)
+        filter_stats["dimer_failed"] = dimer_stats["dimer_failed"]
+        filter_stats["dimer_stats"] = dimer_stats
         
-        # Store distribution stats
-        if dimer_scores:
-            sorted_ds = sorted(dimer_scores)
-            n_ds = len(sorted_ds)
-            filter_stats["dimer_stats"] = {
-                "mean": round(sum(sorted_ds) / n_ds, 4),
-                "median": round(sorted_ds[n_ds // 2], 4),
-                "p95": round(sorted_ds[min(int(n_ds * 0.95), n_ds - 1)], 4),
-                "max": round(sorted_ds[-1], 4),
-                "threshold": round(dimer_threshold, 4),
-                "mode": mode_label,
-            }
-        
-        logger.info(f"Dimer threshold: {dimer_threshold:.4f} ({mode_label})")
-        if dimer_scores:
-            logger.info(f"Dimer distribution: mean={filter_stats['dimer_stats']['mean']}, "
-                       f"median={filter_stats['dimer_stats']['median']}, "
-                       f"P95={filter_stats['dimer_stats']['p95']}, "
-                       f"max={filter_stats['dimer_stats']['max']}")
-        
-        passed_stage3 = []
-        
-        for snp, score in zip(passed_stage2, dimer_scores):
-            if score <= dimer_threshold:
-                passed_stage3.append(snp)
-            else:
-                filter_stats["dimer_failed"] += 1
+        passed_stage3 = [passed_stage2[i] for i in keep_indices]
         
         logger.info(f"Stage 3: {len(passed_stage3)}/{len(passed_stage2)} passed "
-                    f"(dimer:{filter_stats['dimer_failed']} failed)")
+                    f"(dimer: {dimer_stats['dimer_failed']} removed, "
+                    f"{dimer_stats['dimer_groups']} risk groups, "
+                    f"max_group={dimer_stats['max_group_size']})")
     else:
         passed_stage3 = passed_stage2
     
@@ -2757,8 +2750,8 @@ def run_filter(
                 tm_min=tm_range[0],
                 tm_max=tm_range[1],
                 complexity_max=max_complexity,
-                hairpin=max_hairpin if max_hairpin is not None else 18.0,
-                dimer=max_dimer if max_dimer is not None else 0.95,
+                hairpin=max_hairpin if max_hairpin is not None else 0.95,
+                dimer=max_dimer if max_dimer is not None else 0.15,
                 nn_table=nn_table,
                 na_conc=na_conc,
             )

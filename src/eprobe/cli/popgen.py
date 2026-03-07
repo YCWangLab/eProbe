@@ -393,19 +393,19 @@ def extract(
     "--gc",
     type=str,
     default="35,65",
-    help="GC content range (min,max percentage, default: 35,65).",
+    help="GC content range (min,max percentage, default: 35,65). Set -1 to disable.",
 )
 @click.option(
     "--tm",
     type=str,
     default="65,85",
-    help="Melting temperature range (min,max Celsius, default: 65,85).",
+    help="Melting temperature range (min,max Celsius, default: 65,85). Set -1 to disable.",
 )
 @click.option(
     "--complexity",
     type=float,
     default=2.0,
-    help="Maximum DUST complexity score (default: 2.0).",
+    help="Maximum DUST complexity score (default: 2.0). Set -1 to disable.",
 )
 @click.option(
     "--hairpin",
@@ -414,15 +414,18 @@ def extract(
     help="Hairpin filter threshold (default: 0.95 = top 5%% removed). "
          ">=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
          "Uses exponential k-mer continuity scoring: 4^(n-1) bonus, normalized by log4(L). "
-         "Random DNA ~1-6, 7bp stem ~18, 8bp stem ~74. Set 0 to disable.",
+         "Random DNA ~1-6, 7bp stem ~18, 8bp stem ~74. Set -1 to disable.",
 )
 @click.option(
     "--dimer",
     type=float,
-    default=0.95,
-    help="Dimer filter threshold (default: 0.95 = top 5%% removed). "
-         "Scores 1-to-many 11-mer sharing in the probe pool. "
-         ">=1: absolute; <1: percentile (e.g. 0.95 keeps 95%%). Set 0 to disable.",
+    default=0.15,
+    help="Smart dimer filter sensitivity (default: 0.15). "
+         "Identifies groups of cross-hybridizing probes via canonical k-mer sharing "
+         "and keeps only one representative per risk group. "
+         "Value = minimum fraction of shared k-mers to form a dimer edge: "
+         "0.05 = very sensitive (remove more), 0.15 = balanced, 0.5 = conservative. "
+         "Set -1 to disable.",
 )
 @click.option(
     "--nn-table",
@@ -526,9 +529,16 @@ def filter(
     
     verbose = ctx.obj.get("verbose", False)
     
-    # Parse GC and Tm ranges
-    gc_min, gc_max = map(float, gc.split(","))
-    tm_min, tm_max = map(float, tm.split(","))
+    # Parse GC and Tm ranges (support -1 to disable)
+    if gc.strip() == "-1":
+        gc_min, gc_max = -1.0, -1.0
+    else:
+        gc_min, gc_max = map(float, gc.split(","))
+    
+    if tm.strip() == "-1":
+        tm_min, tm_max = -1.0, -1.0
+    else:
+        tm_min, tm_max = map(float, tm.split(","))
     
     # Parse taxonomy IDs (from both taxid and target names)
     tx_ids = None
@@ -731,8 +741,9 @@ def filter(
         gc_stats = bio_details.get('gc_stats', {})
         gc_failed = bio_details.get('gc_failed', 0)
         if gc_stats:
+            gc_range_str = f"{gc_min}-{gc_max}%" if gc_min >= 0 else "disabled"
             echo_info(f"    ├─ GC content failed: {gc_failed} "
-                     f"(range=35-65%, "
+                     f"(range={gc_range_str}, "
                      f"mean={gc_stats['mean']}%, median={gc_stats['median']}%, P95={gc_stats['p95']}%)")
         else:
             echo_info(f"    ├─ GC content failed: {gc_failed}")
@@ -741,8 +752,9 @@ def filter(
         tm_stats = bio_details.get('tm_stats', {})
         tm_failed = bio_details.get('tm_failed', 0)
         if tm_stats:
+            tm_range_str = f"{tm_min}-{tm_max}°C" if tm_min >= 0 else "disabled"
             echo_info(f"    ├─ Tm failed: {tm_failed} "
-                     f"(range=55-75°C, "
+                     f"(range={tm_range_str}, "
                      f"mean={tm_stats['mean']}°C, median={tm_stats['median']}°C, P95={tm_stats['p95']}°C)")
         else:
             echo_info(f"    ├─ Tm failed: {tm_failed}")
@@ -751,8 +763,9 @@ def filter(
         dust_stats = bio_details.get('dust_stats', {})
         complexity_failed = bio_details.get('complexity_failed', 0)
         if dust_stats:
+            dust_thr_str = f"max≤{complexity}" if complexity >= 0 else "disabled"
             echo_info(f"    ├─ Complexity (DUST) failed: {complexity_failed} "
-                     f"(max≤2.0, "
+                     f"({dust_thr_str}, "
                      f"mean={dust_stats['mean']}, median={dust_stats['median']}, P95={dust_stats['p95']})")
         else:
             echo_info(f"    ├─ Complexity (DUST) failed: {complexity_failed}")
@@ -767,13 +780,15 @@ def filter(
         else:
             echo_info(f"    ├─ Hairpin failed: {hp_failed}")
         
-        # Dimer with distribution stats
+        # Dimer with smart filter stats
         dm_stats = bio_details.get('dimer_stats', {})
         dm_failed = bio_details.get('dimer_failed', 0)
         if dm_stats:
             echo_info(f"    ├─ Dimer failed: {dm_failed} "
-                     f"(threshold={dm_stats['threshold']}, {dm_stats['mode']}, "
-                     f"mean={dm_stats['mean']}, median={dm_stats['median']}, P95={dm_stats['p95']}, max={dm_stats['max']})")
+                     f"({dm_stats['mode']}, "
+                     f"{dm_stats['dimer_groups']} risk groups, "
+                     f"max_group={dm_stats['max_group_size']}, "
+                     f"{dm_stats['dimer_edges']} edges)")
         else:
             echo_info(f"    ├─ Dimer failed: {dm_failed}")
         
