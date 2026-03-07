@@ -946,8 +946,8 @@ def rename(
     help="Max DUST complexity (filter mode, default: 2.0). Set -1 to disable.",
 )
 @click.option(
-    "--hairpin", default=0.95, type=float,
-    help="Hairpin threshold (filter mode, default: 0.95 = top 5%% removed). "
+    "--hairpin", default=18.0, type=float,
+    help="Hairpin threshold (filter mode, default: 18.0 absolute threshold). "
          ">=1: absolute; <1: percentile (e.g. 0.95 keeps 95%%). Set -1 to disable.",
 )
 @click.option(
@@ -1501,8 +1501,8 @@ def target(
 @click.option(
     "--hairpin",
     type=float,
-    default=0.95,
-    help="Hairpin filter threshold (default: 0.95 = top 5%% removed). "
+    default=18.0,
+    help="Hairpin filter threshold (default: 18.0 absolute threshold). "
          ">=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
          "Uses exponential k-mer continuity scoring. Set -1 to disable.",
 )

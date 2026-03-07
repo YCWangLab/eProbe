@@ -86,7 +86,7 @@ class BiophysicalThresholds:
     tm_max: float = 75.0
     complexity_max: float = 2.0
     # Hairpin: >=1 absolute, 0<x<1 percentile, <=0 skip
-    hairpin: float = 0.95
+    hairpin: float = 18.0
     # Dimer: >0 smart filter sensitivity (k-mer sharing fraction), <=0 skip
     dimer: float = 0.15
     # Tm calculation parameters
@@ -2750,7 +2750,7 @@ def run_filter(
                 tm_min=tm_range[0],
                 tm_max=tm_range[1],
                 complexity_max=max_complexity,
-                hairpin=max_hairpin if max_hairpin is not None else 0.95,
+                hairpin=max_hairpin if max_hairpin is not None else 18.0,
                 dimer=max_dimer if max_dimer is not None else 0.15,
                 nn_table=nn_table,
                 na_conc=na_conc,
