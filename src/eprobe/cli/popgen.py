@@ -410,8 +410,8 @@ def extract(
 @click.option(
     "--hairpin",
     type=float,
-    default=18.0,
-    help="Hairpin filter threshold (default: 18.0 absolute). "
+    default=0.95,
+    help="Hairpin filter threshold (default: 0.95 = top 5%% removed). "
          ">=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
          "Uses exponential k-mer continuity scoring: 4^(n-1) bonus, normalized by log4(L). "
          "Random DNA ~1-6, 7bp stem ~18, 8bp stem ~74. Set 0 to disable.",
@@ -726,9 +726,37 @@ def filter(
     if 'biophysical' in stats['filters_applied'] and 'biophysical_details' in stats:
         bio_details = stats['biophysical_details']
         echo_success(f"\n  Step 2: Biophysical Filtering")
-        echo_info(f"    ├─ GC content failed: {bio_details.get('gc_failed', 0)}")
-        echo_info(f"    ├─ Tm failed: {bio_details.get('tm_failed', 0)}")
-        echo_info(f"    ├─ Complexity failed: {bio_details.get('complexity_failed', 0)}")
+        
+        # GC with distribution stats
+        gc_stats = bio_details.get('gc_stats', {})
+        gc_failed = bio_details.get('gc_failed', 0)
+        if gc_stats:
+            echo_info(f"    ├─ GC content failed: {gc_failed} "
+                     f"(range=35-65%, "
+                     f"mean={gc_stats['mean']}%, median={gc_stats['median']}%, P95={gc_stats['p95']}%)")
+        else:
+            echo_info(f"    ├─ GC content failed: {gc_failed}")
+        
+        # Tm with distribution stats
+        tm_stats = bio_details.get('tm_stats', {})
+        tm_failed = bio_details.get('tm_failed', 0)
+        if tm_stats:
+            echo_info(f"    ├─ Tm failed: {tm_failed} "
+                     f"(range=55-75°C, "
+                     f"mean={tm_stats['mean']}°C, median={tm_stats['median']}°C, P95={tm_stats['p95']}°C)")
+        else:
+            echo_info(f"    ├─ Tm failed: {tm_failed}")
+        
+        # Complexity with distribution stats
+        dust_stats = bio_details.get('dust_stats', {})
+        complexity_failed = bio_details.get('complexity_failed', 0)
+        if dust_stats:
+            echo_info(f"    ├─ Complexity (DUST) failed: {complexity_failed} "
+                     f"(max≤2.0, "
+                     f"mean={dust_stats['mean']}, median={dust_stats['median']}, P95={dust_stats['p95']})")
+        else:
+            echo_info(f"    ├─ Complexity (DUST) failed: {complexity_failed}")
+        
         # Hairpin with distribution stats
         hp_stats = bio_details.get('hairpin_stats', {})
         hp_failed = bio_details.get('hairpin_failed', 0)
@@ -738,15 +766,17 @@ def filter(
                      f"median={hp_stats['median']}, P95={hp_stats['p95']})")
         else:
             echo_info(f"    ├─ Hairpin failed: {hp_failed}")
+        
         # Dimer with distribution stats
         dm_stats = bio_details.get('dimer_stats', {})
         dm_failed = bio_details.get('dimer_failed', 0)
         if dm_stats:
             echo_info(f"    ├─ Dimer failed: {dm_failed} "
                      f"(threshold={dm_stats['threshold']}, {dm_stats['mode']}, "
-                     f"mean={dm_stats['mean']}, P95={dm_stats['p95']}, max={dm_stats['max']})")
+                     f"mean={dm_stats['mean']}, median={dm_stats['median']}, P95={dm_stats['p95']}, max={dm_stats['max']})")
         else:
             echo_info(f"    ├─ Dimer failed: {dm_failed}")
+        
         echo_info(f"    └─ Passed: {stats.get('biophysical_remaining', final)} SNPs")
     
     # Step 3: Output

@@ -65,12 +65,10 @@ class BiophysicalThresholds:
         gc_min/gc_max: GC content range (default: 35-65%)
         tm_min/tm_max: Melting temperature range (default: 55-75°C)
         complexity_max: Maximum DUST complexity score (default: 2.0)
-        hairpin: Hairpin threshold (default: 18.0 absolute).
-            Uses exponential k-mer continuity scoring (see calculate_hairpin_fast).
-            >=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%)
-        dimer: Dimer threshold (default: 0.95 percentile → remove top 5%).
+        hairpin: Hairpin threshold (default: 0.95 percentile mode).
+            Uses exponential k-mer continuity scoring.
+        dimer: Dimer threshold (default: 0.95 percentile mode).
             Scores 1-to-many k-mer sharing in the probe pool.
-            >=1: absolute score threshold; <1: percentile
         nn_table: NN parameter table for Tm calculation. Options:
             DNA/DNA: "DNA_NN1" to "DNA_NN4" (default: "DNA_NN4")
             RNA/DNA: "R_DNA_NN1" to "R_DNA_NN4"
@@ -82,7 +80,7 @@ class BiophysicalThresholds:
     tm_max: float = 75.0
     complexity_max: float = 2.0
     # Hairpin: >=1 absolute, 0<x<1 percentile, 0 skip
-    hairpin: float = 18.0
+    hairpin: float = 0.95
     # Dimer: >=1 absolute, 0<x<1 percentile, 0 skip
     dimer: float = 0.95
     # Tm calculation parameters
@@ -1128,23 +1126,29 @@ def filter_biophysical(
     
     passed_stage1 = []
     passed_stage1_seqs = []
+    gc_scores = []
+    tm_scores = []
+    dust_scores = []
     
     for snp, seq in zip(snps, sequences):
         try:
             # GC check
             gc = calculate_gc_fast(seq)
+            gc_scores.append(gc)
             if not (thresholds.gc_min <= gc <= thresholds.gc_max):
                 filter_stats["gc_failed"] += 1
                 continue
             
             # Tm check (using user-selected NN table)
             tm = calculate_tm_fast(seq, na_conc=thresholds.na_conc, nn_table=thresholds.nn_table)
+            tm_scores.append(tm)
             if not (thresholds.tm_min <= tm <= thresholds.tm_max):
                 filter_stats["tm_failed"] += 1
                 continue
             
             # DUST complexity check
             dust = calculate_dust_fast(seq)
+            dust_scores.append(dust)
             if dust > thresholds.complexity_max:
                 filter_stats["complexity_failed"] += 1
                 continue
@@ -1155,6 +1159,24 @@ def filter_biophysical(
         except Exception as e:
             logger.warning(f"Error processing SNP {snp.id}: {e}")
             continue
+    
+    # Stage 1 statistics
+    def _calc_stats(scores):
+        if not scores:
+            return {}
+        s = sorted(scores)
+        n = len(s)
+        return {
+            "mean": round(sum(s) / n, 2),
+            "median": round(s[n // 2], 2),
+            "p95": round(s[min(int(n * 0.95), n - 1)], 2),
+            "max": round(s[-1], 2),
+            "min": round(s[0], 2),
+        }
+    
+    filter_stats["gc_stats"] = _calc_stats(gc_scores)
+    filter_stats["tm_stats"] = _calc_stats(tm_scores)
+    filter_stats["dust_stats"] = _calc_stats(dust_scores)
     
     logger.info(f"Stage 1: {len(passed_stage1)}/{n_snps} passed "
                 f"(GC:{filter_stats['gc_failed']}, Tm:{filter_stats['tm_failed']}, "
