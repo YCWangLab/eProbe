@@ -12,6 +12,7 @@ This module corresponds to the original SNP_subsampler.py functionality.
 
 import logging
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Set, Union
 from dataclasses import dataclass, field
@@ -39,9 +40,19 @@ class SelectionStrategy(Enum):
 BIOPHYSICAL_COLUMNS = ['gc', 'tm', 'complexity', 'hairpin', 'dimer']
 
 
+def _load_file_worker(path: Path):
+    """Worker that loads a single SNP TSV file. Returns (path, snp_list, error)."""
+    snp_df_result = SNPDataFrame.from_tsv(path)
+    if snp_df_result.is_err():
+        return path, None, snp_df_result.unwrap_err()
+    snp_list = snp_df_result.unwrap().to_snps()
+    return path, snp_list, None
+
+
 def merge_snp_files(
     input_paths: List[Path],
     merge_mode: str = "intersection",
+    threads: int = 1,
 ) -> Result[List[SNP], str]:
     """
     Merge SNPs from multiple input TSV files.
@@ -49,6 +60,7 @@ def merge_snp_files(
     Args:
         input_paths: List of SNP TSV file paths
         merge_mode: Merge operation ("intersection", "union", "difference", "symmetric_diff")
+        threads: Number of threads for parallel file loading (default: 1)
         
     Returns:
         Result containing merged SNP list
@@ -69,23 +81,38 @@ def merge_snp_files(
             return Err(f"Failed to load {input_paths[0]}: {snp_df_result.unwrap_err()}")
         return Ok(snp_df_result.unwrap().to_snps())
     
-    # Load all input files
-    all_snp_sets = []
-    all_snps_list = []
+    # Load all input files (parallel when threads > 1)
+    all_snps_list = [None] * len(input_paths)  # preserve order
     
-    for path in input_paths:
-        snp_df_result = SNPDataFrame.from_tsv(path)
-        if snp_df_result.is_err():
-            return Err(f"Failed to load {path}: {snp_df_result.unwrap_err()}")
-        
-        snp_list = snp_df_result.unwrap().to_snps()
-        all_snps_list.append(snp_list)
-        
-        # Create SNP ID set for comparison (using chr:pos_ref_alt format)
-        snp_set = set(f"{snp.chrom}:{snp.pos}_{snp.ref}_{snp.alt}" for snp in snp_list)
-        all_snp_sets.append(snp_set)
-        
-        logger.info(f"Loaded {len(snp_list)} SNPs from {path.name}")
+    n_workers = min(threads, len(input_paths)) if threads > 1 else 1
+    if n_workers > 1:
+        logger.info(f"Loading {len(input_paths)} files with {n_workers} threads")
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            future_to_idx = {
+                executor.submit(_load_file_worker, path): idx
+                for idx, path in enumerate(input_paths)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                path, snp_list, err = future.result()
+                if err:
+                    return Err(f"Failed to load {path}: {err}")
+                logger.info(f"Loaded {len(snp_list)} SNPs from {path.name}")
+                all_snps_list[idx] = snp_list
+    else:
+        for idx, path in enumerate(input_paths):
+            snp_df_result = SNPDataFrame.from_tsv(path)
+            if snp_df_result.is_err():
+                return Err(f"Failed to load {path}: {snp_df_result.unwrap_err()}")
+            snp_list = snp_df_result.unwrap().to_snps()
+            logger.info(f"Loaded {len(snp_list)} SNPs from {path.name}")
+            all_snps_list[idx] = snp_list
+    
+    # Build SNP ID sets for set operations
+    all_snp_sets = [
+        set(f"{snp.chrom}:{snp.pos}_{snp.ref}_{snp.alt}" for snp in snp_list)
+        for snp_list in all_snps_list
+    ]
     
     # Perform merge operation
     if merge_mode == "intersection":
@@ -524,6 +551,7 @@ def select_weighted(
     window_size: int = 10000,
     seed: int = 42,
     snp_df: Optional[pd.DataFrame] = None,
+    threads: int = 1,
 ) -> Result[List[SNP], str]:
     """
     Select SNPs based on weighted biophysical scores within windows.
@@ -622,13 +650,28 @@ def select_weighted(
     # Calculate SNPs per window
     base_per_window = max(1, target_count // total_windows)
     
-    # Select top N from each window based on weighted score
-    # Use efficient selection approach (compatible with pandas < 2.1)
-    selected_indices = []
-    for _, group in df.groupby('window_key'):
-        # Sort by weighted score descending
-        sorted_group = group.nlargest(base_per_window, 'weighted_score')
-        selected_indices.extend(sorted_group.index.tolist())
+    # Select top N from each window based on weighted score.
+    # With threads > 1, each chromosome is processed in a separate thread.
+    def _process_windows(chrom_df: pd.DataFrame) -> List:
+        indices = []
+        for _, group in chrom_df.groupby('window_key'):
+            sorted_group = group.nlargest(base_per_window, 'weighted_score')
+            indices.extend(sorted_group.index.tolist())
+        return indices
+    
+    selected_indices: List = []
+    n_workers = min(threads, df['chr'].nunique()) if threads > 1 else 1
+    if n_workers > 1:
+        logger.info(f"Window selection using {n_workers} threads (by chromosome)")
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = [
+                executor.submit(_process_windows, chrom_df)
+                for _, chrom_df in df.groupby('chr', sort=False)
+            ]
+            for future in futures:
+                selected_indices.extend(future.result())
+    else:
+        selected_indices = _process_windows(df)
     
     selected_df = df.loc[selected_indices]
     
@@ -702,6 +745,7 @@ def run_select(
     keep_biophysical: bool = False,
     merged_snps: Optional[List[SNP]] = None,
     merge_details: Optional[Dict[str, Any]] = None,
+    threads: int = 1,
     verbose: bool = False,
     **kwargs,  # Accept extra kwargs for CLI compatibility
 ) -> Result[Dict[str, Any], str]:
@@ -724,6 +768,7 @@ def run_select(
         keep_biophysical: Keep biophysical columns in output (default: False)
         merged_snps: Pre-merged SNP list (if None, load from input_path)
         merge_details: Details dictionary for merge operation (mode, file counts, etc.)
+        threads: Number of threads for parallel operations (default: 1)
         verbose: Enable verbose logging
         
     Returns:
@@ -742,6 +787,7 @@ def run_select(
     
     logger.info(f"Starting SNP selection from {input_path}")
     logger.info(f"Strategy: {strategy}, Window size: {window_size}")
+    logger.info(f"Threads: {threads}")
     
     # Load input SNPs (or use pre-merged SNPs)
     if merged_snps is not None:
@@ -798,7 +844,7 @@ def run_select(
         elif strategy_lower == "weighted":
             if weights is None:
                 weights = [1.0, 1.0, 1.0, 1.0, 1.0]
-            result = select_weighted(snps, probe_number, weights, window_size, seed, snp_df=raw_df)
+            result = select_weighted(snps, probe_number, weights, window_size, seed, snp_df=raw_df, threads=threads)
             # Weighted returns (snps, df_with_biophysical)
             if result.is_ok():
                 selected_snps, selected_with_biophysical = result.unwrap()

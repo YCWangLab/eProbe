@@ -857,6 +857,12 @@ def filter(
     help="Random seed for reproducibility (default: 42).",
 )
 @click.option(
+    "--threads", "-t",
+    default=1,
+    type=int,
+    help="Number of threads for parallel operations: file loading and window selection (default: 1).",
+)
+@click.option(
     "--keep_biophysical",
     is_flag=True,
     default=False,
@@ -874,6 +880,7 @@ def select(
     priority_bed: Optional[Path],
     target_count: Optional[int],
     seed: int,
+    threads: int,
     keep_biophysical: bool,
 ) -> None:
     """
@@ -919,7 +926,7 @@ def select(
         for i, f in enumerate(input, 1):
             echo_info(f"  {i}. {f}")
         
-        merge_result = merge_snp_files(list(input), merge_mode)
+        merge_result = merge_snp_files(list(input), merge_mode, threads=threads)
         if merge_result.is_err():
             echo_error(f"Failed to merge inputs: {merge_result.unwrap_err()}")
             raise SystemExit(1)
@@ -941,7 +948,7 @@ def select(
         merged_data = None
     
     echo_info(f"Selecting SNPs from {input_path}")
-    echo_info(f"Window size: {window_size}bp, Strategy: {strategy}")
+    echo_info(f"Window size: {window_size}bp, Strategy: {strategy}, Threads: {threads}")
     if target_count:
         echo_info(f"Target count: {target_count}")
     
@@ -957,6 +964,7 @@ def select(
         keep_biophysical=keep_biophysical,
         merged_snps=merged_data,
         merge_details=merge_details,
+        threads=threads,
         verbose=verbose,
     )
     
