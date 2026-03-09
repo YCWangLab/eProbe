@@ -971,6 +971,7 @@ def run_pca_assessment(
     logger.info("Starting PCA assessment using PLINK")
     logger.info(f"SNP TSV: {snp_tsv_path}")
     logger.info(f"VCF: {vcf_path}")
+    logger.info(f"Using {threads} thread(s) for PLINK and bcftools")
     
     # Check plink and bcftools
     plink_check = check_plink_available()
@@ -2075,6 +2076,8 @@ def run_sfs_assessment(
     logger.info(f"SNP TSV: {snp_tsv_path}")
     logger.info(f"VCF: {vcf_path}")
     logger.info(f"Pop file: {pop_file}")
+    logger.info(f"Using {threads} thread(s) for bcftools")
+    logger.info(f"Using {threads} thread(s) for bcftools")
     
     # Check easySFS and bcftools
     easysfs_check = check_easysfs_available()
@@ -2380,6 +2383,8 @@ def run_distance_assessment(
     logger.info("Starting IBS distance assessment using PLINK")
     logger.info(f"SNP TSV: {snp_tsv_path}")
     logger.info(f"VCF: {vcf_path}")
+    logger.info(f"Using {threads} thread(s) for PLINK and bcftools")
+    logger.info(f"Using {threads} thread(s) for PLINK and bcftools")
     
     # Check plink and bcftools
     plink_check = check_plink_available()
