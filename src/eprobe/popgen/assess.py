@@ -1024,18 +1024,28 @@ def run_pca_assessment(
         if not all_samples:
             return Err("No samples found in VCF header")
 
+        vcf_sample_set = set(all_samples)
+
         if pop_file is not None:
             # Stratified: sample n_samples per population so every pop is represented
+            # Only consider members that actually exist in the VCF header
             pop_result = load_pop_file(pop_file)
             if pop_result.is_err():
                 return Err(f"Failed to load pop file for stratified sampling: {pop_result.unwrap_err()}")
             pop_dict_strat = pop_result.unwrap()
             subsampled = []
+            skipped_pops = []
             for pop_id, members in pop_dict_strat.items():
                 if pop_id.lower() == 'unknown':
                     continue
-                chosen = sorted(_random.sample(members, min(n_samples, len(members))))
+                vcf_members = [m for m in members if m in vcf_sample_set]
+                if not vcf_members:
+                    skipped_pops.append(pop_id)
+                    continue
+                chosen = sorted(_random.sample(vcf_members, min(n_samples, len(vcf_members))))
                 subsampled.extend(chosen)
+            if skipped_pops:
+                logger.warning(f"Populations with no matching VCF samples (skipped): {skipped_pops}")
             subsampled = sorted(set(subsampled))
             logger.info(
                 f"Stratified subsampling: {len(subsampled)} individuals across "
@@ -1677,6 +1687,7 @@ def subset_vcf_by_samples(
         cmd = [
             "bcftools", "view",
             "-S", samples_file,
+            "--force-samples",
             "--threads", str(threads),
             "-O", "z",
             "-o", str(output_path),
@@ -2422,18 +2433,28 @@ def run_distance_assessment(
         if not all_samples:
             return Err("No samples found in VCF header")
 
+        vcf_sample_set = set(all_samples)
+
         if pop_file is not None:
             # Stratified: sample n_samples per population so every pop is represented
+            # Only consider members that actually exist in the VCF header
             pop_result = load_pop_file(pop_file)
             if pop_result.is_err():
                 return Err(f"Failed to load pop file for stratified sampling: {pop_result.unwrap_err()}")
             pop_dict_strat = pop_result.unwrap()
             subsampled = []
+            skipped_pops = []
             for pop_id, members in pop_dict_strat.items():
                 if pop_id.lower() == 'unknown':
                     continue
-                chosen = sorted(_random.sample(members, min(n_samples, len(members))))
+                vcf_members = [m for m in members if m in vcf_sample_set]
+                if not vcf_members:
+                    skipped_pops.append(pop_id)
+                    continue
+                chosen = sorted(_random.sample(vcf_members, min(n_samples, len(vcf_members))))
                 subsampled.extend(chosen)
+            if skipped_pops:
+                logger.warning(f"Populations with no matching VCF samples (skipped): {skipped_pops}")
             subsampled = sorted(set(subsampled))
             logger.info(
                 f"Stratified subsampling: {len(subsampled)} individuals across "
