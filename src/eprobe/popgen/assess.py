@@ -2647,17 +2647,16 @@ def generate_assessment_plots(
         fig, ax = plt.subplots(figsize=(8, 6))
 
         overlay = compare_results is not None and len(cmp_values) > 0
-        pre_label = f'Before (N={len(values):,})' if overlay else None
-        sns.histplot(values, alpha=0.6 if overlay else 0.7, stat='percent',
+        pre_label = f'Input (N={len(values):,})' if overlay else None
+        sns.histplot(values, alpha=0.65, stat='percent',
                      bins=bin_edges, edgecolor=color, color=color, element='step',
                      line_kws={'linewidth': 2}, ax=ax, label=pre_label)
 
         if overlay:
-            cmp_color = colors[(idx + 1) % len(colors)]
-            sns.histplot(cmp_values, alpha=0.5, stat='percent',
-                         bins=bin_edges, edgecolor=cmp_color, color=cmp_color, element='step',
-                         line_kws={'linewidth': 2}, ax=ax,
-                         label=f'After (N={len(cmp_values):,})')
+            sns.histplot(cmp_values, alpha=0.35, stat='percent',
+                         bins=bin_edges, edgecolor=color, color=color, element='step',
+                         line_kws={'linewidth': 1.5, 'linestyle': '--'}, ax=ax,
+                         label=f'Compare (N={len(cmp_values):,})')
             ax.legend(fontsize=14)
 
         ax.set_xlim(xlim)
@@ -3185,17 +3184,16 @@ def run_tags_from_dataframe(
                 fig, ax = plt.subplots(figsize=(8, 6))
 
                 overlay = len(cmp_values) > 0
-                pre_label = f'Before (N={len(values):,})' if overlay else None
-                sns.histplot(values, alpha=0.6 if overlay else 0.7, stat='percent',
+                pre_label = f'Input (N={len(values):,})' if overlay else None
+                sns.histplot(values, alpha=0.65, stat='percent',
                              bins=bin_edges, edgecolor=color, color=color, element='step',
                              line_kws={'linewidth': 2}, ax=ax, label=pre_label)
 
                 if overlay:
-                    cmp_color = colors[(idx + 1) % len(colors)]
-                    sns.histplot(cmp_values, alpha=0.5, stat='percent',
-                                 bins=bin_edges, edgecolor=cmp_color, color=cmp_color, element='step',
-                                 line_kws={'linewidth': 2}, ax=ax,
-                                 label=f'After (N={len(cmp_values):,})')
+                    sns.histplot(cmp_values, alpha=0.35, stat='percent',
+                                 bins=bin_edges, edgecolor=color, color=color, element='step',
+                                 line_kws={'linewidth': 1.5, 'linestyle': '--'}, ax=ax,
+                                 label=f'Compare (N={len(cmp_values):,})')
                     ax.legend(fontsize=14)
 
                 ax.set_xlim(xlim)
