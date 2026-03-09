@@ -3027,7 +3027,13 @@ def run_tags_assessment(
         sequences = {}
         skipped = 0
         skipped_by_chrom = 0
+        skipped_by_boundary = 0
         observed_chroms = set()
+        boundary_examples = []  # Store examples of boundary-clipped probes
+        
+        # Calculate expected flank sizes for diagnostics
+        is_even = probe_length % 2 == 0
+        expected_pattern = f"{'asymmetric' if is_even else 'centered'} ({left_flank_len}+1+{right_flank_len})"
         
         for _, row in df.iterrows():
             chrom = str(row['chr'])
@@ -3040,11 +3046,12 @@ def run_tags_assessment(
                 continue
 
             chrom_seq = reference[chrom]
+            chrom_len = len(chrom_seq)
             left_end = pos - 1       # 0-based position of SNP
             right_start = pos        # 0-based position after SNP
             
             start_pos = max(0, left_end - left_flank_len)
-            end_pos = min(len(chrom_seq), right_start + right_flank_len)
+            end_pos = min(chrom_len, right_start + right_flank_len)
 
             left_flank = chrom_seq[start_pos:left_end] if left_end > start_pos else ""
             right_flank = chrom_seq[right_start:end_pos] if end_pos > right_start else ""
@@ -3054,6 +3061,19 @@ def run_tags_assessment(
 
             if len(probe_seq) != probe_length:
                 skipped += 1
+                skipped_by_boundary += 1
+                
+                # Collect examples of boundary clipping
+                if len(boundary_examples) < 3:
+                    boundary_examples.append({
+                        'chrom': chrom,
+                        'pos': pos,
+                        'chrom_len': chrom_len,
+                        'expected_len': probe_length,
+                        'actual_len': len(probe_seq),
+                        'left_flank_available': len(left_flank),
+                        'right_flank_available': len(right_flank),
+                    })
                 continue
 
             probe_id = f"{chrom}_{pos}"
@@ -3068,12 +3088,30 @@ def run_tags_assessment(
                 logger.error(f"  TSV chromosomes: {sorted(observed_chroms)}")
                 logger.error(f"  Reference chromosomes: {sorted(ref_chroms)}")
                 logger.error(f"  Missing in reference: {sorted(missing_chroms)}")
+            
+            # If chromosome names match but all probes clipped, diagnose flanking issue
+            if not missing_chroms and skipped_by_boundary > 0:
+                logger.error(f"ALL PROBES CLIPPED: All {skipped_by_boundary} SNPs skipped due to boundaries")
+                logger.error(f"Probe configuration: length={probe_length} ({expected_pattern})")
+                logger.error(f"  Required flank: left {left_flank_len}bp, right {right_flank_len}bp")
+                logger.error(f"Examples of clipped SNPs:")
+                for ex in boundary_examples:
+                    logger.error(f"  • {ex['chrom']}:{ex['pos']} (chromosome {ex['chrom_len']}bp)")
+                    logger.error(f"    Expected: {ex['expected_len']}bp, got: {ex['actual_len']}bp")
+                    logger.error(f"    Left flank available: {ex['left_flank_available']}bp, Right: {ex['right_flank_available']}bp")
+                
+                logger.error(f"\nTo fix this:")
+                logger.error(f"  1. Use a shorter probe_length (e.g., -l 50 instead of 60)")
+                logger.error(f"  2. Pre-filter TSV to exclude SNPs near boundaries")
+                logger.error(f"  3. Check if positions are 0-based (should be 1-based)")
+                logger.error(f"\nFor reference, with probe_length={probe_length}:")
+                logger.error(f"  - SNPs in first {left_flank_len}bp of chromosome will be clipped on left")
+                logger.error(f"  - SNPs in last {right_flank_len}bp of chromosome will be clipped on right")
         
         if skipped > 0:
-            boundary_skipped = skipped - skipped_by_chrom
             logger.warning(f"Skipped {skipped} probes total:")
             logger.warning(f"  - {skipped_by_chrom} missing chromosome in reference")
-            logger.warning(f"  - {boundary_skipped} boundary-clipped (insufficient flanking)")
+            logger.warning(f"  - {skipped_by_boundary} boundary-clipped (insufficient flanking)")
         logger.info(f"Generated {len(sequences)} probe sequences (length={probe_length}) from reference")
     else:
         return Err(f"Unsupported input format: {suffix}")
