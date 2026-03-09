@@ -14,7 +14,7 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from eprobe.biophysics.fast_biophysics import (
+from eprobe.biophysics.biophysics import (
     calculate_gc_fast,
     calculate_tm_fast,
     calculate_dust_fast,

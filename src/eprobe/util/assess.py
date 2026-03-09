@@ -17,7 +17,7 @@ import numpy as np
 
 from eprobe.core.result import Result, Ok, Err
 from eprobe.core.fasta import read_fasta, write_fasta
-from eprobe.biophysics.fast_biophysics import (
+from eprobe.biophysics.biophysics import (
     calculate_gc_fast,
     calculate_tm_fast,
     calculate_dust_fast,

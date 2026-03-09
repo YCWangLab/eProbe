@@ -31,7 +31,7 @@ from eprobe.utils.bam_utils import (
     get_compressbam_path,
 )
 # Use fast biophysical calculators
-from eprobe.biophysics.fast_biophysics import (
+from eprobe.biophysics.biophysics import (
     calculate_gc_fast,
     calculate_tm_fast,
     calculate_dust_fast,
@@ -86,7 +86,7 @@ class BiophysicalThresholds:
     tm_max: float = 75.0
     complexity_max: float = 2.0
     # Hairpin: >=1 absolute, 0<x<1 percentile, <=0 skip
-    hairpin: float = 18.0
+    hairpin: float = 50.0
     # Dimer: >0 smart filter sensitivity (k-mer sharing fraction), <=0 skip
     dimer: float = 0.50
     # Tm calculation parameters
@@ -1266,7 +1266,7 @@ def filter_biophysical(
     use_dimer = thresholds.dimer > 0
     
     if use_dimer:
-        from eprobe.biophysics.fast_biophysics import SmartDimerFilter
+        from eprobe.biophysics.biophysics import SmartDimerFilter
         
         min_shared = thresholds.dimer if thresholds.dimer < 1.0 else 0.15
         logger.info(f"Stage 3: Smart dimer filter (k=11, min_shared≥{min_shared:.0%})...")
@@ -2761,7 +2761,7 @@ def run_filter(
                 tm_min=tm_range[0],
                 tm_max=tm_range[1],
                 complexity_max=max_complexity,
-                hairpin=max_hairpin if max_hairpin is not None else 18.0,
+                hairpin=max_hairpin if max_hairpin is not None else 50.0,
                 dimer=max_dimer if max_dimer is not None else 0.50,
                 nn_table=nn_table,
                 na_conc=na_conc,

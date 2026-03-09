@@ -410,11 +410,11 @@ def extract(
 @click.option(
     "--hairpin",
     type=float,
-    default=18.0,
-    help="Hairpin filter threshold (default: 18.0 absolute threshold). "
+    default=50.0,
+    help="Hairpin filter threshold (default: 50.0, allows stems up to 7bp). "
          ">=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
          "Uses exponential k-mer continuity scoring: 4^(n-1) bonus, normalized by log4(L). "
-         "Random DNA ~1-6, 7bp stem ~18, 8bp stem ~74. Set -1 to disable.",
+         "Stem levels: 4bp~0.34, 5bp~1.35, 6bp~5.42, 7bp~21.67, 8bp~86.68. Set -1 to disable.",
 )
 @click.option(
     "--dimer",

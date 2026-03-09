@@ -28,7 +28,7 @@ from eprobe.core.result import Result, Ok, Err
 from eprobe.core.models import SNPDataFrame, ProbeSet
 from eprobe.core.fasta import read_fasta
 # Use fast biophysical calculators (same as filter.py)
-from eprobe.biophysics.fast_biophysics import (
+from eprobe.biophysics.biophysics import (
     calculate_gc_fast,
     calculate_tm_fast,
     calculate_dust_fast,
@@ -2104,6 +2104,43 @@ def run_sfs_assessment(
     
     pop_dict = pop_result.unwrap()
 
+    # ── Validate pop file samples against actual VCF header ──────────
+    # Pop files often list samples that are absent from the VCF (different
+    # cohort, renamed, etc.).  Subsampling from phantom samples causes
+    # bcftools --force-samples to silently drop them, and easySFS then
+    # crashes with a KeyError because the population has zero genotypes.
+    import subprocess as _sp
+    try:
+        _hdr = _sp.run(
+            ["bcftools", "query", "-l", str(vcf_path)],
+            capture_output=True, text=True, check=False,
+        )
+        vcf_samples = set(s for s in _hdr.stdout.strip().splitlines() if s)
+    except Exception as e:
+        return Err(f"Failed to read sample list from VCF: {e}")
+
+    if not vcf_samples:
+        return Err("No samples found in VCF header")
+
+    filtered_pop_dict: Dict[str, List[str]] = {}
+    for pop_id, members in pop_dict.items():
+        valid = [m for m in members if m in vcf_samples]
+        if valid:
+            filtered_pop_dict[pop_id] = valid
+        else:
+            logger.warning(f"Population '{pop_id}': none of {len(members)} samples found in VCF — skipped")
+
+    if not filtered_pop_dict:
+        return Err(
+            "No population samples match VCF header. "
+            "Check that sample IDs in the pop file match those in the VCF."
+        )
+
+    n_dropped = sum(len(pop_dict[p]) for p in pop_dict) - sum(len(filtered_pop_dict[p]) for p in filtered_pop_dict)
+    if n_dropped > 0:
+        logger.info(f"Dropped {n_dropped} pop-file samples not present in VCF")
+    pop_dict = filtered_pop_dict
+
     # Select populations (exclude 'unknown', limit to 3)
     pop_select_result = select_sfs_populations(pop_dict, pops)
     if pop_select_result.is_err():
@@ -2593,16 +2630,19 @@ def _smart_plot_limits(
     values: np.ndarray,
     n_bins: int = 50,
 ) -> Tuple[Tuple[float, float], np.ndarray]:
-    """P99-clipped x-axis limits and uniform bin edges (xmin always 0)."""
+    """P1-P99-clipped x-axis limits centred on the distribution."""
     if len(values) == 0:
         return (0.0, 1.0), np.linspace(0.0, 1.0, n_bins + 1)
+    xmin = float(np.percentile(values, 1))
     xmax = float(np.percentile(values, 99))
-    if xmax <= 0:
+    if xmax <= xmin:
         xmax = float(np.max(values))
-    if xmax <= 0:
-        xmax = 1.0
-    xmax *= 1.05  # 5% right padding
-    return (0.0, xmax), np.linspace(0.0, xmax, n_bins + 1)
+    if xmax <= xmin:
+        xmax = xmin + 1.0
+    span = xmax - xmin
+    xmin = xmin - span * 0.05  # 5% left padding
+    xmax = xmax + span * 0.05  # 5% right padding
+    return (xmin, xmax), np.linspace(xmin, xmax, n_bins + 1)
 
 
 def _dimer_log_bins(
@@ -2688,12 +2728,55 @@ def generate_assessment_plots(
                     xlim = (xmin_log, xmax_log)
                 else:
                     cmp_xlim, _ = _smart_plot_limits(cmp_values, n_bins=tag_bins)
+                    xmin = min(xlim[0], cmp_xlim[0])
                     xmax = max(xlim[1], cmp_xlim[1])
-                    xlim = (0.0, xmax)
-                    bin_edges = np.linspace(0.0, xmax, tag_bins + 1)
+                    xlim = (xmin, xmax)
+                    bin_edges = np.linspace(xmin, xmax, tag_bins + 1)
         elif use_log_x:
             bin_edges, xmin_log, xmax_log = _dimer_log_bins(values, n_bins=tag_bins)
             xlim = (xmin_log, xmax_log)
+
+        # --- Hairpin-specific: discrete stem-bp transform ---
+        tick_positions_custom = None
+        tick_labels_custom = None
+        plot_vals = values
+        plot_cmp = cmp_values
+        if tag == 'hairpin' and xlim_fixed is None:
+            unique_combined = (
+                np.unique(np.concatenate([values, cmp_values]))
+                if len(cmp_values) > 0 else np.unique(values)
+            )
+            _log4 = np.log(4)
+            plot_vals = np.log(values + 1) / _log4
+            plot_cmp = np.log(cmp_values + 1) / _log4 if len(cmp_values) > 0 else cmp_values
+            unique_t = np.log(unique_combined + 1) / _log4
+            if len(unique_t) > 1:
+                gaps = np.diff(unique_t)
+                half_w = float(np.min(gaps)) * 0.45
+                bin_edges = np.concatenate([
+                    [unique_t[0] - half_w],
+                    (unique_t[:-1] + unique_t[1:]) / 2,
+                    [unique_t[-1] + half_w],
+                ])
+            else:
+                bin_edges = np.array([unique_t[0] - 0.1, unique_t[0] + 0.1])
+            xlim = (bin_edges[0], bin_edges[-1])
+            tick_positions_custom = unique_t
+            # Convert scores to stem bp labels
+            nonzero = unique_combined[unique_combined > 0]
+            if len(nonzero) > 0:
+                log4_L = 1.0 / float(nonzero.min())
+                labels = []
+                for v in unique_combined:
+                    if v == 0:
+                        labels.append('<4bp')
+                    else:
+                        raw = v * log4_L
+                        n = round(np.log(raw) / _log4) + 1 if raw > 0.5 else 1
+                        labels.append(f'{n + 3}bp')
+                tick_labels_custom = labels
+            else:
+                tick_labels_custom = [f'{v:.2f}' for v in unique_combined]
 
         color = colors[idx % len(colors)]
         sns.set(style='darkgrid')
@@ -2704,12 +2787,12 @@ def generate_assessment_plots(
 
         overlay = compare_results is not None and len(cmp_values) > 0
         pre_label = f'Input (N={len(values):,})' if overlay else None
-        sns.histplot(values, alpha=0.65, stat='percent',
+        sns.histplot(plot_vals, alpha=0.65, stat='percent',
                      bins=bin_edges, edgecolor=color, color=color, element='step',
                      line_kws={'linewidth': 2}, ax=ax, label=pre_label)
 
         if overlay:
-            sns.histplot(cmp_values, alpha=0.35, stat='percent',
+            sns.histplot(plot_cmp, alpha=0.35, stat='percent',
                          bins=bin_edges, edgecolor=color, color=color, element='step',
                          line_kws={'linewidth': 1.5, 'linestyle': '--'}, ax=ax,
                          label=f'Compare (N={len(cmp_values):,})')
@@ -2719,10 +2802,19 @@ def generate_assessment_plots(
         ylim_fixed = (ylim_overrides or {}).get(tag)
         if ylim_fixed is not None:
             ax.set_ylim(ylim_fixed)
+        discrete_xlabel = 'Estimated stem length (bp)' if tag == 'hairpin' else 'log\u2084(score + 1)'
         ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
-        ax.set_xlabel('Values', fontsize=20, fontname='Arial', labelpad=10)
+        ax.set_xlabel(
+            discrete_xlabel if tick_positions_custom is not None else 'Values',
+            fontsize=20, fontname='Arial', labelpad=10,
+        )
         ax.set_ylabel('Percent (%)', fontsize=18, fontname='Arial', labelpad=10)
         ax.tick_params(axis='both', labelsize=18)
+        ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        if tick_positions_custom is not None:
+            ax.set_xticks(tick_positions_custom)
+            ax.set_xticklabels(tick_labels_custom, fontsize=15, rotation=30, ha='right',
+                               fontname='Arial')
         for label in ax.get_xticklabels() + ax.get_yticklabels():
             label.set_fontname('Arial')
 
@@ -3311,12 +3403,54 @@ def run_tags_from_dataframe(
                             xlim = (xmin_log, xmax_log)
                         else:
                             cmp_xlim, _ = _smart_plot_limits(cmp_values, n_bins=tag_bins)
+                            xmin = min(xlim[0], cmp_xlim[0])
                             xmax = max(xlim[1], cmp_xlim[1])
-                            xlim = (0.0, xmax)
-                            bin_edges = np.linspace(0.0, xmax, tag_bins + 1)
+                            xlim = (xmin, xmax)
+                            bin_edges = np.linspace(xmin, xmax, tag_bins + 1)
                 elif use_log_x:
                     bin_edges, xmin_log, xmax_log = _dimer_log_bins(values, n_bins=tag_bins)
                     xlim = (xmin_log, xmax_log)
+
+                # --- Hairpin-specific: discrete stem-bp transform ---
+                tick_positions_custom = None
+                tick_labels_custom = None
+                plot_vals = values
+                plot_cmp = cmp_values
+                if tag == 'hairpin' and xlim_fixed is None:
+                    unique_combined = (
+                        np.unique(np.concatenate([values, cmp_values]))
+                        if len(cmp_values) > 0 else np.unique(values)
+                    )
+                    _log4 = np.log(4)
+                    plot_vals = np.log(values + 1) / _log4
+                    plot_cmp = np.log(cmp_values + 1) / _log4 if len(cmp_values) > 0 else cmp_values
+                    unique_t = np.log(unique_combined + 1) / _log4
+                    if len(unique_t) > 1:
+                        gaps = np.diff(unique_t)
+                        half_w = float(np.min(gaps)) * 0.45
+                        bin_edges = np.concatenate([
+                            [unique_t[0] - half_w],
+                            (unique_t[:-1] + unique_t[1:]) / 2,
+                            [unique_t[-1] + half_w],
+                        ])
+                    else:
+                        bin_edges = np.array([unique_t[0] - 0.1, unique_t[0] + 0.1])
+                    xlim = (bin_edges[0], bin_edges[-1])
+                    tick_positions_custom = unique_t
+                    nonzero = unique_combined[unique_combined > 0]
+                    if len(nonzero) > 0:
+                        log4_L = 1.0 / float(nonzero.min())
+                        labels = []
+                        for v in unique_combined:
+                            if v == 0:
+                                labels.append('<4bp')
+                            else:
+                                raw = v * log4_L
+                                n = round(np.log(raw) / _log4) + 1 if raw > 0.5 else 1
+                                labels.append(f'{n + 3}bp')
+                        tick_labels_custom = labels
+                    else:
+                        tick_labels_custom = [f'{v:.2f}' for v in unique_combined]
 
                 color = colors[idx % len(colors)]
                 sns.set(style='darkgrid')
@@ -3327,12 +3461,12 @@ def run_tags_from_dataframe(
 
                 overlay = len(cmp_values) > 0
                 pre_label = f'Input (N={len(values):,})' if overlay else None
-                sns.histplot(values, alpha=0.65, stat='percent',
+                sns.histplot(plot_vals, alpha=0.65, stat='percent',
                              bins=bin_edges, edgecolor=color, color=color, element='step',
                              line_kws={'linewidth': 2}, ax=ax, label=pre_label)
 
                 if overlay:
-                    sns.histplot(cmp_values, alpha=0.35, stat='percent',
+                    sns.histplot(plot_cmp, alpha=0.35, stat='percent',
                                  bins=bin_edges, edgecolor=color, color=color, element='step',
                                  line_kws={'linewidth': 1.5, 'linestyle': '--'}, ax=ax,
                                  label=f'Compare (N={len(cmp_values):,})')
@@ -3342,10 +3476,19 @@ def run_tags_from_dataframe(
                 ylim_fixed = (ylim_overrides or {}).get(tag)
                 if ylim_fixed is not None:
                     ax.set_ylim(ylim_fixed)
+                discrete_xlabel = 'Estimated stem length (bp)' if tag == 'hairpin' else 'log\u2084(score + 1)'
                 ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
-                ax.set_xlabel('Values', fontsize=20, fontname='Arial', labelpad=10)
+                ax.set_xlabel(
+                    discrete_xlabel if tick_positions_custom is not None else 'Values',
+                    fontsize=20, fontname='Arial', labelpad=10,
+                )
                 ax.set_ylabel('Percent (%)', fontsize=18, fontname='Arial', labelpad=10)
                 ax.tick_params(axis='both', labelsize=18)
+                ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                if tick_positions_custom is not None:
+                    ax.set_xticks(tick_positions_custom)
+                    ax.set_xticklabels(tick_labels_custom, fontsize=15, rotation=30, ha='right',
+                                       fontname='Arial')
                 for label in ax.get_xticklabels() + ax.get_yticklabels():
                     label.set_fontname('Arial')
 

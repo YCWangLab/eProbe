@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, "/Users/zh384/Desktop/scripts_dev/vs_code/developed_package/eProbe/src")
 
 from eprobe.popgen.filter import BiophysicalThresholds
-from eprobe.biophysics.fast_biophysics import SmartDimerFilter
+from eprobe.biophysics.biophysics import SmartDimerFilter
 
 # Test 1: New defaults
 t = BiophysicalThresholds()

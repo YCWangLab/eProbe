@@ -19,7 +19,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
-from eprobe.biophysics.fast_biophysics import (
+from eprobe.biophysics.biophysics import (
     calculate_hairpin_fast,
     _calculate_hairpin_exponential,
 )

@@ -35,7 +35,7 @@ from eprobe.biophysics.thermo_entropy import (
 )
 
 # Fast optimized versions
-from eprobe.biophysics.fast_biophysics import (
+from eprobe.biophysics.biophysics import (
     calculate_gc_fast,
     calculate_gc_batch_fast,
     calculate_tm_fast,
