@@ -3030,7 +3030,7 @@ def run_tags_assessment(
         generate_plots: Generate distribution plots
         sample_dimer: Number of pairs for dimer sampling
         compare_path: Optional second TSV to overlay distributions against
-        plot_xlim: Per-tag x-axis limits override, e.g. {"gc": (0.0, 1.0)}
+        plot_xlim: Per-tag x-axis limits override. Preset defaults: gc=(20,80), tm=(60,80), complexity=(0,2)
         plot_ylim: Per-tag y-axis limits override, e.g. {"gc": (0.0, 50.0)}
         plot_bins: Per-tag bin count override, e.g. {"gc": 100}
         verbose: Enable verbose logging
@@ -3253,14 +3253,24 @@ def run_tags_assessment(
     
     logger.info(f"Saved summary to {summary_path}")
     
+    # Apply default plot preset ranges (user overrides take precedence)
+    default_xlim = {
+        "gc": (20.0, 80.0),
+        "tm": (60.0, 80.0),
+        "complexity": (0.0, 2.0),
+    }
+    xlim_final = {**default_xlim, **(plot_xlim or {})}
+    ylim_final = plot_ylim or {}
+    bins_final = plot_bins or {}
+    
     # Generate plots
     plot_paths = []
     if generate_plots:
         plot_result = generate_assessment_plots(
             results, tags, output_prefix,
-            xlim_overrides=plot_xlim,
-            ylim_overrides=plot_ylim,
-            bins_overrides=plot_bins,
+            xlim_overrides=xlim_final,
+            ylim_overrides=ylim_final,
+            bins_overrides=bins_final,
         )
         if plot_result.is_ok():
             plot_paths = plot_result.unwrap()
