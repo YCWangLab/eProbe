@@ -2909,6 +2909,7 @@ def run_assess(
             plot_xlim=plot_xlim,
             plot_ylim=plot_ylim,
             plot_bins=plot_bins,
+            probe_length=probe_length,
             verbose=verbose,
         )
         
@@ -2935,6 +2936,7 @@ def run_tags_assessment(
     plot_xlim: Optional[Dict[str, Tuple[float, float]]] = None,
     plot_ylim: Optional[Dict[str, Tuple[float, float]]] = None,
     plot_bins: Optional[Dict[str, int]] = None,
+    probe_length: int = 80,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
