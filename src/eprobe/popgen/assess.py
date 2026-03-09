@@ -2294,19 +2294,37 @@ def run_distance_assessment(
     return Ok(stats)
 
 
+def _smart_plot_limits(
+    values: np.ndarray,
+    n_bins: int = 50,
+) -> Tuple[Tuple[float, float], np.ndarray]:
+    """P99-clipped x-axis limits and uniform bin edges (xmin always 0)."""
+    if len(values) == 0:
+        return (0.0, 1.0), np.linspace(0.0, 1.0, n_bins + 1)
+    xmax = float(np.percentile(values, 99))
+    if xmax <= 0:
+        xmax = float(np.max(values))
+    if xmax <= 0:
+        xmax = 1.0
+    xmax *= 1.05  # 5% right padding
+    return (0.0, xmax), np.linspace(0.0, xmax, n_bins + 1)
+
+
 def generate_assessment_plots(
     results: List[AssessmentResult],
     tags: List[str],
     output_prefix: Path,
+    compare_results: Optional[List[AssessmentResult]] = None,
 ) -> Result[List[Path], str]:
     """
     Generate distribution plots for assessment metrics.
-    
+
     Args:
         results: List of assessment results
         tags: List of metrics to plot
         output_prefix: Output file prefix
-        
+        compare_results: Optional second result set to overlay (e.g. post-filter)
+
     Returns:
         Result containing list of generated plot paths
     """
@@ -2315,101 +2333,67 @@ def generate_assessment_plots(
         import seaborn as sns
     except ImportError:
         return Err("Plotting requires matplotlib and seaborn. Install with: pip install eprobe[plot]")
-    
+
     plot_paths = []
-    
+
     # Legacy color palette
     colors = ['#83639F', '#EA7827', '#C22f2F', '#449945', '#1F70A9']
-    
+
     for idx, tag in enumerate(tags):
-        values = [getattr(r, tag) for r in results if getattr(r, tag) is not None]
-        
-        if not values:
+        values = np.array([getattr(r, tag) for r in results if getattr(r, tag) is not None], dtype=float)
+
+        if len(values) == 0:
             continue
-        
-        # Auto bins based on tag type (legacy logic)
-        if tag.lower() == 'gc':
-            bins_interval = 2
-            xlim = (0, 100)
-        elif tag.lower() == 'tm':
-            bins_interval = 1
-            xlim = (0, 100)
-        elif tag.lower() == 'complexity':
-            bins_interval = 0.1
-            xlim = (0, 5)
-        elif tag.lower() == 'hairpin':
-            # Use data-driven range: 0 to max(99th percentile, 36)
-            p99 = float(np.percentile(values, 99))
-            xlim_max = max(36.0, min(p99, 200.0))
-            bins_interval = xlim_max / 50
-            xlim = (0, xlim_max)
-        elif tag.lower() == 'dimer':
-            # Use fixed x-axis range suited for ×10000 scale
-            p99 = float(np.percentile(values, 99))
-            xlim_max = max(p99 * 1.5, 5.0)
-            bins_interval = xlim_max / 50
-            xlim = (0, xlim_max)
-        else:
-            bins_interval = 'auto'
-            xlim = None
-        
-        # Calculate number of bins
-        if bins_interval != 'auto' and xlim is not None:
-            n_bins = int((xlim[1] - xlim[0]) / bins_interval)
-        else:
-            n_bins = 'auto'
-        
-        # Get color for this tag
+
+        xlim, bin_edges = _smart_plot_limits(values)
+
+        # When overlaying, expand axis to cover both datasets
+        cmp_values = np.array([], dtype=float)
+        if compare_results is not None:
+            cmp_values = np.array(
+                [getattr(r, tag) for r in compare_results if getattr(r, tag) is not None], dtype=float
+            )
+            if len(cmp_values) > 0:
+                cmp_xlim, _ = _smart_plot_limits(cmp_values)
+                xmax = max(xlim[1], cmp_xlim[1])
+                xlim = (0.0, xmax)
+                bin_edges = np.linspace(0.0, xmax, 51)
+
         color = colors[idx % len(colors)]
-        
-        # Set seaborn style (legacy)
         sns.set(style='darkgrid')
-        
         fig, ax = plt.subplots(figsize=(8, 6))
-        
-        # Use step histogram style (legacy default)
-        sns.histplot(values, alpha=0.7, stat='percent', edgecolor=color, 
-                    color=color, bins=n_bins, element='step',
-                    line_kws={'linewidth': 2}, ax=ax)
-        
-        # Add threshold / reference lines
-        if tag.lower() == 'hairpin':
-            ax.axvline(x=18.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (18)')
+
+        overlay = compare_results is not None and len(cmp_values) > 0
+        pre_label = f'Before (N={len(values):,})' if overlay else None
+        sns.histplot(values, alpha=0.6 if overlay else 0.7, stat='percent',
+                     bins=bin_edges, edgecolor=color, color=color, element='step',
+                     line_kws={'linewidth': 2}, ax=ax, label=pre_label)
+
+        if overlay:
+            cmp_color = colors[(idx + 1) % len(colors)]
+            sns.histplot(cmp_values, alpha=0.5, stat='percent',
+                         bins=bin_edges, edgecolor=cmp_color, color=cmp_color, element='step',
+                         line_kws={'linewidth': 2}, ax=ax,
+                         label=f'After (N={len(cmp_values):,})')
             ax.legend(fontsize=14)
-        elif tag.lower() == 'dimer':
-            ax.axvline(x=2.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (2.0)')
-            ax.legend(fontsize=14)
-        
-        # Set labels with Arial font (legacy style)
+
+        ax.set_xlim(xlim)
         ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
         ax.set_xlabel('Values', fontsize=20, fontname='Arial', labelpad=10)
         ax.set_ylabel('Percent (%)', fontsize=18, fontname='Arial', labelpad=10)
-        
-        # Set axis limits
-        if xlim is not None:
-            ax.set_xlim(xlim)
-        # Hairpin and dimer are right-skewed: let y auto-scale so bars aren't clipped.
-        # GC, Tm, complexity are roughly uniform — the 40% cap keeps them consistent.
-        if tag.lower() not in ('hairpin', 'dimer'):
-            ax.set_ylim(0, 40)
-        
-        # Set tick font (legacy style)
         ax.tick_params(axis='both', labelsize=18)
         for label in ax.get_xticklabels() + ax.get_yticklabels():
             label.set_fontname('Arial')
-        
+
         plt.tight_layout()
-        
-        # Save as jpg with 600 dpi (legacy style)
+
         plot_path = Path(str(output_prefix) + f".{tag}_dist.jpg")
         fig.savefig(plot_path, dpi=600)
         plt.close(fig)
-        
+
         plot_paths.append(plot_path)
         logger.info(f"Saved plot: {plot_path}")
-    
-    return Ok(plot_paths)
-    
+
     return Ok(plot_paths)
 
 
@@ -2431,6 +2415,7 @@ def run_assess(
     seed: int = 42,
     threads: int = 1,
     verbose: bool = False,
+    compare_path: Optional[Path] = None,
 ) -> Result[Dict[str, Any], str]:
     """
     Assess quality of probe set.
@@ -2647,7 +2632,17 @@ def run_tags_assessment(
         if existing_cols:
             # Use existing biophysical data from filter step
             logger.info(f"Found existing biophysical columns: {existing_cols}")
-            return run_tags_from_dataframe(df, existing_cols, output_prefix, generate_plots)
+
+            # Load compare DataFrame if a compare path was provided
+            compare_df = None
+            if compare_path is not None:
+                cmp_snp_result = SNPDataFrame.from_tsv(compare_path)
+                if cmp_snp_result.is_err():
+                    logger.warning(f"Could not load compare TSV: {cmp_snp_result.unwrap_err()}")
+                else:
+                    compare_df = cmp_snp_result.unwrap().df
+
+            return run_tags_from_dataframe(df, existing_cols, output_prefix, generate_plots, compare_df=compare_df)
         else:
             # Need to generate sequences - requires reference
             if reference_path is None:
@@ -2761,18 +2756,20 @@ def run_tags_from_dataframe(
     tags: List[str],
     output_prefix: Path,
     generate_plots: bool = True,
+    compare_df: Optional[pd.DataFrame] = None,
 ) -> Result[Dict[str, Any], str]:
     """
     Run tags assessment using existing biophysical columns in DataFrame.
-    
+
     This is used when the TSV from filter step already has gc, tm, etc. columns.
-    
+
     Args:
         df: DataFrame with biophysical columns
         tags: List of tags to analyze
         output_prefix: Output prefix
         generate_plots: Whether to generate plots
-        
+        compare_df: Optional second DataFrame to overlay in plots (e.g. post-filter)
+
     Returns:
         Result with assessment statistics
     """
@@ -2816,105 +2813,71 @@ def run_tags_from_dataframe(
     
     logger.info(f"Saved summary to {summary_path}")
     
-    # Generate plots using legacy style
+    # Generate plots
     plot_paths = []
     if generate_plots:
         try:
             import matplotlib.pyplot as plt
             import seaborn as sns
-            
+
             # Legacy color palette
             colors = ['#83639F', '#EA7827', '#C22f2F', '#449945', '#1F70A9']
-            
+
             for idx, tag in enumerate(tags):
                 if tag not in df.columns:
                     continue
-                
-                values = df[tag].dropna()
+
+                values = df[tag].dropna().values
                 if len(values) == 0:
                     continue
-                
-                # Auto bins and limits based on tag type
-                if tag.lower() == 'gc':
-                    bins_interval = 2
-                    xlim = (0, 100)
-                elif tag.lower() == 'tm':
-                    bins_interval = 1
-                    xlim = (0, 100)
-                elif tag.lower() == 'complexity':
-                    bins_interval = 0.1
-                    xlim = (0, 5)
-                elif tag.lower() == 'hairpin':
-                    # Use data-driven range: 0 to max(99th percentile, 36)
-                    p99 = float(np.percentile(values, 99))
-                    xlim_max = max(36.0, min(p99, 200.0))
-                    bins_interval = xlim_max / 50
-                    xlim = (0, xlim_max)
-                elif tag.lower() == 'dimer':
-                    # Use fixed x-axis range suited for ×10000 scale
-                    p99 = float(np.percentile(values, 99))
-                    xlim_max = max(p99 * 1.5, 5.0)
-                    bins_interval = xlim_max / 50
-                    xlim = (0, xlim_max)
-                else:
-                    bins_interval = 'auto'
-                    xlim = None
-                
-                # Calculate number of bins
-                if bins_interval != 'auto' and xlim is not None:
-                    n_bins = int((xlim[1] - xlim[0]) / bins_interval)
-                else:
-                    n_bins = 'auto'
-                
-                # Get color for this tag
+
+                xlim, bin_edges = _smart_plot_limits(values)
+
+                # When overlaying, expand axis to cover both datasets
+                cmp_values = np.array([], dtype=float)
+                if compare_df is not None and tag in compare_df.columns:
+                    cmp_values = compare_df[tag].dropna().values
+                    if len(cmp_values) > 0:
+                        cmp_xlim, _ = _smart_plot_limits(cmp_values)
+                        xmax = max(xlim[1], cmp_xlim[1])
+                        xlim = (0.0, xmax)
+                        bin_edges = np.linspace(0.0, xmax, 51)
+
                 color = colors[idx % len(colors)]
-                
-                # Set seaborn style (legacy)
                 sns.set(style='darkgrid')
-                
                 fig, ax = plt.subplots(figsize=(8, 6))
-                
-                # Use step histogram style (legacy default)
-                sns.histplot(values, alpha=0.7, stat='percent', edgecolor=color, 
-                            color=color, bins=n_bins, element='step',
-                            line_kws={'linewidth': 2}, ax=ax)
-                
-                # Add threshold / reference lines
-                if tag.lower() == 'hairpin':
-                    ax.axvline(x=18.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (18)')
+
+                overlay = len(cmp_values) > 0
+                pre_label = f'Before (N={len(values):,})' if overlay else None
+                sns.histplot(values, alpha=0.6 if overlay else 0.7, stat='percent',
+                             bins=bin_edges, edgecolor=color, color=color, element='step',
+                             line_kws={'linewidth': 2}, ax=ax, label=pre_label)
+
+                if overlay:
+                    cmp_color = colors[(idx + 1) % len(colors)]
+                    sns.histplot(cmp_values, alpha=0.5, stat='percent',
+                                 bins=bin_edges, edgecolor=cmp_color, color=cmp_color, element='step',
+                                 line_kws={'linewidth': 2}, ax=ax,
+                                 label=f'After (N={len(cmp_values):,})')
                     ax.legend(fontsize=14)
-                elif tag.lower() == 'dimer':
-                    ax.axvline(x=2.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (2.0)')
-                    ax.legend(fontsize=14)
-                
-                # Set labels with Arial font (legacy style)
+
+                ax.set_xlim(xlim)
                 ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
                 ax.set_xlabel('Values', fontsize=20, fontname='Arial', labelpad=10)
                 ax.set_ylabel('Percent (%)', fontsize=18, fontname='Arial', labelpad=10)
-                
-                # Set axis limits
-                if xlim is not None:
-                    ax.set_xlim(xlim)
-                # Hairpin and dimer are right-skewed: let y auto-scale so bars aren't clipped.
-                # GC, Tm, complexity are roughly uniform — the 40% cap keeps them consistent.
-                if tag.lower() not in ('hairpin', 'dimer'):
-                    ax.set_ylim(0, 40)
-                
-                # Set tick font (legacy style)
                 ax.tick_params(axis='both', labelsize=18)
                 for label in ax.get_xticklabels() + ax.get_yticklabels():
                     label.set_fontname('Arial')
-                
+
                 plt.tight_layout()
-                
-                # Save as jpg with 600 dpi (legacy style)
+
                 plot_path = Path(str(output_prefix) + f".{tag}_dist.jpg")
                 fig.savefig(plot_path, dpi=600)
                 plt.close(fig)
-                
+
                 plot_paths.append(str(plot_path))
                 logger.info(f"Saved plot: {plot_path}")
-                
+
         except ImportError:
             logger.warning("Plotting requires matplotlib and seaborn")
     

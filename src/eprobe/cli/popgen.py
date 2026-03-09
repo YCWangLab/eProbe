@@ -1198,6 +1198,13 @@ def build(
     type=int,
     help="[sfs/pca modes] Random seed for sample subsampling (default: 42).",
 )
+@click.option(
+    "-c", "--compare",
+    "compare",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="[tags mode] Second TSV (e.g. post-filter) to overlay distributions against the main input.",
+)
 @click.pass_context
 def assess(
     ctx: click.Context,
@@ -1215,6 +1222,7 @@ def assess(
     projection: Optional[str],
     pops: Optional[str],
     seed: int,
+    compare: Optional[Path],
 ) -> None:
     """
     Assess quality of probe set.
@@ -1317,6 +1325,7 @@ def assess(
         pops=pops_list,
         seed=seed,
         verbose=verbose,
+        compare_path=compare,
     )
     
     if result.is_err():
