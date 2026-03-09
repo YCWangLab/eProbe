@@ -315,8 +315,8 @@ def make_datadict(genotypes, pops, verbose=False, ploidy=1):
             ## just carve it off for now.
             try:
                 pop_genotypes = [row[x].split(":")[0] for x in pops[pop]]
-            except:
-                import pdb; pdb.set_trace()
+            except Exception:
+                continue
             if ploidy > 2:
                 delim = "/"
                 if "|" in pop_genotypes[0]: delim = "|"
