@@ -2077,7 +2077,6 @@ def run_sfs_assessment(
     logger.info(f"VCF: {vcf_path}")
     logger.info(f"Pop file: {pop_file}")
     logger.info(f"Using {threads} thread(s) for bcftools")
-    logger.info(f"Using {threads} thread(s) for bcftools")
     
     # Check easySFS and bcftools
     easysfs_check = check_easysfs_available()
