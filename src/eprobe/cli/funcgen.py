@@ -101,8 +101,8 @@ def funcgen(ctx: click.Context) -> None:
 @click.option(
     "--aligner",
     type=click.Choice(["muscle", "clustalo", "mafft"]),
-    default="muscle",
-    help="MSA aligner for haplotype comparison when indels present. Default: muscle.",
+    default="mafft",
+    help="MSA aligner for haplotype comparison when indels present. Default: mafft.",
 )
 @click.pass_context
 def from_fasta(
@@ -171,6 +171,14 @@ def from_fasta(
     )
     if stats.get("multi_allele_count", 0) > 0:
         echo_info(f"  Multi-allele genes: {stats['multi_allele_count']}")
+    if stats.get("haplotyping") and stats.get("multi_allele_count", 0) > 0:
+        v_win = stats.get("n_variant_windows_total", 0)
+        i_win = stats.get("n_invariant_windows_total", 0)
+        v_pr = stats.get("n_variant_probes_total", 0)
+        i_pr = stats.get("n_invariant_probes_total", 0)
+        if v_win + i_win > 0:
+            echo_info(f"  Variant windows   (mutation-covering): {v_win} → {v_pr} probes")
+            echo_info(f"  Invariant windows (shared sequence):   {i_win} → {i_pr} probes")
 
 
 # ---------------------------------------------------------------------------

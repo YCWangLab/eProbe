@@ -514,8 +514,8 @@ def generate_haplotype_probes(
     variant_only: bool = False,
     source_chrom: Optional[str] = None,
     source_offset: int = 0,
-    aligner: str = "muscle",
-) -> Result[List[Probe], str]:
+    aligner: str = "mafft",
+) -> Result[Tuple[List[Probe], Dict[str, int]], str]:
     """
     Generate probes with haplotype awareness.
 
@@ -526,6 +526,9 @@ def generate_haplotype_probes(
 
     At non-variant windows: 1 probe (from any allele)
     At variant windows: 1 probe per unique haplotype sequence
+    Variant probe IDs include mutation annotation, e.g.:
+      GENE_H1_snp87:A_P0002   (SNP at gene pos 87, this haplotype has A)
+      GENE_H2_snp87:G_P0003   (same window, H2 has G)
 
     Args:
         region_id: Identifier for this region/gene
@@ -535,24 +538,37 @@ def generate_haplotype_probes(
         variant_only: If True, only generate probes at variant positions
         source_chrom: Chromosome for coordinate annotation
         source_offset: Genomic offset (0-based) for coordinate mapping
-        aligner: MSA aligner when needed ('muscle', 'clustalo', 'mafft')
+        aligner: MSA aligner when needed ('mafft', 'muscle', 'clustalo')
 
     Returns:
-        Ok(List[Probe]) on success
+        Ok((List[Probe], stats_dict)) where stats_dict has:
+          n_variant_windows:   windows with >=2 unique probe sequences
+          n_invariant_windows: windows with exactly 1 unique probe sequence
+          n_variant_probes:    total probes from variant windows
+          n_invariant_probes:  total probes from invariant windows
     """
+    empty_stats: Dict[str, int] = {
+        "n_variant_windows": 0, "n_invariant_windows": 0,
+        "n_variant_probes": 0, "n_invariant_probes": 0,
+    }
+
     if not alleles:
-        return Ok([])
+        return Ok(([], empty_stats))
 
     # --- Single allele: simple tiling ---
     if len(alleles) == 1:
         if variant_only:
-            return Ok([])
+            return Ok(([], empty_stats))
         seq = list(alleles.values())[0]
         probes = tile_sequence(
             region_id, seq, probe_length, step_size,
             source_chrom, source_offset,
         )
-        return Ok(probes)
+        stats = {
+            "n_variant_windows": 0, "n_invariant_windows": len(probes),
+            "n_variant_probes": 0, "n_invariant_probes": len(probes),
+        }
+        return Ok((probes, stats))
 
     # --- Multiple alleles ---
     lengths = set(len(s) for s in alleles.values())
@@ -577,11 +593,14 @@ def _probes_equal_length(
     variant_only: bool,
     source_chrom: Optional[str],
     source_offset: int,
-) -> Result[List[Probe], str]:
+) -> Result[Tuple[List[Probe], Dict[str, int]], str]:
     """
     Fast path: all alleles have equal length (SNPs only).
 
     Tiles all alleles at identical positions and deduplicates per window.
+    Variant probe IDs encode the variable positions and bases:
+      {gene}_{allele}_snp{pos1}:{base}[,{pos2}:{base}...]_P{n}
+    where pos is 1-based gene-relative.
     """
     seq_len = len(next(iter(alleles.values())))
 
@@ -596,6 +615,8 @@ def _probes_equal_length(
     allele_items = list(alleles.items())
     all_probes: List[Probe] = []
     probe_counter = 0
+    n_variant_windows = 0
+    n_invariant_windows = 0
 
     for start in positions:
         end = start + probe_length
@@ -617,15 +638,40 @@ def _probes_equal_length(
         if variant_only and not is_variant:
             continue
 
+        # For variant windows: find variable positions in gene coordinates
+        # and build per-allele mutation annotation for the probe ID
+        if is_variant:
+            n_variant_windows += 1
+            # Find positions (0-based within window) that differ across alleles
+            unique_seqs = list(seen.keys())
+            var_positions = [
+                p for p in range(probe_length)
+                if len({sq[p] for sq in unique_seqs}) > 1
+            ]
+        else:
+            n_invariant_windows += 1
+            var_positions = []
+
         chrom = source_chrom or region_id
         genomic_start = source_offset + start + 1
         genomic_end = source_offset + end
 
         for probe_seq, allele_label in seen.items():
             probe_counter += 1
-            suffix = f"_{allele_label}" if is_variant else ""
+            if is_variant:
+                # Encode variable positions as snp{gene_pos1_1based}:{base},...
+                parts = [
+                    f"{start + p + 1}:{probe_seq[p]}"
+                    for p in var_positions[:5]  # cap at 5 to keep ID readable
+                ]
+                extra = f"+{len(var_positions) - 5}more" if len(var_positions) > 5 else ""
+                ann = "snp" + ",".join(parts) + extra
+                probe_id = f"{region_id}_{allele_label}_{ann}_P{probe_counter:04d}"
+            else:
+                probe_id = f"{region_id}_P{probe_counter:04d}"
+
             probe = Probe(
-                id=f"{region_id}{suffix}_P{probe_counter:04d}",
+                id=probe_id,
                 sequence=probe_seq,
                 source_chrom=chrom,
                 source_start=genomic_start,
@@ -633,7 +679,15 @@ def _probes_equal_length(
             )
             all_probes.append(probe)
 
-    return Ok(all_probes)
+    n_variant_probes = sum(1 for p in all_probes if "_snp" in p.id)
+    n_invariant_probes = len(all_probes) - n_variant_probes
+    stats = {
+        "n_variant_windows": n_variant_windows,
+        "n_invariant_windows": n_invariant_windows,
+        "n_variant_probes": n_variant_probes,
+        "n_invariant_probes": n_invariant_probes,
+    }
+    return Ok((all_probes, stats))
 
 
 def _find_ungapped_position(aligned_window: str, original_seq: str) -> int:
@@ -653,7 +707,7 @@ def _probes_with_msa(
     source_chrom: Optional[str],
     source_offset: int,
     aligner: str,
-) -> Result[List[Probe], str]:
+) -> Result[Tuple[List[Probe], Dict[str, int]], str]:
     """
     MSA path: alleles have different lengths (indels present).
 
@@ -661,6 +715,9 @@ def _probes_with_msa(
     2. Slide window across alignment coordinates
     3. For each window, extract original (ungapped) sequences per allele
     4. Deduplicate per window
+
+    Variant probe IDs encode the allele + 'indel' type:
+      {gene}_{allele}_indel_P{n}
     """
     msa_result = run_msa(alleles, aligner=aligner)
     if msa_result.is_err():
@@ -670,7 +727,8 @@ def _probes_with_msa(
     aln_length = len(next(iter(aligned.values())))
 
     if aln_length < probe_length:
-        return Ok([])
+        return Ok(([], {"n_variant_windows": 0, "n_invariant_windows": 0,
+                        "n_variant_probes": 0, "n_invariant_probes": 0}))
 
     positions = list(range(0, aln_length - probe_length + 1, step_size))
     last_start = aln_length - probe_length
@@ -679,6 +737,8 @@ def _probes_with_msa(
 
     all_probes: List[Probe] = []
     probe_counter = 0
+    n_variant_windows = 0
+    n_invariant_windows = 0
 
     for aln_start in positions:
         aln_end = aln_start + probe_length
@@ -697,6 +757,11 @@ def _probes_with_msa(
 
         if variant_only and not has_variation:
             continue
+
+        if has_variation:
+            n_variant_windows += 1
+        else:
+            n_invariant_windows += 1
 
         # Extract original (ungapped) probe sequences per allele
         seen: Dict[str, str] = {}
@@ -728,9 +793,12 @@ def _probes_with_msa(
 
         for probe_seq, allele_label in seen.items():
             probe_counter += 1
-            suffix = f"_{allele_label}" if is_variant else ""
+            if is_variant:
+                probe_id = f"{region_id}_{allele_label}_indel_P{probe_counter:04d}"
+            else:
+                probe_id = f"{region_id}_P{probe_counter:04d}"
             probe = Probe(
-                id=f"{region_id}{suffix}_P{probe_counter:04d}",
+                id=probe_id,
                 sequence=probe_seq,
                 source_chrom=source_chrom or region_id,
                 source_start=source_offset + aln_start + 1,
@@ -738,4 +806,12 @@ def _probes_with_msa(
             )
             all_probes.append(probe)
 
-    return Ok(all_probes)
+    n_variant_probes = sum(1 for p in all_probes if "_indel_" in p.id)
+    n_invariant_probes = len(all_probes) - n_variant_probes
+    stats = {
+        "n_variant_windows": n_variant_windows,
+        "n_invariant_windows": n_invariant_windows,
+        "n_variant_probes": n_variant_probes,
+        "n_invariant_probes": n_invariant_probes,
+    }
+    return Ok((all_probes, stats))

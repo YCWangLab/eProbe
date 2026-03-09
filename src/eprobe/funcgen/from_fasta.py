@@ -95,7 +95,7 @@ def run_from_fasta(
     haplotyping: bool = False,
     haplotype_sep: str = "_",
     variant_only: bool = False,
-    aligner: str = "muscle",
+    aligner: str = "mafft",
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -150,6 +150,10 @@ def run_from_fasta(
     all_probes: List[Probe] = []
     n_genes = 0
     n_multi_allele = 0
+    total_variant_windows = 0
+    total_invariant_windows = 0
+    total_variant_probes = 0
+    total_invariant_probes = 0
 
     if haplotyping:
         # Haplotype-aware mode
@@ -178,12 +182,24 @@ def run_from_fasta(
                 logger.warning(f"  {gene_id}: probe generation failed: {result.unwrap_err()}")
                 continue
 
-            probes = result.unwrap()
+            probes, gene_stats = result.unwrap()
             all_probes.extend(probes)
-            logger.debug(f"  {gene_id}: {len(probes)} probes")
+            total_variant_windows += gene_stats["n_variant_windows"]
+            total_invariant_windows += gene_stats["n_invariant_windows"]
+            total_variant_probes += gene_stats["n_variant_probes"]
+            total_invariant_probes += gene_stats["n_invariant_probes"]
+            logger.debug(
+                f"  {gene_id}: {len(probes)} probes "
+                f"({gene_stats['n_variant_probes']} variant, "
+                f"{gene_stats['n_invariant_probes']} invariant)"
+            )
 
         logger.info(
             f"Processed {n_genes} genes ({n_multi_allele} multi-allele)"
+        )
+        logger.info(
+            f"Variant windows: {total_variant_windows}, "
+            f"Invariant windows: {total_invariant_windows}"
         )
     else:
         # Simple tiling mode
@@ -229,6 +245,10 @@ def run_from_fasta(
         "variant_only": variant_only,
         "fasta_file": str(fasta_output),
         "tsv_file": str(tsv_output),
+        "n_variant_windows_total": total_variant_windows,
+        "n_invariant_windows_total": total_invariant_windows,
+        "n_variant_probes_total": total_variant_probes,
+        "n_invariant_probes_total": total_invariant_probes,
     }
 
     return Ok(stats)
