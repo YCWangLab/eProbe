@@ -2580,6 +2580,26 @@ def _smart_plot_limits(
     return (0.0, xmax), np.linspace(0.0, xmax, n_bins + 1)
 
 
+def _dimer_log_bins(
+    *value_arrays: np.ndarray,
+    n_bins: int = 50,
+) -> Tuple[np.ndarray, float, float]:
+    """
+    Build log-spaced bin edges for dimer histograms.
+
+    Excludes exact-zero values from the range calculation (they are plotted
+    in the first bin).  Returns (bin_edges, xmin, xmax).
+    """
+    all_vals = np.concatenate([v[v > 0] for v in value_arrays if len(v[v > 0]) > 0])
+    if len(all_vals) == 0:
+        return np.logspace(-3, 0, n_bins + 1), 1e-3, 1.0
+    xmin = float(np.percentile(all_vals, 1))
+    xmax = float(np.percentile(all_vals, 99)) * 1.05
+    xmin = max(xmin, 1e-6)
+    xmax = max(xmax, xmin * 10)
+    return np.logspace(np.log10(xmin), np.log10(xmax), n_bins + 1), xmin, xmax
+
+
 def generate_assessment_plots(
     results: List[AssessmentResult],
     tags: List[str],
@@ -2623,6 +2643,7 @@ def generate_assessment_plots(
 
         tag_bins = (bins_overrides or {}).get(tag, 50)
         xlim_fixed = (xlim_overrides or {}).get(tag)
+        use_log_x = (tag == 'dimer') and (xlim_fixed is None)
 
         if xlim_fixed is not None:
             xlim = xlim_fixed
@@ -2637,14 +2658,24 @@ def generate_assessment_plots(
                 [getattr(r, tag) for r in compare_results if getattr(r, tag) is not None], dtype=float
             )
             if len(cmp_values) > 0 and xlim_fixed is None:
-                cmp_xlim, _ = _smart_plot_limits(cmp_values, n_bins=tag_bins)
-                xmax = max(xlim[1], cmp_xlim[1])
-                xlim = (0.0, xmax)
-                bin_edges = np.linspace(0.0, xmax, tag_bins + 1)
+                if use_log_x:
+                    bin_edges, xmin_log, xmax_log = _dimer_log_bins(values, cmp_values, n_bins=tag_bins)
+                    xlim = (xmin_log, xmax_log)
+                else:
+                    cmp_xlim, _ = _smart_plot_limits(cmp_values, n_bins=tag_bins)
+                    xmax = max(xlim[1], cmp_xlim[1])
+                    xlim = (0.0, xmax)
+                    bin_edges = np.linspace(0.0, xmax, tag_bins + 1)
+        elif use_log_x:
+            bin_edges, xmin_log, xmax_log = _dimer_log_bins(values, n_bins=tag_bins)
+            xlim = (xmin_log, xmax_log)
 
         color = colors[idx % len(colors)]
         sns.set(style='darkgrid')
         fig, ax = plt.subplots(figsize=(8, 6))
+
+        if use_log_x:
+            ax.set_xscale('log')
 
         overlay = compare_results is not None and len(cmp_values) > 0
         pre_label = f'Input (N={len(values):,})' if overlay else None
@@ -3162,6 +3193,7 @@ def run_tags_from_dataframe(
 
                 tag_bins = (bins_overrides or {}).get(tag, 50)
                 xlim_fixed = (xlim_overrides or {}).get(tag)
+                use_log_x = (tag == 'dimer') and (xlim_fixed is None)
 
                 if xlim_fixed is not None:
                     xlim = xlim_fixed
@@ -3174,14 +3206,24 @@ def run_tags_from_dataframe(
                 if compare_df is not None and tag in compare_df.columns:
                     cmp_values = compare_df[tag].dropna().values
                     if len(cmp_values) > 0 and xlim_fixed is None:
-                        cmp_xlim, _ = _smart_plot_limits(cmp_values, n_bins=tag_bins)
-                        xmax = max(xlim[1], cmp_xlim[1])
-                        xlim = (0.0, xmax)
-                        bin_edges = np.linspace(0.0, xmax, tag_bins + 1)
+                        if use_log_x:
+                            bin_edges, xmin_log, xmax_log = _dimer_log_bins(values, cmp_values, n_bins=tag_bins)
+                            xlim = (xmin_log, xmax_log)
+                        else:
+                            cmp_xlim, _ = _smart_plot_limits(cmp_values, n_bins=tag_bins)
+                            xmax = max(xlim[1], cmp_xlim[1])
+                            xlim = (0.0, xmax)
+                            bin_edges = np.linspace(0.0, xmax, tag_bins + 1)
+                elif use_log_x:
+                    bin_edges, xmin_log, xmax_log = _dimer_log_bins(values, n_bins=tag_bins)
+                    xlim = (xmin_log, xmax_log)
 
                 color = colors[idx % len(colors)]
                 sns.set(style='darkgrid')
                 fig, ax = plt.subplots(figsize=(8, 6))
+
+                if use_log_x:
+                    ax.set_xscale('log')
 
                 overlay = len(cmp_values) > 0
                 pre_label = f'Input (N={len(values):,})' if overlay else None
