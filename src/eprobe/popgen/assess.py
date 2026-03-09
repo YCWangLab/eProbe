@@ -2388,7 +2388,10 @@ def generate_assessment_plots(
         # Set axis limits
         if xlim is not None:
             ax.set_xlim(xlim)
-        ax.set_ylim(0, 40)  # Legacy default for percent
+        # Hairpin and dimer are right-skewed: let y auto-scale so bars aren't clipped.
+        # GC, Tm, complexity are roughly uniform — the 40% cap keeps them consistent.
+        if tag.lower() not in ('hairpin', 'dimer'):
+            ax.set_ylim(0, 40)
         
         # Set tick font (legacy style)
         ax.tick_params(axis='both', labelsize=18)
@@ -2892,7 +2895,10 @@ def run_tags_from_dataframe(
                 # Set axis limits
                 if xlim is not None:
                     ax.set_xlim(xlim)
-                ax.set_ylim(0, 40)  # Legacy default for percent
+                # Hairpin and dimer are right-skewed: let y auto-scale so bars aren't clipped.
+                # GC, Tm, complexity are roughly uniform — the 40% cap keeps them consistent.
+                if tag.lower() not in ('hairpin', 'dimer'):
+                    ax.set_ylim(0, 40)
                 
                 # Set tick font (legacy style)
                 ax.tick_params(axis='both', labelsize=18)
