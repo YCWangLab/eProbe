@@ -1961,15 +1961,33 @@ def generate_multipop_sfs_heatmap(
     # Custom colormap: dark red -> red -> orange -> yellow -> white
     colors = ['#8B0000', '#FF0000', '#FF4500', '#FFA500', '#FFD700', '#FFFF00', '#FFFACD', '#FFFFFF']
     cmap = LinearSegmentedColormap.from_list('sfs_cmap', colors[::-1])  # Reverse for high=red
+    cmap.set_bad('lightgray')  # Color for masked (monomorphic) cells
 
-    # Find global max for consistent colorscale
+    # Log-transform for better dynamic range (standard SFS visualization)
+    plot_sfs_1d = {}
+    for pop, arr in sfs_1d.items():
+        log_arr = np.log10(1.0 + arr)
+        masked = np.ma.array(log_arr)
+        masked[0] = np.ma.masked   # mask monomorphic (all ancestral)
+        masked[-1] = np.ma.masked  # mask fixed (all derived)
+        plot_sfs_1d[pop] = masked
+
+    plot_sfs_2d = {}
+    for key, arr in sfs_2d.items():
+        log_arr = np.log10(1.0 + arr)
+        masked = np.ma.array(log_arr)
+        masked[0, 0] = np.ma.masked    # mask all-ancestral corner
+        masked[-1, -1] = np.ma.masked  # mask all-derived corner
+        plot_sfs_2d[key] = masked
+
+    # Global vmax from unmasked log-transformed values
     all_values = []
-    for arr in sfs_1d.values():
-        all_values.extend(arr.flatten())
-    for arr in sfs_2d.values():
-        all_values.extend(arr.flatten())
+    for arr in plot_sfs_1d.values():
+        all_values.extend(arr.compressed())
+    for arr in plot_sfs_2d.values():
+        all_values.extend(arr.compressed())
     
-    vmax = max(all_values) if all_values else 100
+    vmax = max(all_values) if all_values else 1.0
     
     # Create figure with custom layout
     # Main grid for heatmaps + space for colorbar
@@ -1996,8 +2014,8 @@ def generate_multipop_sfs_heatmap(
             
             if i == j:
                 # Diagonal: 1D SFS as column heatmap
-                if pop_row in sfs_1d:
-                    sfs_data = sfs_1d[pop_row]
+                if pop_row in plot_sfs_1d:
+                    sfs_data = plot_sfs_1d[pop_row]
                     im = ax.imshow(
                         sfs_data.reshape(-1, 1),
                         aspect='auto',
@@ -2014,9 +2032,9 @@ def generate_multipop_sfs_heatmap(
                     
             elif i > j:
                 # Lower triangle: 2D joint SFS
-                key = (pop_col, pop_row) if (pop_col, pop_row) in sfs_2d else (pop_row, pop_col)
-                if key in sfs_2d:
-                    sfs_data = sfs_2d[key]
+                key = (pop_col, pop_row) if (pop_col, pop_row) in plot_sfs_2d else (pop_row, pop_col)
+                if key in plot_sfs_2d:
+                    sfs_data = plot_sfs_2d[key]
                     if key == (pop_row, pop_col):
                         sfs_data = sfs_data.T
                     
@@ -2039,14 +2057,14 @@ def generate_multipop_sfs_heatmap(
             
             # Y-axis: only show ticks on leftmost column
             if j == 0 and i >= j:
-                if i == j and pop_row in sfs_1d:
-                    n_bins = len(sfs_1d[pop_row])
+                if i == j and pop_row in plot_sfs_1d:
+                    n_bins = len(plot_sfs_1d[pop_row])
                     ax.set_yticks(range(n_bins))
                     ax.set_yticklabels(range(n_bins), fontsize=7)
                 elif i > j:
-                    key = (pop_col, pop_row) if (pop_col, pop_row) in sfs_2d else (pop_row, pop_col)
-                    if key in sfs_2d:
-                        sfs_data = sfs_2d[key]
+                    key = (pop_col, pop_row) if (pop_col, pop_row) in plot_sfs_2d else (pop_row, pop_col)
+                    if key in plot_sfs_2d:
+                        sfs_data = plot_sfs_2d[key]
                         if key == (pop_row, pop_col):
                             sfs_data = sfs_data.T
                         ax.set_yticks(range(sfs_data.shape[0]))
@@ -2084,7 +2102,7 @@ def generate_multipop_sfs_heatmap(
         plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, vmax)),
         cax=cbar_ax
     )
-    cbar.set_label('Number of alleles', fontsize=9)
+    cbar.set_label('log\u2081\u2080(count + 1)', fontsize=9)
     cbar.ax.tick_params(labelsize=8)
     
     # Add title
