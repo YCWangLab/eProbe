@@ -2122,23 +2122,38 @@ def run_sfs_assessment(
 
 
 def _count_vcf_sites(vcf_path: Path) -> int:
-    """Count number of variant sites in VCF."""
+    """Count number of variant sites in VCF using bcftools index (fast, no decompression)."""
     import subprocess
     import shutil
-    
+
     if shutil.which("bcftools") is None:
         return 0
-    
+
     try:
+        # --nrecords reads the index file directly — O(1), no decompression needed
         result = subprocess.run(
-            ["bcftools", "view", "-H", str(vcf_path)],
+            ["bcftools", "index", "--nrecords", str(vcf_path)],
             capture_output=True,
             text=True,
             check=False,
         )
-        return len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
-    except:
-        return 0
+        if result.returncode == 0 and result.stdout.strip().isdigit():
+            return int(result.stdout.strip())
+
+        # Fallback: bcftools stats (reads full file but doesn't buffer into Python)
+        result2 = subprocess.run(
+            ["bcftools", "stats", str(vcf_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in result2.stdout.splitlines():
+            if line.startswith("SN") and "number of records" in line:
+                return int(line.split()[-1])
+    except Exception:
+        pass
+
+    return 0
 
 
 def run_distance_assessment(
@@ -2226,17 +2241,23 @@ def run_distance_assessment(
         logger.info("Creating probe-subset VCF...")
         probe_vcf = tmpdir / "probe_subset.vcf.gz"
         subset_result = subset_vcf_by_positions(vcf_path, probe_positions, probe_vcf)
-        
+
         if subset_result.is_err():
-            return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
-        
+            err_msg = f"VCF subsetting failed: {subset_result.unwrap_err()}"
+            logger.error(err_msg)
+            return Err(err_msg)
+
+        logger.info(f"Probe-subset VCF created: {probe_vcf}")
+
         # === Calculate IBS distance for probe VCF ===
         logger.info("Calculating IBS distances for probe set using PLINK...")
         probe_ibs_result = run_plink_ibs_distance(probe_vcf, tmpdir / "probe")
-        
+
         if probe_ibs_result.is_err():
-            return Err(f"Probe VCF IBS failed: {probe_ibs_result.unwrap_err()}")
-        
+            err_msg = f"Probe VCF IBS failed: {probe_ibs_result.unwrap_err()}"
+            logger.error(err_msg)
+            return Err(err_msg)
+
         dist_probe, samples_probe = probe_ibs_result.unwrap()
         n_sites_probe = len(probe_positions)
         logger.info(f"Probe VCF: {len(samples_probe)} samples, {n_sites_probe} sites")
