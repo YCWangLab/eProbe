@@ -2338,11 +2338,18 @@ def generate_assessment_plots(
             bins_interval = 0.1
             xlim = (0, 5)
         elif tag.lower() == 'hairpin':
-            bins_interval = 2
-            xlim = (0, 100)
+            # Use data-driven range: 0 to max(99th percentile, 36)
+            p99 = float(np.percentile(values, 99))
+            xlim_max = max(36.0, min(p99, 200.0))
+            bins_interval = xlim_max / 50
+            xlim = (0, xlim_max)
         elif tag.lower() == 'dimer':
-            bins_interval = 0.01
-            xlim = (0, 1)
+            # Center x-axis around data median
+            median_val = float(np.median(values))
+            xlim_max = max(median_val * 10, 0.05)
+            xlim_max = min(xlim_max, float(np.percentile(values, 99)) * 1.5)
+            bins_interval = xlim_max / 50
+            xlim = (0, xlim_max)
         else:
             bins_interval = 'auto'
             xlim = None
@@ -2365,6 +2372,15 @@ def generate_assessment_plots(
         sns.histplot(values, alpha=0.7, stat='percent', edgecolor=color, 
                     color=color, bins=n_bins, element='step',
                     line_kws={'linewidth': 2}, ax=ax)
+        
+        # Add threshold / reference lines
+        if tag.lower() == 'hairpin':
+            ax.axvline(x=18.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (18)')
+            ax.legend(fontsize=14)
+        elif tag.lower() == 'dimer':
+            med = float(np.median(values))
+            ax.axvline(x=med, color='red', linestyle='--', linewidth=1.5, label=f'median ({med:.4f})')
+            ax.legend(fontsize=14)
         
         # Set labels with Arial font (legacy style)
         ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
@@ -2817,7 +2833,7 @@ def run_tags_from_dataframe(
                 if len(values) == 0:
                     continue
                 
-                # Auto bins based on tag type (legacy logic)
+                # Auto bins and limits based on tag type
                 if tag.lower() == 'gc':
                     bins_interval = 2
                     xlim = (0, 100)
@@ -2828,11 +2844,18 @@ def run_tags_from_dataframe(
                     bins_interval = 0.1
                     xlim = (0, 5)
                 elif tag.lower() == 'hairpin':
-                    bins_interval = 2
-                    xlim = (0, 100)
+                    # Use data-driven range: 0 to max(99th percentile, 36)
+                    p99 = float(np.percentile(values, 99))
+                    xlim_max = max(36.0, min(p99, 200.0))
+                    bins_interval = xlim_max / 50
+                    xlim = (0, xlim_max)
                 elif tag.lower() == 'dimer':
-                    bins_interval = 0.01
-                    xlim = (0, 1)
+                    # Center x-axis around data median
+                    median_val = float(np.median(values))
+                    xlim_max = max(median_val * 10, 0.05)
+                    xlim_max = min(xlim_max, float(np.percentile(values, 99)) * 1.5)
+                    bins_interval = xlim_max / 50
+                    xlim = (0, xlim_max)
                 else:
                     bins_interval = 'auto'
                     xlim = None
@@ -2855,6 +2878,15 @@ def run_tags_from_dataframe(
                 sns.histplot(values, alpha=0.7, stat='percent', edgecolor=color, 
                             color=color, bins=n_bins, element='step',
                             line_kws={'linewidth': 2}, ax=ax)
+                
+                # Add threshold / reference lines
+                if tag.lower() == 'hairpin':
+                    ax.axvline(x=18.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (18)')
+                    ax.legend(fontsize=14)
+                elif tag.lower() == 'dimer':
+                    med = float(np.median(values))
+                    ax.axvline(x=med, color='red', linestyle='--', linewidth=1.5, label=f'median ({med:.4f})')
+                    ax.legend(fontsize=14)
                 
                 # Set labels with Arial font (legacy style)
                 ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
