@@ -74,7 +74,7 @@ class BiophysicalThresholds:
         tm_min/tm_max: Melting temp range (default: 55-75°C). Set -1 to disable.
         complexity_max: Max DUST complexity score (default: 2.0). Set -1 to disable.
         hairpin: Hairpin threshold (default: 0.95 percentile). Set -1 to disable.
-        dimer: Smart dimer sensitivity (default: 0.15 = 15% k-mer sharing).
+        dimer: Smart dimer sensitivity (default: 0.30 = 30% k-mer sharing).
             Lower = more sensitive (more groups detected, more removed).
             Higher = more conservative. Set -1 to disable.
         nn_table: NN parameter table for Tm. Default: DNA_NN4 (SantaLucia 1998).
@@ -88,7 +88,7 @@ class BiophysicalThresholds:
     # Hairpin: >=1 absolute, 0<x<1 percentile, <=0 skip
     hairpin: float = 18.0
     # Dimer: >0 smart filter sensitivity (k-mer sharing fraction), <=0 skip
-    dimer: float = 0.15
+    dimer: float = 0.30
     # Tm calculation parameters
     nn_table: str = "DNA_NN4"  # SantaLucia 1998, most widely used
     na_conc: float = 50.0      # mM Na+ concentration
@@ -2751,7 +2751,7 @@ def run_filter(
                 tm_max=tm_range[1],
                 complexity_max=max_complexity,
                 hairpin=max_hairpin if max_hairpin is not None else 18.0,
-                dimer=max_dimer if max_dimer is not None else 0.15,
+                dimer=max_dimer if max_dimer is not None else 0.30,
                 nn_table=nn_table,
                 na_conc=na_conc,
             )
