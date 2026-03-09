@@ -3008,26 +3008,47 @@ def run_tags_assessment(
 
         reference = ref_result.unwrap()
 
-        # Centre probe on SNP; split evenly (left gets the extra base for odd lengths)
-        half_left = probe_length // 2
-        half_right = probe_length - half_left - 1
+        # Generate probe sequences matching filter.py logic:
+        # Symmetric flanking around SNP with REF base at centre.
+        # For probe_length=81: flank_size=40 → 40 + 1(ref) + 40 = 81
+        # For probe_length=80: flank_size=39 → 39 + 1(ref) + 39 = 79 (!)
+        # Recommend using an odd probe_length for exact centering.
+        flank_size = (probe_length - 1) // 2
+        has_ref_col = "ref" in df.columns
 
         sequences = {}
+        skipped = 0
         for _, row in df.iterrows():
             chrom = str(row['chr'])
             pos = int(row['pos'])
 
             if chrom not in reference:
+                skipped += 1
                 continue
 
-            ref_seq = reference[chrom]
-            start = max(0, pos - half_left - 1)
-            end = min(len(ref_seq), pos + half_right)
+            chrom_seq = reference[chrom]
+            start_pos = max(0, pos - 1 - flank_size)   # 0-based start
+            end_pos = min(len(chrom_seq), pos + flank_size)  # 0-based exclusive
 
-            probe_seq = ref_seq[start:end]
+            # Split into left_flank + REF + right_flank (same as filter.py)
+            left_end = pos - 1       # 0-based position of SNP
+            right_start = pos        # 0-based position after SNP
+
+            left_flank = chrom_seq[start_pos:left_end] if left_end > start_pos else ""
+            right_flank = chrom_seq[right_start:end_pos] if end_pos > right_start else ""
+
+            ref_base = str(row['ref']).upper() if has_ref_col else chrom_seq[pos - 1].upper()
+            probe_seq = left_flank + ref_base + right_flank
+
+            if len(probe_seq) != probe_length:
+                skipped += 1
+                continue
+
             probe_id = f"{chrom}_{pos}"
-            sequences[probe_id] = probe_seq
+            sequences[probe_id] = probe_seq.upper()
 
+        if skipped > 0:
+            logger.warning(f"Skipped {skipped} probes (missing chrom or boundary-clipped)")
         logger.info(f"Generated {len(sequences)} probe sequences (length={probe_length}) from reference")
     else:
         return Err(f"Unsupported input format: {suffix}")
