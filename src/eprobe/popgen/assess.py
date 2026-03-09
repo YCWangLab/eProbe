@@ -419,12 +419,14 @@ def generate_combined_heatmap(
     sample_names: List[str],
     output_path: Path,
     correlation_stats: Dict[str, float],
+    pop_file: Optional[Path] = None,
 ) -> Result[Path, str]:
     """
     Generate combined heatmap with full VCF (upper triangle) and probe set (lower triangle).
     
     Clustering is performed on probe set distances, and the same sample order
     is applied to both triangles for fair comparison.
+    If pop_file is provided, a population color strip is drawn to the right of the heatmap.
     
     Args:
         dist_full: Distance matrix from full VCF
@@ -432,14 +434,15 @@ def generate_combined_heatmap(
         sample_names: List of sample names
         output_path: Output file path
         correlation_stats: Correlation statistics to display
+        pop_file: Optional population file for color strip annotation
         
     Returns:
         Result containing output path
     """
     try:
         import matplotlib.pyplot as plt
-        from matplotlib.colors import LinearSegmentedColormap
-        from matplotlib.gridspec import GridSpec
+        from matplotlib.patches import Patch
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
     except ImportError:
         return Err("Plotting requires matplotlib. Install with: pip install matplotlib")
     
@@ -455,7 +458,6 @@ def generate_combined_heatmap(
         dendro = dendrogram(linkage_matrix, no_plot=True)
         order = dendro['leaves']
     except Exception:
-        # If clustering fails, use original order
         order = list(range(n))
     
     # Reorder both matrices using probe set clustering order
@@ -463,57 +465,95 @@ def generate_combined_heatmap(
     dist_full_ordered = dist_full[np.ix_(order, order)]
     sample_names_ordered = [sample_names[i] for i in order]
     
-    # Create combined matrix with gap on diagonal
-    # Lower triangle = probe (i > j), Upper triangle = full (i < j)
-    # Diagonal = 1 (max distance to create visual separation)
-    combined = np.ones_like(dist_full_ordered)  # Fill with 1 (max distance)
-    for i in range(n):
-        for j in range(n):
-            if i > j:  # Lower triangle - probe set
-                combined[i, j] = dist_probe_ordered[i, j]
-            elif i < j:  # Upper triangle - full VCF
-                combined[i, j] = dist_full_ordered[i, j]
-            # Diagonal stays as 1 to create visual gap
+    # Combined matrix: lower triangle = probe, upper = full, diagonal = 1 (gap)
+    combined = np.tril(dist_probe_ordered, -1) + np.triu(dist_full_ordered, 1) + np.eye(n)
     
-    # Create figure: 9x8, with 8x8 heatmap and narrow colorbar on upper right
-    fig = plt.figure(figsize=(9, 8))
-    gs = GridSpec(3, 2, width_ratios=[16, 1], height_ratios=[1, 2, 1], 
-                  wspace=0.02, hspace=0.02)
+    # --- Build population color strip if pop_file provided ---
+    pop_color_strip = None
+    pop_legend_handles = []
+    if pop_file is not None and pop_file.exists():
+        pop_dict_sample = {}
+        try:
+            with open(pop_file, 'r') as _pf:
+                for _line in _pf:
+                    _line = _line.strip()
+                    if not _line or _line.startswith('#'):
+                        continue
+                    _parts = _line.split('\t') if '\t' in _line else _line.split()
+                    if len(_parts) >= 2:
+                        pop_dict_sample[_parts[0]] = _parts[1]
+        except Exception as _e:
+            logger.warning(f"Could not load pop file for heatmap coloring: {_e}")
+        
+        if pop_dict_sample:
+            pops_ordered = [pop_dict_sample.get(s, 'Unknown') for s in sample_names_ordered]
+            unique_pops = sorted(set(pops_ordered))
+            cmap_pop = plt.get_cmap('tab10')
+            pop_color_map = {p: cmap_pop(i % 10) for i, p in enumerate(unique_pops)}
+            # Build (n, 1, 4) RGBA array
+            pop_color_strip = np.array(
+                [pop_color_map[p] for p in pops_ordered], dtype=float
+            ).reshape(n, 1, 4)
+            pop_legend_handles = [
+                Patch(facecolor=pop_color_map[p], label=p) for p in unique_pops
+            ]
     
-    # Heatmap axis spans all rows on the left
-    ax = fig.add_subplot(gs[:, 0])
+    # --- Figure and axes ---
+    fig, ax = plt.subplots(figsize=(9, 8))
     
-    # Colorbar axis in upper right (smaller, only top 1/4)
-    cax = fig.add_subplot(gs[0, 1])
-    
-    # Custom colormap
     cmap = plt.cm.YlOrRd
+    im = ax.imshow(combined, cmap=cmap, vmin=0, vmax=1.0, aspect='auto')
     
-    # Plot heatmap
-    vmin = 0
-    vmax = 1.0  # 1-IBS ranges from 0 to 1
+    # Build axes attached to the heatmap using make_axes_locatable
+    divider = make_axes_locatable(ax)
     
-    im = ax.imshow(combined, cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal')
+    if pop_color_strip is not None:
+        # Population color strip to the right of the heatmap
+        ax_pop = divider.append_axes("right", size="2%", pad=0.06)
+        ax_pop.imshow(pop_color_strip, aspect='auto', interpolation='nearest')
+        ax_pop.set_xticks([])
+        ax_pop.set_yticks([])
+        for spine in ax_pop.spines.values():
+            spine.set_linewidth(0.5)
+        ax_pop.set_xlabel('Pop', fontsize=7, labelpad=2)
+        cax = divider.append_axes("right", size="3%", pad=0.35)
+    else:
+        cax = divider.append_axes("right", size="3%", pad=0.1)
     
-    # Add colorbar in the upper right area
     cbar = plt.colorbar(im, cax=cax)
     cbar.set_label('1-IBS', fontsize=11)
     
-    # Add sample labels
+    # Sample labels
     if n <= 50:
         ax.set_xticks(range(n))
         ax.set_yticks(range(n))
         ax.set_xticklabels(sample_names_ordered, rotation=90, fontsize=8)
         ax.set_yticklabels(sample_names_ordered, fontsize=8)
     else:
-        # Too many samples, don't show labels
         ax.set_xticks([])
         ax.set_yticks([])
     
-    # Title with correlation stats
-    title = f"1-IBS Distance: Upper triangle Full VCF | Lower triangle Probe Set\n"
-    title += f"Pearson = {correlation_stats['pearson_r']:.3f}, Spearman = {correlation_stats['spearman_r']:.3f}, Manhattan = {correlation_stats['manhattan_distance']:.3f}"
+    # Title
+    title = "1-IBS Distance: Upper triangle Full VCF | Lower triangle Probe Set\n"
+    title += (
+        f"Pearson = {correlation_stats['pearson_r']:.3f}, "
+        f"Spearman = {correlation_stats['spearman_r']:.3f}, "
+        f"Manhattan = {correlation_stats['manhattan_distance']:.3f}"
+    )
     ax.set_title(title, fontsize=12, fontweight='bold')
+    
+    # Population legend below the figure
+    if pop_legend_handles:
+        ncol = min(len(pop_legend_handles), 6)
+        fig.legend(
+            handles=pop_legend_handles,
+            title='Population',
+            loc='lower center',
+            bbox_to_anchor=(0.45, -0.02),
+            ncol=ncol,
+            fontsize=8,
+            frameon=True,
+        )
     
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -2467,7 +2507,8 @@ def run_distance_assessment(
     heatmap_path = Path(str(output_prefix) + ".ibs_heatmap.png")
     logger.info(f"Generating combined heatmap: {heatmap_path}")
     heatmap_result = generate_combined_heatmap(
-        dist_full, dist_probe, samples_full, heatmap_path, corr_stats
+        dist_full, dist_probe, samples_full, heatmap_path, corr_stats,
+        pop_file=pop_file,
     )
     if heatmap_result.is_err():
         logger.warning(f"Failed to generate heatmap: {heatmap_result.unwrap_err()}")
