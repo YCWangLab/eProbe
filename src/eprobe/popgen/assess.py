@@ -3008,13 +3008,20 @@ def run_tags_assessment(
 
         reference = ref_result.unwrap()
 
-        # Generate probe sequences matching filter.py logic:
-        # Symmetric flanking around SNP with REF base at centre.
-        # For probe_length=81: flank_size=40 → 40 + 1(ref) + 40 = 81 ✓ (perfect centering)
-        # For probe_length=80: flank_size=39 → 39 + 1(ref) + 39 = 79 (truncated, boundary SNP discarded)
-        # NOTE: Even probe_length values result in loss of coverage at sequence boundaries.
-        # Recommend using odd probe_length (e.g., 81) for maximum coverage and exact centering.
-        flank_size = (probe_length - 1) // 2
+        # Generate probe sequences matching filter.py logic with asymmetric flanking for even lengths:
+        # For ODD probe_length (e.g., 81): centered flanking
+        #   flank_size=40 → 40 + 1(ref) + 40 = 81 ✓ (perfect centering)
+        # For EVEN probe_length (e.g., 80): SNP shifted left by 1 bp
+        #   flank_size=40 → 39 + 1(ref@left) + 40 = 80 ✓ (precise, SNP not at center)
+        # This ensures all probes meet exact length requirements without truncation.
+        is_odd = probe_length % 2 == 1
+        if is_odd:
+            left_flank_len = (probe_length - 1) // 2
+            right_flank_len = (probe_length - 1) // 2
+        else:
+            left_flank_len = probe_length // 2 - 1
+            right_flank_len = probe_length // 2
+        
         has_ref_col = "ref" in df.columns
 
         sequences = {}
@@ -3028,12 +3035,11 @@ def run_tags_assessment(
                 continue
 
             chrom_seq = reference[chrom]
-            start_pos = max(0, pos - 1 - flank_size)   # 0-based start
-            end_pos = min(len(chrom_seq), pos + flank_size)  # 0-based exclusive
-
-            # Split into left_flank + REF + right_flank (same as filter.py)
             left_end = pos - 1       # 0-based position of SNP
             right_start = pos        # 0-based position after SNP
+            
+            start_pos = max(0, left_end - left_flank_len)
+            end_pos = min(len(chrom_seq), right_start + right_flank_len)
 
             left_flank = chrom_seq[start_pos:left_end] if left_end > start_pos else ""
             right_flank = chrom_seq[right_start:end_pos] if end_pos > right_start else ""

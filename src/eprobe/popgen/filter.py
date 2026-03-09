@@ -2526,7 +2526,18 @@ def run_filter(
     ref_dict = ref_result.unwrap()
     
     # Create probe sequences dictionary (SNP ID -> probe sequence)
-    flank_size = (probe_length - 1) // 2
+    # For ODD probe_length (e.g., 81): centered flanking
+    #   left_flank_len=40, right_flank_len=40 → 40 + 1(ref) + 40 = 81 ✓
+    # For EVEN probe_length (e.g., 80): SNP shifted left by 1 bp
+    #   left_flank_len=39, right_flank_len=40 → 39 + 1(ref@left) + 40 = 80 ✓
+    is_odd = probe_length % 2 == 1
+    if is_odd:
+        left_flank_len = (probe_length - 1) // 2
+        right_flank_len = (probe_length - 1) // 2
+    else:
+        left_flank_len = probe_length // 2 - 1
+        right_flank_len = probe_length // 2
+    
     probe_sequences = {}
     
     for snp in snps:
@@ -2536,13 +2547,13 @@ def run_filter(
             continue
         
         chrom_seq = ref_dict[snp.chrom]
-        start_pos = max(0, snp.pos - 1 - flank_size)  # Convert to 0-based
-        end_pos = min(len(chrom_seq), snp.pos + flank_size)
-        
-        # Extract flanking regions
         left_end = snp.pos - 1  # Position before SNP (0-based)
         right_start = snp.pos  # Position after SNP (0-based)
         
+        start_pos = max(0, left_end - left_flank_len)  # 0-based start
+        end_pos = min(len(chrom_seq), right_start + right_flank_len)  # 0-based exclusive
+        
+        # Extract flanking regions
         left_flank = chrom_seq[start_pos:left_end] if left_end > start_pos else ""
         right_flank = chrom_seq[right_start:end_pos] if end_pos > right_start else ""
         
