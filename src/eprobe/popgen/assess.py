@@ -1329,16 +1329,22 @@ def run_easysfs(
         Result containing path to output directory
     """
     import subprocess
-    
+    import sys
+
     easysfs_result = check_easysfs_available()
     if easysfs_result.is_err():
         return Err(easysfs_result.unwrap_err())
-    
+
     easysfs_cmd = easysfs_result.unwrap()
-    
-    # Build command
-    cmd = [easysfs_cmd, "-i", str(vcf_path), "-p", str(pops_file)]
-    
+
+    # Always invoke through the active Python interpreter so that the correct
+    # conda/virtualenv environment (including easySFS dependencies) is used,
+    # regardless of the shebang line in the script.
+    if easysfs_cmd.endswith(".py"):
+        cmd = [sys.executable, easysfs_cmd, "-i", str(vcf_path), "-p", str(pops_file)]
+    else:
+        cmd = [easysfs_cmd, "-i", str(vcf_path), "-p", str(pops_file)]
+
     if preview_only:
         cmd.append("--preview")
     else:
@@ -1346,9 +1352,9 @@ def run_easysfs(
         if projection is not None:
             cmd.extend(["--proj", projection])
         cmd.extend(["-a", "-f", "-y"])  # -a: all SNPs, -f: force overwrite, -y: no prompt
-    
+
     logger.info(f"Running easySFS: {' '.join(cmd)}")
-    
+
     try:
         result = subprocess.run(
             cmd,
@@ -1356,10 +1362,17 @@ def run_easysfs(
             text=True,
             check=False,
         )
-        
+
         if result.returncode != 0:
-            return Err(f"easySFS failed: {result.stderr}\n{result.stdout}")
-        
+            cmd_str = ' '.join(cmd)
+            stderr = result.stderr.strip() or "(empty)"
+            stdout = result.stdout.strip() or "(empty)"
+            return Err(
+                f"easySFS failed (exit {result.returncode}):\n"
+                f"  cmd:    {cmd_str}\n"
+                f"  stderr: {stderr}\n"
+                f"  stdout: {stdout}"
+            )
         if preview_only:
             # Return preview output as text
             logger.info(f"easySFS preview:\n{result.stdout}")
@@ -1386,21 +1399,30 @@ def parse_easysfs_preview(
         Result containing dict of pop_id -> [(projection, n_segregating_sites), ...]
     """
     import subprocess
-    
+    import sys
+
     easysfs_result = check_easysfs_available()
     if easysfs_result.is_err():
         return Err(easysfs_result.unwrap_err())
-    
+
     easysfs_cmd = easysfs_result.unwrap()
-    
-    cmd = [easysfs_cmd, "-i", str(vcf_path), "-p", str(pops_file), "--preview", "-a"]
-    
+
+    if easysfs_cmd.endswith(".py"):
+        cmd = [sys.executable, easysfs_cmd, "-i", str(vcf_path), "-p", str(pops_file), "--preview", "-a"]
+    else:
+        cmd = [easysfs_cmd, "-i", str(vcf_path), "-p", str(pops_file), "--preview", "-a"]
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        
+
         if result.returncode != 0:
-            return Err(f"easySFS preview failed: {result.stderr}")
-        
+            stderr = result.stderr.strip() or "(empty)"
+            stdout = result.stdout.strip() or "(empty)"
+            return Err(
+                f"easySFS preview failed (exit {result.returncode}):\n"
+                f"  stderr: {stderr}\n"
+                f"  stdout: {stdout}"
+            )
         # Parse preview output
         # Format: pop_name\n(proj, n_sites) (proj, n_sites) ...
         preview_dict = {}
