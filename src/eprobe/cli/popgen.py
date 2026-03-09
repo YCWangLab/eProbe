@@ -1292,6 +1292,44 @@ def assess(
       all      - Run all assessments
     
     \b
+    Parameters by mode:
+    
+      ALWAYS REQUIRED:
+        -i, --input        Input SNPs TSV file
+        -o, --output       Output prefix
+      
+      TAGS MODE:
+        -r, --reference    Reference genome FASTA (for sequence generation)
+        --tags             Biophysical metrics to plot (default: gc,tm,complexity,hairpin,dimer)
+        -c, --compare      Second TSV file to overlay for comparison
+        --xlim, --ylim     Fix axis ranges (format: TAG:MIN,MAX, e.g., --xlim gc:0,1)
+        --bins             Histogram bin count per tag (format: TAG:N, e.g., --bins gc:100)
+        -l, --probe_length Probe length for sequence generation (default: 80)
+      
+      DISTANCE MODE (needs -v, --vcf):
+        --max_vcf_sites    Max VCF sites to load (default: 100000)
+        --pop_file         Population assignments (optional, for stratified subsampling)
+        --n_samples_per_pop Max samples per population (default: 100)
+      
+      PCA MODE (needs -v, --vcf):
+        --pop_file         Population assignments (optional, for coloring)
+        --n_samples_per_pop Max samples per population (default: 100)
+        --samples          Specific samples to use (comma-separated)
+      
+      SFS MODE (needs -v, --vcf and --pop_file):
+        --pop_file         Population assignments (REQUIRED, format: sample_id<tab>pop_id)
+        --n_samples_per_pop Samples per population (default: 100, typically 5 for SFS)
+        --pops             Populations to analyze, max 3 (e.g., --pops pop_A,pop_B,pop_C)
+        --projection       easySFS projection (e.g., --projection 10,10,10). If omitted, auto-calculated.
+        --samples          Specific samples to use (comma-separated)
+      
+      COMMON TO DISTANCE/PCA/SFS:
+        -v, --vcf          Original VCF file
+        -t, --threads      Number of threads (default: 1)
+        --seed             Random seed for subsampling (default: 42)
+        --plot             Generate plots (default: yes, use --no_plot to disable)
+    
+    \b
     Output files (depends on mode):
       --mode tags:
         {output}.tags_summary.txt   - Biophysical statistics
