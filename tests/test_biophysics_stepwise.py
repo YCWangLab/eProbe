@@ -367,7 +367,7 @@ def test_dimer():
     ]
     
     # 构建 dimer 索引
-    dimer_calc = DimerCalculatorFast(k=11, include_revcomp=True)
+    dimer_calc = DimerCalculatorFast(k=11)
     n_kmers = dimer_calc.build_index(sequences)
     print(f"\n构建索引: {len(sequences)} 条序列, {n_kmers} 个唯一 k-mer")
     

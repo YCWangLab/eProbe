@@ -86,7 +86,7 @@ def assess_fasta(
     # Pre-compute dimer scores if needed (requires pool-level index)
     dimer_scores: Dict[str, float] = {}
     if "dimer" in tags and len(seq_list) > 1:
-        calc = DimerCalculatorFast(k=11, include_revcomp=True)
+        calc = DimerCalculatorFast(k=11)
         calc.build_index(seq_list)
         scores = calc.calculate_all_scores()
         dimer_scores = dict(zip(seq_ids, scores))
@@ -202,7 +202,7 @@ def filter_fasta(
     
     # Stage 3: Dimer (dual-mode)
     if len(stage2_passed) > 1 and thresholds.dimer > 0:
-        calc = DimerCalculatorFast(k=11, include_revcomp=True)
+        calc = DimerCalculatorFast(k=11)
         seq_list = list(stage2_passed.values())
         calc.build_index(seq_list)
         dimer_scores_list = calc.calculate_all_scores()

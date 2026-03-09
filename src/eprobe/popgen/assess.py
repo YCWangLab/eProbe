@@ -146,7 +146,7 @@ def calculate_dimer_scores(
         return {pid: 0.0 for pid in sequences.keys()}
     
     # Use same dimer calculator as filter.py
-    dimer_calc = DimerCalculatorFast(k=11, include_revcomp=True)
+    dimer_calc = DimerCalculatorFast(k=11)
     
     # Build k-mer index from all probes
     seq_list = list(sequences.values())

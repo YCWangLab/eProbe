@@ -732,8 +732,13 @@ class DimerCalculatorFast:
     """
     Fast calculator for dimer (inter-probe complementarity) scores.
     
-    Pre-builds a k-mer index from all probes, then calculates each probe's
-    dimer score based on how often its k-mers appear in the overall pool.
+    Indexes only the reverse-complement k-mers of all probes, then scores
+    each probe by querying its forward k-mers against this RC index.
+    A hit means another probe's RC contains that k-mer → potential
+    Watson-Crick hybridization (dimer formation).
+    
+    Self-complementarity (own RC hits) is subtracted so the score
+    reflects only inter-probe dimer risk (hairpin is a separate metric).
     
     Higher scores indicate greater potential for dimer formation with other probes.
     
@@ -744,7 +749,6 @@ class DimerCalculatorFast:
     """
     
     k: int = 11  # K-mer size
-    include_revcomp: bool = True  # Include reverse complement k-mers
     
     _kmer_freq: Counter = field(default_factory=Counter, repr=False)
     _sequences: List[str] = field(default_factory=list, repr=False)
@@ -758,86 +762,80 @@ class DimerCalculatorFast:
     
     def build_index(self, sequences: List[str]) -> int:
         """
-        Build k-mer frequency index from all probe sequences.
-        
+        Build k-mer frequency index from reverse complements of all probes.
+
+        Only RC k-mers are indexed so that querying a probe's forward k-mers
+        against this index directly counts complementary matches (i.e. which
+        other probes could hybridize to this one via Watson-Crick pairing).
+
         Args:
             sequences: List of probe sequences
-            
+
         Returns:
             Number of unique k-mers in index
         """
         self._sequences = [seq.upper() for seq in sequences]
         self._total_sequences = len(sequences)
         self._kmer_freq = Counter()
-        
+
         for seq in self._sequences:
-            # Count k-mers in forward sequence
-            for i in range(len(seq) - self.k + 1):
-                kmer = seq[i:i + self.k]
+            rc_seq = _reverse_complement(seq)
+            for i in range(len(rc_seq) - self.k + 1):
+                kmer = rc_seq[i:i + self.k]
                 self._kmer_freq[kmer] += 1
-            
-            # Also count reverse complement k-mers (for detecting sense/antisense dimers)
-            if self.include_revcomp:
-                rc_seq = _reverse_complement(seq)
-                for i in range(len(rc_seq) - self.k + 1):
-                    kmer = rc_seq[i:i + self.k]
-                    self._kmer_freq[kmer] += 1
-        
+
         return len(self._kmer_freq)
-    
+
     def calculate_score(self, sequence: str) -> float:
         """
         Calculate dimer score for a single sequence.
-        
-        Score = sum of k-mer frequencies / total_sequences
-        Higher scores mean more k-mers are shared with other probes.
-        
+
+        Queries the probe's forward k-mers against the RC index.
+        Subtracts the probe's own RC contribution (self-complementarity
+        is hairpin, not inter-probe dimer).
+
+        Score = (sum of other-probe RC hits) / (n_kmers × N_probes) × 10000
+
         Args:
             sequence: DNA sequence
-            
+
         Returns:
-            Dimer score (normalized)
+            Dimer score (normalized, higher = more complementary to pool)
         """
         if self._total_sequences == 0:
             raise ValueError("No sequences indexed. Call build_index first.")
-        
+
         seq = sequence.upper()
-        
+
         if len(seq) < self.k:
             return 0.0
-        
-        # Pre-compute how many times each k-mer appears in THIS probe's RC,
-        # because build_index added RC k-mers too — those inflate the global
-        # frequency and must be subtracted alongside the forward self-contribution.
-        from collections import Counter as _Counter
-        if self.include_revcomp:
-            rc_seq = _reverse_complement(seq)
-            rc_self: dict = _Counter(
-                rc_seq[i:i + self.k] for i in range(len(rc_seq) - self.k + 1)
-            )
-        else:
-            rc_self = {}
 
-        # Sum frequencies of k-mers in this sequence
+        # Count this probe's own RC k-mers so we can subtract self-contribution
+        rc_seq = _reverse_complement(seq)
+        rc_self: Dict[str, int] = {}
+        for i in range(len(rc_seq) - self.k + 1):
+            kmer = rc_seq[i:i + self.k]
+            rc_self[kmer] = rc_self.get(kmer, 0) + 1
+
+        # Query forward k-mers against RC index
         total_freq = 0
         n_kmers = 0
 
         for i in range(len(seq) - self.k + 1):
             kmer = seq[i:i + self.k]
             freq = self._kmer_freq.get(kmer, 0)
-            # Subtract own forward contribution (1) + own RC contributions
-            self_contrib = 1 + rc_self.get(kmer, 0)
-            if freq > 0:
-                total_freq += max(freq - self_contrib, 0)
+            # Subtract own RC contribution (self-complementarity = hairpin, not dimer)
+            self_rc_count = rc_self.get(kmer, 0)
+            other_freq = max(freq - self_rc_count, 0)
+            total_freq += other_freq
             n_kmers += 1
-        
+
         if n_kmers == 0:
             return 0.0
-        
+
         # Normalize by number of k-mers and total sequences
-        # This gives average k-mer sharing per probe (×10000 scale)
         score = total_freq / (n_kmers * self._total_sequences) * 10000
-        
+
         return round(score, 2)
     
     def calculate_all_scores(self) -> List[float]:
@@ -853,7 +851,6 @@ class DimerCalculatorFast:
 def calculate_dimer_batch_fast(
     sequences: List[str],
     k: int = 11,
-    include_revcomp: bool = True,
 ) -> List[float]:
     """
     Calculate dimer scores for a set of sequences.
@@ -864,12 +861,11 @@ def calculate_dimer_batch_fast(
     Args:
         sequences: List of DNA sequences
         k: K-mer size (default: 11)
-        include_revcomp: Whether to include reverse complement k-mers
         
     Returns:
         List of dimer scores
     """
-    calc = DimerCalculatorFast(k=k, include_revcomp=include_revcomp)
+    calc = DimerCalculatorFast(k=k)
     calc.build_index(sequences)
     return calc.calculate_all_scores()
 
