@@ -1532,11 +1532,62 @@ def subset_vcf_by_positions(
         
         # Index the output
         subprocess.run(["bcftools", "index", "-f", str(output_path)], check=False)
-        
+
         return Ok(output_path)
-        
+
     except Exception as e:
         return Err(f"Failed to subset VCF: {e}")
+
+
+def subset_vcf_by_samples(
+    vcf_path: Path,
+    sample_ids: List[str],
+    output_path: Path,
+) -> Result[Path, str]:
+    """
+    Create a subset VCF containing only specified samples using bcftools.
+
+    Args:
+        vcf_path: Input VCF path
+        sample_ids: List of sample IDs to keep
+        output_path: Output VCF path
+
+    Returns:
+        Result containing output path
+    """
+    import subprocess
+    import shutil
+    import tempfile
+
+    if shutil.which("bcftools") is None:
+        return Err("bcftools not found in PATH")
+
+    try:
+        # Write sample list to temp file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            samples_file = f.name
+            for s in sample_ids:
+                f.write(f"{s}\n")
+
+        cmd = [
+            "bcftools", "view",
+            "-S", samples_file,
+            "-O", "z",
+            "-o", str(output_path),
+            str(vcf_path)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        Path(samples_file).unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            return Err(f"bcftools view -S failed (exit {result.returncode}): {result.stderr.strip()}")
+
+        subprocess.run(["bcftools", "index", "-f", str(output_path)], check=False)
+        return Ok(output_path)
+
+    except Exception as e:
+        return Err(f"Failed to subset VCF by samples: {e}")
 
 
 def parse_dadi_1d_sfs(sfs_dir: Path, pop_id: str) -> Result[np.ndarray, str]:
@@ -1978,13 +2029,24 @@ def run_sfs_assessment(
             proj_val = 2 * n_samples_per_pop
             projection = ",".join([str(proj_val)] * len(pop_ids))
             logger.info(f"Auto projection: {projection}")
-        
-        # === Run easySFS on full VCF ===
+
+        # Build flat list of all subsampled sample IDs (for bcftools -S)
+        all_subsampled = [s for samples in subsampled_pops.values() for s in samples]
+
+        # === Subset full VCF to subsampled individuals before running easySFS ===
+        # This avoids OOM: original VCF has all samples; we only need the subsampled ones
+        logger.info(f"Subsetting full VCF to {len(all_subsampled)} subsampled individuals...")
+        full_vcf_sub = tmpdir / "full_samples_subset.vcf.gz"
+        full_sample_result = subset_vcf_by_samples(vcf_path, all_subsampled, full_vcf_sub)
+        if full_sample_result.is_err():
+            return Err(f"Failed to subset full VCF by samples: {full_sample_result.unwrap_err()}")
+
+        # === Run easySFS on sample-subsetted full VCF ===
         logger.info("Running easySFS on full VCF...")
         full_sfs_dir = tmpdir / "full_sfs"
-        
+
         full_result = run_easysfs(
-            vcf_path, sub_pop_file, full_sfs_dir,
+            full_vcf_sub, sub_pop_file, full_sfs_dir,
             projection=projection, preview_only=False
         )
         
@@ -1993,19 +2055,19 @@ def run_sfs_assessment(
         
         # Count sites in full VCF
         n_sites_full = _count_vcf_sites(vcf_path)
-        
-        # === Create probe subset VCF ===
+
+        # === Create probe subset VCF (positions only, from sample-subsetted VCF) ===
         logger.info("Creating probe-subset VCF...")
         probe_vcf = tmpdir / "probe_subset.vcf.gz"
-        subset_result = subset_vcf_by_positions(vcf_path, probe_positions, probe_vcf)
-        
+        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf)
+
         if subset_result.is_err():
             return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
-        
+
         # === Run easySFS on probe VCF ===
         logger.info("Running easySFS on probe-subset VCF...")
         probe_sfs_dir = tmpdir / "probe_sfs"
-        
+
         probe_result = run_easysfs(
             probe_vcf, sub_pop_file, probe_sfs_dir,
             projection=projection, preview_only=False
