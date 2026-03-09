@@ -223,9 +223,19 @@ def snp_in_priority_region(
     return False
 
 
+# Default target values for biophysical scoring
+# [gc%, tm°C, complexity, hairpin, dimer]
+DEFAULT_TARGETS = [50.0, 70.0, 0.0, 0.0, 0.0]
+
+# Maximum plausible range for each metric (used for normalization)
+# score = 1 - |value - target| / range  →  clamped to [0, 1]
+_NORMALIZE_RANGE = [50.0, 30.0, 5.0, None, None]  # None = data-driven
+
+
 def calculate_snp_score(
     snp: SNP,
     weights: List[float],
+    targets: Optional[List[float]] = None,
     probe_sequences: Optional[Dict[str, str]] = None,
 ) -> float:
     """
@@ -237,50 +247,38 @@ def calculate_snp_score(
     Args:
         snp: SNP object
         weights: [gc_weight, tm_weight, complexity_weight, hairpin_weight, dimer_weight]
+        targets: Target values [gc, tm, complexity, hairpin, dimer]. Default: [50,70,0,0,0]
         probe_sequences: Optional dict of SNP ID -> probe sequence
         
     Returns:
         Weighted score (higher = better)
     """
-    # Default weights if not provided
     if weights is None or len(weights) != 5:
         weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+    if targets is None:
+        targets = list(DEFAULT_TARGETS)
     
-    # Get biophysical values from SNP tags if available
-    # SNP is frozen dataclass, so we use getattr to check for tags
     tags = getattr(snp, 'tags', None)
     
     if tags and isinstance(tags, dict):
-        gc = tags.get('gc', 50.0)
-        tm = tags.get('tm', 70.0)
-        complexity = tags.get('complexity', 1.0)
-        hairpin = tags.get('hairpin', 0.0)
-        dimer = tags.get('dimer', 0.0)
+        gc = tags.get('gc', targets[0])
+        tm = tags.get('tm', targets[1])
+        complexity = tags.get('complexity', targets[2])
+        hairpin = tags.get('hairpin', targets[3])
+        dimer = tags.get('dimer', targets[4])
     else:
-        # Use defaults if no tags
-        gc = 50.0
-        tm = 70.0
-        complexity = 1.0
-        hairpin = 0.0
-        dimer = 0.0
+        gc = targets[0]
+        tm = targets[1]
+        complexity = targets[2]
+        hairpin = targets[3]
+        dimer = targets[4]
     
-    # Normalize scores (higher = better for selection)
-    # GC: optimal around 50, penalty for deviation
-    gc_score = 1.0 - abs(gc - 50.0) / 50.0
+    gc_score = max(0, 1.0 - abs(gc - targets[0]) / _NORMALIZE_RANGE[0])
+    tm_score = max(0, 1.0 - abs(tm - targets[1]) / _NORMALIZE_RANGE[1])
+    complexity_score = max(0, 1.0 - abs(complexity - targets[2]) / _NORMALIZE_RANGE[2])
+    hairpin_score = max(0, 1.0 - hairpin) if targets[3] == 0 else max(0, 1.0 - abs(hairpin - targets[3]))
+    dimer_score = max(0, 1.0 - dimer) if targets[4] == 0 else max(0, 1.0 - abs(dimer - targets[4]))
     
-    # Tm: optimal around 70, penalty for deviation  
-    tm_score = 1.0 - abs(tm - 70.0) / 30.0
-    
-    # Complexity: lower is better (less repetitive)
-    complexity_score = max(0, 1.0 - complexity / 5.0)
-    
-    # Hairpin: lower is better
-    hairpin_score = max(0, 1.0 - hairpin)
-    
-    # Dimer: lower is better
-    dimer_score = max(0, 1.0 - dimer)
-    
-    # Weighted sum
     total_score = (
         weights[0] * gc_score +
         weights[1] * tm_score +
@@ -422,6 +420,7 @@ def select_by_priority(
     seed: int = 42,
     weights: Optional[List[float]] = None,
     snp_df: Optional[pd.DataFrame] = None,
+    targets: Optional[List[float]] = None,
 ) -> Result[Union[List[SNP], Tuple[List[SNP], pd.DataFrame]], str]:
     """
     Select SNPs with priority for specific genomic regions.
@@ -439,6 +438,7 @@ def select_by_priority(
         seed: Random seed for reproducibility
         weights: Optional biophysical weights [gc, tm, complexity, hairpin, dimer]
         snp_df: Optional DataFrame with biophysical columns for weighted selection
+        targets: Target values [gc, tm, complexity, hairpin, dimer]. Default: [50,70,0,0,0]
         
     Returns:
         Result containing selected SNP list (or tuple with DataFrame if weighted)
@@ -487,7 +487,7 @@ def select_by_priority(
         if use_weighted:
             # Filter DataFrame to priority SNPs only
             priority_df = snp_df.iloc[priority_indices].copy()
-            result = select_weighted(priority_snps, target_count, weights, window_size, seed, snp_df=priority_df)
+            result = select_weighted(priority_snps, target_count, weights, window_size, seed, snp_df=priority_df, targets=targets)
             if result.is_err():
                 return result
             selected, selected_df = result.unwrap()
@@ -503,7 +503,7 @@ def select_by_priority(
             priority_df = snp_df.iloc[priority_indices].copy()
             if len(priority_snps) > 0:
                 # Select best from priority using weights
-                result = select_weighted(priority_snps, len(priority_snps), weights, window_size, seed, snp_df=priority_df)
+                result = select_weighted(priority_snps, len(priority_snps), weights, window_size, seed, snp_df=priority_df, targets=targets)
                 if result.is_err():
                     return result
                 selected, selected_df = result.unwrap()
@@ -513,7 +513,7 @@ def select_by_priority(
             if remaining > 0 and other_snps:
                 # Also use weighted for remaining from other regions
                 other_df = snp_df.iloc[other_indices].copy()
-                result = select_weighted(other_snps, remaining, weights, window_size, seed, snp_df=other_df)
+                result = select_weighted(other_snps, remaining, weights, window_size, seed, snp_df=other_df, targets=targets)
                 if result.is_err():
                     return result
                 other_selected, other_df_selected = result.unwrap()
@@ -552,6 +552,7 @@ def select_weighted(
     seed: int = 42,
     snp_df: Optional[pd.DataFrame] = None,
     threads: int = 1,
+    targets: Optional[List[float]] = None,
 ) -> Result[List[SNP], str]:
     """
     Select SNPs based on weighted biophysical scores within windows.
@@ -561,7 +562,7 @@ def select_weighted(
     
     Algorithm:
     1. Validate biophysical columns exist
-    2. Calculate weighted composite score for each SNP
+    2. Calculate weighted composite score for each SNP (distance to targets)
     3. Group by window (chrom + pos // window_size)
     4. Select top-scoring SNP(s) from each window
     
@@ -572,6 +573,7 @@ def select_weighted(
         window_size: Window size for selection (default: 10kb)
         seed: Random seed for tie-breaking
         snp_df: DataFrame with biophysical columns (required for weighted selection)
+        targets: Target values [gc, tm, complexity, hairpin, dimer]. Default: [50,70,0,0,0]
         
     Returns:
         Result containing selected SNP list, or error if biophysical columns missing
@@ -595,35 +597,32 @@ def select_weighted(
     logger.info(f"Weights: gc={weights[0]}, tm={weights[1]}, complexity={weights[2]}, "
                 f"hairpin={weights[3]}, dimer={weights[4]}")
     
+    if targets is None:
+        targets = list(DEFAULT_TARGETS)
+    logger.info(f"Targets: gc={targets[0]}, tm={targets[1]}, complexity={targets[2]}, "
+                f"hairpin={targets[3]}, dimer={targets[4]}")
+    
     df = snp_df.copy()
     
     # === VECTORIZED SCORE CALCULATION (FAST) ===
-    # Normalize each metric to 0-1 scale (higher = better)
+    # Normalize each metric: score = 1 - |value - target| / range  (clamped to [0,1])
     
-    # GC: optimal around 50%, penalty for deviation
-    df['gc_score'] = 1.0 - np.abs(df['gc'] - 50.0) / 50.0
+    # GC: distance from target
+    df['gc_score'] = (1.0 - np.abs(df['gc'] - targets[0]) / _NORMALIZE_RANGE[0]).clip(lower=0)
     
-    # Tm: optimal around 70°C, penalty for deviation
-    df['tm_score'] = 1.0 - np.abs(df['tm'] - 70.0) / 30.0
-    df['tm_score'] = df['tm_score'].clip(lower=0)
+    # Tm: distance from target
+    df['tm_score'] = (1.0 - np.abs(df['tm'] - targets[1]) / _NORMALIZE_RANGE[1]).clip(lower=0)
     
-    # Complexity: lower is better (less repetitive)
-    df['complexity_score'] = (1.0 - df['complexity'] / 5.0).clip(lower=0)
+    # Complexity: distance from target
+    df['complexity_score'] = (1.0 - np.abs(df['complexity'] - targets[2]) / _NORMALIZE_RANGE[2]).clip(lower=0)
     
-    # Hairpin: lower is better (use percentile or raw score)
-    # Assume hairpin is normalized 0-1 or use max normalization
-    max_hairpin = df['hairpin'].max()
-    if max_hairpin > 0:
-        df['hairpin_score'] = 1.0 - df['hairpin'] / max_hairpin
-    else:
-        df['hairpin_score'] = 1.0
+    # Hairpin: distance from target (data-driven normalization)
+    max_hairpin = max(df['hairpin'].max(), 1.0)
+    df['hairpin_score'] = (1.0 - np.abs(df['hairpin'] - targets[3]) / max_hairpin).clip(lower=0)
     
-    # Dimer: lower is better
-    max_dimer = df['dimer'].max()
-    if max_dimer > 0:
-        df['dimer_score'] = 1.0 - df['dimer'] / max_dimer
-    else:
-        df['dimer_score'] = 1.0
+    # Dimer: distance from target (data-driven normalization)
+    max_dimer = max(df['dimer'].max(), 1.0)
+    df['dimer_score'] = (1.0 - np.abs(df['dimer'] - targets[4]) / max_dimer).clip(lower=0)
     
     # Weighted composite score
     df['weighted_score'] = (
@@ -739,6 +738,7 @@ def run_select(
     target_count: Optional[int] = None,
     window_size: int = 10000,
     weights: Optional[List[float]] = None,
+    targets: Optional[List[float]] = None,
     priority_bed: Optional[Path] = None,
     chromosomes: Optional[List[str]] = None,
     seed: int = 42,
@@ -762,6 +762,7 @@ def run_select(
         target_count: Target number of SNPs to select (None = keep all)
         window_size: Window size for selection
         weights: Biophysical weights [gc, tm, complexity, hairpin, dimer]
+        targets: Biophysical target values [gc, tm, complexity, hairpin, dimer] (default: 50,70,0,0,0)
         priority_bed: BED file with priority regions
         chromosomes: Optional list of chromosomes to include
         seed: Random seed for reproducibility
@@ -844,7 +845,7 @@ def run_select(
         elif strategy_lower == "weighted":
             if weights is None:
                 weights = [1.0, 1.0, 1.0, 1.0, 1.0]
-            result = select_weighted(snps, probe_number, weights, window_size, seed, snp_df=raw_df, threads=threads)
+            result = select_weighted(snps, probe_number, weights, window_size, seed, snp_df=raw_df, threads=threads, targets=targets)
             # Weighted returns (snps, df_with_biophysical)
             if result.is_ok():
                 selected_snps, selected_with_biophysical = result.unwrap()
@@ -902,7 +903,7 @@ def run_select(
             # Priority strategy can optionally use weights for biophysical scoring
             result = select_by_priority(
                 snps, probe_number, priority_regions, window_size, seed,
-                weights=weights, snp_df=raw_df
+                weights=weights, snp_df=raw_df, targets=targets
             )
             
             # Check if result is tuple (weighted was used) or just list

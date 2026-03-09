@@ -841,6 +841,12 @@ def filter(
     help="Weights for biophysical features: gc,tm,complexity,hairpin,dimer (default: 1,1,1,1,1).",
 )
 @click.option(
+    "--targets",
+    type=str,
+    help="Target values for biophysical features: gc,tm,complexity,hairpin,dimer "
+         "(default: 50,70,0,0,0). Scoring penalises distance from each target.",
+)
+@click.option(
     "--priority_bed",
     type=click.Path(exists=True, path_type=Path),
     help="BED file of priority regions (e.g., exons). Required for 'priority' strategy.",
@@ -877,6 +883,7 @@ def select(
     window_size: int,
     strategy: str,
     weights: Optional[str],
+    targets: Optional[str],
     priority_bed: Optional[Path],
     target_count: Optional[int],
     seed: int,
@@ -918,6 +925,14 @@ def select(
         if len(weight_values) != 5:
             echo_error("Weights must have 5 values: gc,tm,complexity,hairpin,dimer")
             raise SystemExit(1)
+
+    # Parse targets if provided
+    target_values = None
+    if targets:
+        target_values = list(map(float, targets.split(",")))
+        if len(target_values) != 5:
+            echo_error("Targets must have 5 values: gc,tm,complexity,hairpin,dimer")
+            raise SystemExit(1)
     
     # Handle multiple input files
     merge_details = None
@@ -958,6 +973,7 @@ def select(
         window_size=window_size,
         strategy=strategy,
         weights=weight_values,
+        targets=target_values,
         priority_bed=priority_bed,
         target_count=target_count,
         seed=seed,
