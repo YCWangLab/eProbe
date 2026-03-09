@@ -6,10 +6,8 @@ import pytest
 from pathlib import Path
 from eprobe.funcgen.from_fasta import (
     tile_sequence,
-    TilingConfig,
     parse_haplotype_id,
-    group_haplotypes,
-    HaplotypeConfig,
+    group_by_gene,
 )
 from eprobe.funcgen.from_bed import (
     parse_bed_file,
@@ -22,40 +20,36 @@ class TestTileSequence:
     
     def test_basic_tiling(self):
         """Test basic tiling with step size."""
-        config = TilingConfig(probe_length=10, step_size=5)
         sequence = "A" * 30
         
-        probes = tile_sequence("test", sequence, config)
+        probes = tile_sequence("test", sequence, 10, 5)
         
         assert len(probes) > 0
         assert all(len(p.sequence) == 10 for p in probes)
     
     def test_short_sequence(self):
         """Test sequence shorter than probe length."""
-        config = TilingConfig(probe_length=20, step_size=10)
         sequence = "ATCGATCGATCG"  # 12 bp
         
-        probes = tile_sequence("test", sequence, config)
+        probes = tile_sequence("test", sequence, 20, 10)
         
         # Should return empty or single truncated probe
         assert len(probes) == 0
     
     def test_exact_probe_length(self):
         """Test sequence exactly probe length."""
-        config = TilingConfig(probe_length=10, step_size=5)
         sequence = "ATCGATCGAT"  # Exactly 10 bp
         
-        probes = tile_sequence("test", sequence, config)
+        probes = tile_sequence("test", sequence, 10, 5)
         
         assert len(probes) == 1
         assert probes[0].sequence == "ATCGATCGAT"
     
     def test_probe_ids_sequential(self):
         """Test that probe IDs are sequential."""
-        config = TilingConfig(probe_length=10, step_size=5)
         sequence = "A" * 50
         
-        probes = tile_sequence("gene1", sequence, config)
+        probes = tile_sequence("gene1", sequence, 10, 5)
         
         for i, probe in enumerate(probes):
             assert f"P{i+1:04d}" in probe.id
@@ -90,8 +84,7 @@ class TestHaplotypeProcessing:
             "GENE2_1": "GCTA",
         }
         
-        config = HaplotypeConfig(enabled=True, separator="_")
-        groups = group_haplotypes(sequences, config)
+        groups = group_by_gene(sequences, "_")
         
         assert "GENE1" in groups
         assert "GENE2" in groups

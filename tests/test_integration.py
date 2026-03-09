@@ -9,7 +9,7 @@ import pytest
 from pathlib import Path
 from eprobe.core.fasta import read_fasta, write_fasta
 from eprobe.core.models import SNP, SNPDataFrame
-from eprobe.funcgen.from_fasta import tile_sequence, TilingConfig, parse_haplotype_id, group_haplotypes, HaplotypeConfig
+from eprobe.funcgen.from_fasta import tile_sequence, parse_haplotype_id, group_by_gene
 from eprobe.funcgen.from_bed import parse_bed_file
 from eprobe.biophysics import calculate_gc, calculate_tm, calculate_complexity, calculate_hairpin_score
 from eprobe.biophysics.entropy import calculate_entropy
@@ -106,11 +106,9 @@ class TestFuncgenFromFasta:
         assert result.is_ok()
         sequences = result.unwrap()
         
-        config = TilingConfig(probe_length=81, step_size=30)
-        
         total_probes = []
         for seq_id, sequence in sequences.items():
-            probes = tile_sequence(seq_id, sequence, config)
+            probes = tile_sequence(seq_id, sequence, 81, 30)
             total_probes.extend(probes)
         
         assert len(total_probes) > 0
@@ -134,8 +132,7 @@ class TestFuncgenFromFasta:
         assert allele_id == "1"
         
         # Group by gene
-        config = HaplotypeConfig(enabled=True, separator="_")
-        groups = group_haplotypes(sequences, config)
+        groups = group_by_gene(sequences, "_")
         
         assert "BRCA1" in groups
         assert "BRCA2" in groups
@@ -155,10 +152,8 @@ class TestBiophysicsWithRealSequences:
         assert result.is_ok()
         sequences = result.unwrap()
         
-        config = TilingConfig(probe_length=81, step_size=30)
-        
         for seq_id, sequence in sequences.items():
-            probes = tile_sequence(seq_id, sequence, config)
+            probes = tile_sequence(seq_id, sequence, 81, 30)
             
             for probe in probes:
                 # Calculate all biophysics properties
@@ -197,10 +192,9 @@ class TestEndToEndWorkflow:
         sequences = result.unwrap()
         
         # Step 2: Generate probes
-        config = TilingConfig(probe_length=81, step_size=30)
         all_probes = []
         for seq_id, sequence in sequences.items():
-            probes = tile_sequence(seq_id, sequence, config)
+            probes = tile_sequence(seq_id, sequence, 81, 30)
             all_probes.extend(probes)
         
         assert len(all_probes) > 0

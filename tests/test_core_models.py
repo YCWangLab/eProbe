@@ -45,8 +45,8 @@ class TestSNP:
             alt="G",
         )
         
-        # ID format: chrom:pos_ref>alt
-        assert snp.id == "chr1:100_A>G"
+        # ID format: chrom:pos_ref_to_alt (uses _to_ to avoid FASTA '>' conflicts)
+        assert snp.id == "chr1:100_A_to_G"
     
     def test_snp_invalid_ref(self):
         """Test SNP rejects invalid reference allele."""

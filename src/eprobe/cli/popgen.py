@@ -1241,9 +1241,9 @@ def build(
 )
 @click.option(
     "-l", "--probe_length",
-    default=80,
+    default=81,
     type=int,
-    help="[tags mode] Probe length when generating sequences from TSV (default: 80).",
+    help="[tags mode] Probe length when generating sequences from TSV (default: 81).",
 )
 @click.pass_context
 def assess(
@@ -1304,7 +1304,7 @@ def assess(
         -c, --compare      Second TSV file to overlay for comparison
         --xlim, --ylim     Fix axis ranges (format: TAG:MIN,MAX, e.g., --xlim gc:0,1)
         --bins             Histogram bin count per tag (format: TAG:N, e.g., --bins gc:100)
-        -l, --probe_length Probe length for sequence generation (default: 80)
+        -l, --probe_length Probe length for sequence generation (default: 81)
       
       DISTANCE MODE (needs -v, --vcf):
         --max_vcf_sites    Max VCF sites to load (default: 100000)

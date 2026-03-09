@@ -2746,7 +2746,7 @@ def run_assess(
     reference_path: Optional[Path] = None,
     tags: Optional[List[str]] = None,
     generate_plots: bool = True,
-    probe_length: int = 80,
+    probe_length: int = 81,
     sample_dimer: int = 1000,
     max_vcf_sites: int = 100000,
     pop_file: Optional[Path] = None,
@@ -2780,7 +2780,7 @@ def run_assess(
         reference_path: Reference FASTA (optional, for generating probe sequences)
         tags: List of metrics to calculate (default: gc, tm, complexity, hairpin)
         generate_plots: Generate distribution plots
-        probe_length: Probe length when generating sequences from TSV (default: 80)
+        probe_length: Probe length when generating sequences from TSV (default: 81)
         sample_dimer: Number of pairs to sample for dimer calculation
         max_vcf_sites: Maximum sites to load from full VCF
         pop_file: Population assignment file for SFS/PCA mode (optional for PCA coloring)
@@ -2940,7 +2940,7 @@ def run_tags_assessment(
     plot_xlim: Optional[Dict[str, Tuple[float, float]]] = None,
     plot_ylim: Optional[Dict[str, Tuple[float, float]]] = None,
     plot_bins: Optional[Dict[str, int]] = None,
-    probe_length: int = 80,
+    probe_length: int = 81,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -3010,9 +3010,10 @@ def run_tags_assessment(
 
         # Generate probe sequences matching filter.py logic:
         # Symmetric flanking around SNP with REF base at centre.
-        # For probe_length=81: flank_size=40 → 40 + 1(ref) + 40 = 81
-        # For probe_length=80: flank_size=39 → 39 + 1(ref) + 39 = 79 (!)
-        # Recommend using an odd probe_length for exact centering.
+        # For probe_length=81: flank_size=40 → 40 + 1(ref) + 40 = 81 ✓ (perfect centering)
+        # For probe_length=80: flank_size=39 → 39 + 1(ref) + 39 = 79 (truncated, boundary SNP discarded)
+        # NOTE: Even probe_length values result in loss of coverage at sequence boundaries.
+        # Recommend using odd probe_length (e.g., 81) for maximum coverage and exact centering.
         flank_size = (probe_length - 1) // 2
         has_ref_col = "ref" in df.columns
 

@@ -4,10 +4,9 @@ Tests for eprobe.popgen modules.
 
 import pytest
 from pathlib import Path
+import numpy as np
 from eprobe.popgen.extract import (
-    detect_clusters,
-    apply_cluster_filter,
-    ClusterConfig,
+    detect_clusters_numpy,
 )
 from eprobe.popgen.select import (
     select_uniform,
@@ -38,11 +37,10 @@ class TestClusterDetection:
             make_snp("chr1", 1000, "G", "A"),
         ]
         
-        config = ClusterConfig(flank=60, max_snp=3)
-        result = apply_cluster_filter(snps, config)
+        positions = np.array([s.pos for s in snps])
+        mask = detect_clusters_numpy(positions, flank=60, max_snp=3)
         
-        assert result.is_ok()
-        assert len(result.unwrap()) == 3  # No SNPs removed
+        assert mask.sum() == 3  # No SNPs removed
     
     def test_cluster_detected(self):
         """Test cluster is detected and removed."""
@@ -56,25 +54,24 @@ class TestClusterDetection:
             make_snp("chr1", 1000, "G", "C"),  # Far away, not in cluster
         ]
         
-        config = ClusterConfig(flank=60, max_snp=3)
-        result = apply_cluster_filter(snps, config)
+        positions = np.array([s.pos for s in snps])
+        mask = detect_clusters_numpy(positions, flank=60, max_snp=3)
         
-        assert result.is_ok()
         # Clustered SNPs should be removed
-        assert len(result.unwrap()) < 6
+        assert mask.sum() < 6
     
-    def test_disabled_filter(self):
-        """Test cluster filter when disabled."""
+    def test_tight_threshold(self):
+        """Test cluster filter with max_snp=1 (each SNP must be alone)."""
         snps = [
             make_snp("chr1", 100, "A", "G"),
-            make_snp("chr1", 110, "C", "T"),  # Would be in cluster
+            make_snp("chr1", 110, "C", "T"),  # Within 60bp of first
         ]
         
-        config = ClusterConfig(flank=60, max_snp=1, enabled=False)
-        result = apply_cluster_filter(snps, config)
+        positions = np.array([s.pos for s in snps])
+        mask = detect_clusters_numpy(positions, flank=60, max_snp=1)
         
-        assert result.is_ok()
-        assert len(result.unwrap()) == 2  # None removed
+        # Both SNPs see each other → both filtered
+        assert mask.sum() == 0
 
 
 class TestWindowCalculation:
@@ -148,7 +145,7 @@ class TestProbeCoordinates:
     
     def test_centered_probe(self):
         """Test probe with SNP at center."""
-        start, end, offset = calculate_probe_coordinates(
+        start, end, offset, _ = calculate_probe_coordinates(
             snp_pos=100,
             probe_length=81,
             shift=0,
@@ -160,7 +157,7 @@ class TestProbeCoordinates:
     
     def test_shifted_probe(self):
         """Test probe with SNP shifted."""
-        start, end, offset = calculate_probe_coordinates(
+        start, end, offset, _ = calculate_probe_coordinates(
             snp_pos=100,
             probe_length=81,
             shift=20,  # Shift right, SNP moves left
@@ -171,7 +168,7 @@ class TestProbeCoordinates:
     
     def test_probe_length_odd(self):
         """Test odd probe length."""
-        start, end, offset = calculate_probe_coordinates(
+        start, end, offset, _ = calculate_probe_coordinates(
             snp_pos=100,
             probe_length=81,
             shift=0,
