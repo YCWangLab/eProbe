@@ -1239,6 +1239,12 @@ def build(
     help="[tags mode] Number of histogram bins for a tag (e.g. --bins gc:100 --bins tm:50). "
          "Default: 50 per tag. Repeatable per tag.",
 )
+@click.option(
+    "-l", "--probe_length",
+    default=80,
+    type=int,
+    help="[tags mode] Probe length when generating sequences from TSV (default: 80).",
+)
 @click.pass_context
 def assess(
     ctx: click.Context,
@@ -1261,6 +1267,7 @@ def assess(
     xlim: tuple,
     ylim: tuple,
     bins: tuple,
+    probe_length: int,
 ) -> None:
     """
     Assess quality of probe set.
@@ -1385,6 +1392,7 @@ def assess(
         reference_path=reference,
         tags=tags.split(","),
         generate_plots=plot,
+        probe_length=probe_length,
         max_vcf_sites=max_vcf_sites,
         pop_file=pop_file,
         n_samples_per_pop=n_samples_per_pop,

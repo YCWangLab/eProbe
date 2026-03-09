@@ -2742,6 +2742,7 @@ def run_assess(
     reference_path: Optional[Path] = None,
     tags: Optional[List[str]] = None,
     generate_plots: bool = True,
+    probe_length: int = 80,
     sample_dimer: int = 1000,
     max_vcf_sites: int = 100000,
     pop_file: Optional[Path] = None,
@@ -2775,6 +2776,7 @@ def run_assess(
         reference_path: Reference FASTA (optional, for generating probe sequences)
         tags: List of metrics to calculate (default: gc, tm, complexity, hairpin)
         generate_plots: Generate distribution plots
+        probe_length: Probe length when generating sequences from TSV (default: 80)
         sample_dimer: Number of pairs to sample for dimer calculation
         max_vcf_sites: Maximum sites to load from full VCF
         pop_file: Population assignment file for SFS/PCA mode (optional for PCA coloring)
@@ -2981,70 +2983,46 @@ def run_tags_assessment(
             return Err(f"Failed to read FASTA: {fasta_result.unwrap_err()}")
         sequences = fasta_result.unwrap()
     elif suffix == '.tsv':
-        # Load from TSV - check if it has biophysical columns already
+        # Always generate probe sequences fresh from reference + coordinates.
+        # Never reuse biophysical columns from filter step — assess is an
+        # independent quality check that must recalculate from scratch.
         snp_df_result = SNPDataFrame.from_tsv(input_path)
         if snp_df_result.is_err():
             return Err(f"Failed to read TSV: {snp_df_result.unwrap_err()}")
-        
+
         snp_df = snp_df_result.unwrap()
         df = snp_df.df
-        
-        # Check if biophysical columns already exist
-        biophysical_cols = ['gc', 'tm', 'complexity', 'hairpin', 'dimer']
-        existing_cols = [c for c in biophysical_cols if c in df.columns]
-        
-        if existing_cols:
-            # Use existing biophysical data from filter step
-            logger.info(f"Found existing biophysical columns: {existing_cols}")
 
-            # Load compare DataFrame if a compare path was provided
-            compare_df = None
-            if compare_path is not None:
-                cmp_snp_result = SNPDataFrame.from_tsv(compare_path)
-                if cmp_snp_result.is_err():
-                    logger.warning(f"Could not load compare TSV: {cmp_snp_result.unwrap_err()}")
-                else:
-                    compare_df = cmp_snp_result.unwrap().df
+        if reference_path is None:
+            return Err("TSV input requires --reference to generate probe sequences")
 
-            return run_tags_from_dataframe(
-                df, existing_cols, output_prefix, generate_plots,
-                compare_df=compare_df,
-                xlim_overrides=plot_xlim,
-                ylim_overrides=plot_ylim,
-                bins_overrides=plot_bins,
-            )
-        else:
-            # Need to generate sequences - requires reference
-            if reference_path is None:
-                return Err("TSV without biophysical columns requires --reference to generate sequences")
-            
-            # Load reference and generate sequences
-            ref_result = read_fasta(reference_path)
-            if ref_result.is_err():
-                return Err(f"Failed to read reference: {ref_result.unwrap_err()}")
-            
-            reference = ref_result.unwrap()
-            
-            # Generate probe sequences from SNP positions
-            sequences = {}
-            flank_size = 40  # Default flank size
-            
-            for _, row in df.iterrows():
-                chrom = str(row['chr'])
-                pos = int(row['pos'])
-                
-                if chrom not in reference:
-                    continue
-                
-                ref_seq = reference[chrom]
-                start = max(0, pos - flank_size - 1)
-                end = min(len(ref_seq), pos + flank_size)
-                
-                probe_seq = ref_seq[start:end]
-                probe_id = f"{chrom}_{pos}"
-                sequences[probe_id] = probe_seq
-            
-            logger.info(f"Generated {len(sequences)} probe sequences from reference")
+        ref_result = read_fasta(reference_path)
+        if ref_result.is_err():
+            return Err(f"Failed to read reference: {ref_result.unwrap_err()}")
+
+        reference = ref_result.unwrap()
+
+        # Centre probe on SNP; split evenly (left gets the extra base for odd lengths)
+        half_left = probe_length // 2
+        half_right = probe_length - half_left - 1
+
+        sequences = {}
+        for _, row in df.iterrows():
+            chrom = str(row['chr'])
+            pos = int(row['pos'])
+
+            if chrom not in reference:
+                continue
+
+            ref_seq = reference[chrom]
+            start = max(0, pos - half_left - 1)
+            end = min(len(ref_seq), pos + half_right)
+
+            probe_seq = ref_seq[start:end]
+            probe_id = f"{chrom}_{pos}"
+            sequences[probe_id] = probe_seq
+
+        logger.info(f"Generated {len(sequences)} probe sequences (length={probe_length}) from reference")
     else:
         return Err(f"Unsupported input format: {suffix}")
     
