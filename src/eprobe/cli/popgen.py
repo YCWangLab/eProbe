@@ -1215,6 +1215,30 @@ def build(
     default=None,
     help="[tags mode] Second TSV (e.g. post-filter) to overlay distributions against the main input.",
 )
+@click.option(
+    "--xlim",
+    "xlim",
+    multiple=True,
+    metavar="TAG:MIN,MAX",
+    help="[tags mode] Fix x-axis range for a tag (e.g. --xlim gc:0,1 --xlim tm:30,80). "
+         "Default: auto (P99-clipped). Repeatable per tag.",
+)
+@click.option(
+    "--ylim",
+    "ylim",
+    multiple=True,
+    metavar="TAG:MIN,MAX",
+    help="[tags mode] Fix y-axis (percent) range for a tag (e.g. --ylim gc:0,50). "
+         "Default: auto. Repeatable per tag.",
+)
+@click.option(
+    "--bins",
+    "bins",
+    multiple=True,
+    metavar="TAG:N",
+    help="[tags mode] Number of histogram bins for a tag (e.g. --bins gc:100 --bins tm:50). "
+         "Default: 50 per tag. Repeatable per tag.",
+)
 @click.pass_context
 def assess(
     ctx: click.Context,
@@ -1234,6 +1258,9 @@ def assess(
     seed: int,
     threads: int,
     compare: Optional[Path],
+    xlim: tuple,
+    ylim: tuple,
+    bins: tuple,
 ) -> None:
     """
     Assess quality of probe set.
@@ -1319,7 +1346,37 @@ def assess(
     pops_list = None
     if pops is not None:
         pops_list = [p.strip() for p in pops.split(",")]
-    
+
+    # Parse --xlim / --ylim / --bins into dicts  (format: "tag:min,max" or "tag:n")
+    def _parse_range(values: tuple) -> dict:
+        out = {}
+        for v in values:
+            try:
+                tag_part, rest = v.split(":", 1)
+                lo, hi = rest.split(",", 1)
+                out[tag_part.strip()] = (float(lo), float(hi))
+            except Exception:
+                echo_error(
+                    f"Invalid format '{v}' — expected TAG:MIN,MAX (e.g. gc:0,1). Ignoring."
+                )
+        return out
+
+    def _parse_bins(values: tuple) -> dict:
+        out = {}
+        for v in values:
+            try:
+                tag_part, n = v.split(":", 1)
+                out[tag_part.strip()] = int(n.strip())
+            except Exception:
+                echo_error(
+                    f"Invalid format '{v}' — expected TAG:N (e.g. gc:100). Ignoring."
+                )
+        return out
+
+    plot_xlim = _parse_range(xlim) or None
+    plot_ylim = _parse_range(ylim) or None
+    plot_bins = _parse_bins(bins) or None
+
     result = run_assess(
         input_path=input,
         output_prefix=output,
@@ -1338,6 +1395,9 @@ def assess(
         threads=threads,
         verbose=verbose,
         compare_path=compare,
+        plot_xlim=plot_xlim,
+        plot_ylim=plot_ylim,
+        plot_bins=plot_bins,
     )
     
     if result.is_err():

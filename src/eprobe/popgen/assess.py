@@ -2585,6 +2585,9 @@ def generate_assessment_plots(
     tags: List[str],
     output_prefix: Path,
     compare_results: Optional[List[AssessmentResult]] = None,
+    xlim_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
+    ylim_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
+    bins_overrides: Optional[Dict[str, int]] = None,
 ) -> Result[List[Path], str]:
     """
     Generate distribution plots for assessment metrics.
@@ -2594,6 +2597,9 @@ def generate_assessment_plots(
         tags: List of metrics to plot
         output_prefix: Output file prefix
         compare_results: Optional second result set to overlay (e.g. post-filter)
+        xlim_overrides: Per-tag x-axis limits, e.g. {"gc": (0.0, 1.0)}
+        ylim_overrides: Per-tag y-axis limits, e.g. {"gc": (0.0, 50.0)}
+        bins_overrides: Per-tag bin count, e.g. {"gc": 100}
 
     Returns:
         Result containing list of generated plot paths
@@ -2615,19 +2621,26 @@ def generate_assessment_plots(
         if len(values) == 0:
             continue
 
-        xlim, bin_edges = _smart_plot_limits(values)
+        tag_bins = (bins_overrides or {}).get(tag, 50)
+        xlim_fixed = (xlim_overrides or {}).get(tag)
 
-        # When overlaying, expand axis to cover both datasets
+        if xlim_fixed is not None:
+            xlim = xlim_fixed
+            bin_edges = np.linspace(xlim[0], xlim[1], tag_bins + 1)
+        else:
+            xlim, bin_edges = _smart_plot_limits(values, n_bins=tag_bins)
+
+        # When overlaying, expand axis to cover both datasets (unless x-axis is fixed)
         cmp_values = np.array([], dtype=float)
         if compare_results is not None:
             cmp_values = np.array(
                 [getattr(r, tag) for r in compare_results if getattr(r, tag) is not None], dtype=float
             )
-            if len(cmp_values) > 0:
-                cmp_xlim, _ = _smart_plot_limits(cmp_values)
+            if len(cmp_values) > 0 and xlim_fixed is None:
+                cmp_xlim, _ = _smart_plot_limits(cmp_values, n_bins=tag_bins)
                 xmax = max(xlim[1], cmp_xlim[1])
                 xlim = (0.0, xmax)
-                bin_edges = np.linspace(0.0, xmax, 51)
+                bin_edges = np.linspace(0.0, xmax, tag_bins + 1)
 
         color = colors[idx % len(colors)]
         sns.set(style='darkgrid')
@@ -2648,6 +2661,9 @@ def generate_assessment_plots(
             ax.legend(fontsize=14)
 
         ax.set_xlim(xlim)
+        ylim_fixed = (ylim_overrides or {}).get(tag)
+        if ylim_fixed is not None:
+            ax.set_ylim(ylim_fixed)
         ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
         ax.set_xlabel('Values', fontsize=20, fontname='Arial', labelpad=10)
         ax.set_ylabel('Percent (%)', fontsize=18, fontname='Arial', labelpad=10)
@@ -2686,6 +2702,9 @@ def run_assess(
     threads: int = 1,
     verbose: bool = False,
     compare_path: Optional[Path] = None,
+    plot_xlim: Optional[Dict[str, Tuple[float, float]]] = None,
+    plot_ylim: Optional[Dict[str, Tuple[float, float]]] = None,
+    plot_bins: Optional[Dict[str, int]] = None,
 ) -> Result[Dict[str, Any], str]:
     """
     Assess quality of probe set.
@@ -2714,6 +2733,10 @@ def run_assess(
         seed: Random seed for sample subsampling
         threads: Number of threads
         verbose: Enable verbose logging
+        compare_path: Second TSV to overlay against input in tags mode
+        plot_xlim: Per-tag x-axis limits, e.g. {"gc": (0.0, 1.0)}
+        plot_ylim: Per-tag y-axis limits, e.g. {"gc": (0.0, 50.0)}
+        plot_bins: Per-tag bin count, e.g. {"gc": 100}
         
     Returns:
         Result containing assessment statistics
@@ -2829,6 +2852,10 @@ def run_assess(
             tags=tags,
             generate_plots=generate_plots,
             sample_dimer=sample_dimer,
+            compare_path=compare_path,
+            plot_xlim=plot_xlim,
+            plot_ylim=plot_ylim,
+            plot_bins=plot_bins,
             verbose=verbose,
         )
         
@@ -2851,6 +2878,10 @@ def run_tags_assessment(
     tags: Optional[List[str]] = None,
     generate_plots: bool = True,
     sample_dimer: int = 1000,
+    compare_path: Optional[Path] = None,
+    plot_xlim: Optional[Dict[str, Tuple[float, float]]] = None,
+    plot_ylim: Optional[Dict[str, Tuple[float, float]]] = None,
+    plot_bins: Optional[Dict[str, int]] = None,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -2865,6 +2896,10 @@ def run_tags_assessment(
         tags: List of metrics to calculate
         generate_plots: Generate distribution plots
         sample_dimer: Number of pairs for dimer sampling
+        compare_path: Optional second TSV to overlay distributions against
+        plot_xlim: Per-tag x-axis limits override, e.g. {"gc": (0.0, 1.0)}
+        plot_ylim: Per-tag y-axis limits override, e.g. {"gc": (0.0, 50.0)}
+        plot_bins: Per-tag bin count override, e.g. {"gc": 100}
         verbose: Enable verbose logging
         
     Returns:
@@ -2920,7 +2955,13 @@ def run_tags_assessment(
                 else:
                     compare_df = cmp_snp_result.unwrap().df
 
-            return run_tags_from_dataframe(df, existing_cols, output_prefix, generate_plots, compare_df=compare_df)
+            return run_tags_from_dataframe(
+                df, existing_cols, output_prefix, generate_plots,
+                compare_df=compare_df,
+                xlim_overrides=plot_xlim,
+                ylim_overrides=plot_ylim,
+                bins_overrides=plot_bins,
+            )
         else:
             # Need to generate sequences - requires reference
             if reference_path is None:
@@ -3011,7 +3052,12 @@ def run_tags_assessment(
     # Generate plots
     plot_paths = []
     if generate_plots:
-        plot_result = generate_assessment_plots(results, tags, output_prefix)
+        plot_result = generate_assessment_plots(
+            results, tags, output_prefix,
+            xlim_overrides=plot_xlim,
+            ylim_overrides=plot_ylim,
+            bins_overrides=plot_bins,
+        )
         if plot_result.is_ok():
             plot_paths = plot_result.unwrap()
     
@@ -3035,6 +3081,9 @@ def run_tags_from_dataframe(
     output_prefix: Path,
     generate_plots: bool = True,
     compare_df: Optional[pd.DataFrame] = None,
+    xlim_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
+    ylim_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
+    bins_overrides: Optional[Dict[str, int]] = None,
 ) -> Result[Dict[str, Any], str]:
     """
     Run tags assessment using existing biophysical columns in DataFrame.
@@ -3047,6 +3096,9 @@ def run_tags_from_dataframe(
         output_prefix: Output prefix
         generate_plots: Whether to generate plots
         compare_df: Optional second DataFrame to overlay in plots (e.g. post-filter)
+        xlim_overrides: Per-tag x-axis limits override
+        ylim_overrides: Per-tag y-axis limits override
+        bins_overrides: Per-tag bin count override
 
     Returns:
         Result with assessment statistics
@@ -3109,17 +3161,24 @@ def run_tags_from_dataframe(
                 if len(values) == 0:
                     continue
 
-                xlim, bin_edges = _smart_plot_limits(values)
+                tag_bins = (bins_overrides or {}).get(tag, 50)
+                xlim_fixed = (xlim_overrides or {}).get(tag)
 
-                # When overlaying, expand axis to cover both datasets
+                if xlim_fixed is not None:
+                    xlim = xlim_fixed
+                    bin_edges = np.linspace(xlim[0], xlim[1], tag_bins + 1)
+                else:
+                    xlim, bin_edges = _smart_plot_limits(values, n_bins=tag_bins)
+
+                # When overlaying, expand axis to cover both datasets (unless x-axis is fixed)
                 cmp_values = np.array([], dtype=float)
                 if compare_df is not None and tag in compare_df.columns:
                     cmp_values = compare_df[tag].dropna().values
-                    if len(cmp_values) > 0:
-                        cmp_xlim, _ = _smart_plot_limits(cmp_values)
+                    if len(cmp_values) > 0 and xlim_fixed is None:
+                        cmp_xlim, _ = _smart_plot_limits(cmp_values, n_bins=tag_bins)
                         xmax = max(xlim[1], cmp_xlim[1])
                         xlim = (0.0, xmax)
-                        bin_edges = np.linspace(0.0, xmax, 51)
+                        bin_edges = np.linspace(0.0, xmax, tag_bins + 1)
 
                 color = colors[idx % len(colors)]
                 sns.set(style='darkgrid')
@@ -3140,6 +3199,9 @@ def run_tags_from_dataframe(
                     ax.legend(fontsize=14)
 
                 ax.set_xlim(xlim)
+                ylim_fixed = (ylim_overrides or {}).get(tag)
+                if ylim_fixed is not None:
+                    ax.set_ylim(ylim_fixed)
                 ax.set_title('Distribution Plot', fontsize=22, fontname='Arial', pad=20)
                 ax.set_xlabel('Values', fontsize=20, fontname='Arial', labelpad=10)
                 ax.set_ylabel('Percent (%)', fontsize=18, fontname='Arial', labelpad=10)
