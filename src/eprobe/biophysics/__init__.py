@@ -25,7 +25,6 @@ from eprobe.biophysics.gc import calculate_gc, calculate_gc_batch
 from eprobe.biophysics.tm import calculate_tm, calculate_tm_batch, TmMethod, TmTable
 from eprobe.biophysics.complexity import calculate_dust_score, calculate_dust_batch
 from eprobe.biophysics.hairpin import calculate_hairpin_score, calculate_hairpin_batch
-from eprobe.biophysics.dimer import calculate_dimer_score, DimerCalculator
 from eprobe.biophysics.entropy import calculate_entropy, calculate_entropy_batch
 from eprobe.biophysics.thermo_entropy import (
     calculate_thermo_entropy,

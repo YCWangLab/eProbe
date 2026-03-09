@@ -806,16 +806,29 @@ class DimerCalculatorFast:
         if len(seq) < self.k:
             return 0.0
         
+        # Pre-compute how many times each k-mer appears in THIS probe's RC,
+        # because build_index added RC k-mers too — those inflate the global
+        # frequency and must be subtracted alongside the forward self-contribution.
+        from collections import Counter as _Counter
+        if self.include_revcomp:
+            rc_seq = _reverse_complement(seq)
+            rc_self: dict = _Counter(
+                rc_seq[i:i + self.k] for i in range(len(rc_seq) - self.k + 1)
+            )
+        else:
+            rc_self = {}
+
         # Sum frequencies of k-mers in this sequence
         total_freq = 0
         n_kmers = 0
-        
+
         for i in range(len(seq) - self.k + 1):
             kmer = seq[i:i + self.k]
-            # Subtract 1 to not count the sequence's own contribution
             freq = self._kmer_freq.get(kmer, 0)
+            # Subtract own forward contribution (1) + own RC contributions
+            self_contrib = 1 + rc_self.get(kmer, 0)
             if freq > 0:
-                total_freq += freq - 1  # -1 to exclude self
+                total_freq += max(freq - self_contrib, 0)
             n_kmers += 1
         
         if n_kmers == 0:
