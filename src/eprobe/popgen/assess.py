@@ -1708,6 +1708,67 @@ def subset_vcf_by_samples(
         return Err(f"Failed to subset VCF by samples: {e}")
 
 
+def subset_vcf_by_samples_and_positions(
+    vcf_path: Path,
+    sample_ids: List[str],
+    positions: Set[Tuple[str, int]],
+    output_path: Path,
+    threads: int = 1,
+) -> Result[Path, str]:
+    """
+    Subset VCF by samples AND positions in a single bcftools call.
+
+    Equivalent to running bcftools view -S samples.txt -T positions.txt
+    in one pass, which avoids writing/reading an intermediate VCF.
+    """
+    import subprocess
+    import shutil
+    import tempfile
+
+    if shutil.which("bcftools") is None:
+        return Err("bcftools not found in PATH")
+
+    samples_file = None
+    regions_file = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            samples_file = f.name
+            for s in sample_ids:
+                f.write(f"{s}\n")
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            regions_file = f.name
+            for chrom, pos in sorted(positions):
+                f.write(f"{chrom}\t{pos}\n")
+
+        cmd = [
+            "bcftools", "view",
+            "-S", samples_file,
+            "--force-samples",
+            "-T", regions_file,
+            "--threads", str(threads),
+            "-O", "z",
+            "-o", str(output_path),
+            str(vcf_path)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+        if result.returncode != 0:
+            return Err(f"bcftools view -S -T failed (exit {result.returncode}): {result.stderr.strip()}")
+
+        subprocess.run(["bcftools", "index", "--threads", str(threads), "-f", str(output_path)], check=False)
+        return Ok(output_path)
+
+    except Exception as e:
+        return Err(f"Failed to subset VCF by samples+positions: {e}")
+    finally:
+        if samples_file:
+            Path(samples_file).unlink(missing_ok=True)
+        if regions_file:
+            Path(regions_file).unlink(missing_ok=True)
+
+
 def parse_dadi_1d_sfs(sfs_dir: Path, pop_id: str) -> Result[np.ndarray, str]:
     """
     Parse 1D SFS from easySFS dadi output.
@@ -2214,10 +2275,14 @@ def run_sfs_assessment(
         # Count sites in full VCF
         n_sites_full = _count_vcf_sites(vcf_path)
 
-        # === Create probe subset VCF (positions only, from sample-subsetted VCF) ===
-        logger.info("Creating probe-subset VCF...")
+        # === Create probe subset VCF (samples + positions in one bcftools call) ===
+        # Read directly from original VCF instead of re-reading the intermediate
+        # full_vcf_sub: this avoids one full I/O pass over that large intermediate file.
+        logger.info("Creating probe-subset VCF (samples + positions in one pass)...")
         probe_vcf = tmpdir / "probe_subset.vcf.gz"
-        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf, threads=threads)
+        subset_result = subset_vcf_by_samples_and_positions(
+            vcf_path, all_subsampled, probe_positions, probe_vcf, threads=threads
+        )
 
         if subset_result.is_err():
             return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
