@@ -1186,6 +1186,14 @@ def build(
     help="easySFS projection values (e.g., '10,10,10'). Auto-calculated if not specified.",
 )
 @click.option(
+    "--pops",
+    type=str,
+    default=None,
+    help="Populations to use for SFS analysis (comma-separated, max 3). "
+         "Samples labeled 'unknown' are always excluded. "
+         "Default: first 3 non-unknown populations found in pop_file.",
+)
+@click.option(
     "--seed",
     default=42,
     type=int,
@@ -1206,6 +1214,7 @@ def assess(
     n_samples_per_pop: int,
     samples: Optional[str],
     projection: Optional[str],
+    pops: Optional[str],
     seed: int,
 ) -> None:
     """
@@ -1226,7 +1235,8 @@ def assess(
       sfs      - Compare multi-population joint Site Frequency Spectrum
                  using easySFS. Requires --pop_file with population assignments.
                  Generates heatmap plots for full VCF and probe set.
-                 NOTE: Recommended for ≤3 populations for better visualization.
+                 NOTE: Max 3 populations. 'unknown' samples are excluded.
+                 Use --pops to select specific populations (e.g., --pops pop_A,pop_B).
       all      - Run all assessments
     
     \b
@@ -1287,6 +1297,11 @@ def assess(
     if samples is not None:
         specified_samples = [s.strip() for s in samples.split(",")]
     
+    # Parse pops
+    pops_list = None
+    if pops is not None:
+        pops_list = [p.strip() for p in pops.split(",")]
+    
     result = run_assess(
         input_path=input,
         output_prefix=output,
@@ -1300,6 +1315,7 @@ def assess(
         n_samples_per_pop=n_samples_per_pop,
         specified_samples=specified_samples,
         projection=projection,
+        pops=pops_list,
         seed=seed,
         verbose=verbose,
     )

@@ -1162,6 +1162,61 @@ def load_pop_file(
         return Err(f"Failed to load pop file: {e}")
 
 
+MAX_SFS_POPULATIONS = 3
+
+
+def select_sfs_populations(
+    pop_dict: Dict[str, List[str]],
+    pops: Optional[List[str]] = None,
+) -> Result[tuple, str]:
+    """
+    Select populations for SFS analysis.
+
+    - Samples labeled 'unknown' (case-insensitive) are always excluded.
+    - If *pops* is given, validate and use those populations (max 3).
+    - Otherwise, auto-select the first MAX_SFS_POPULATIONS sorted populations.
+
+    Returns:
+        Ok((filtered_pop_dict, selected_pop_ids))
+    """
+    # Exclude 'unknown' population
+    valid = {k: v for k, v in pop_dict.items() if k.lower() != "unknown"}
+    n_unknown = sum(len(v) for k, v in pop_dict.items() if k.lower() == "unknown")
+    if n_unknown:
+        logger.info(f"Excluded {n_unknown} samples labeled 'unknown' from SFS analysis")
+
+    if not valid:
+        return Err("No valid populations found after excluding 'unknown'")
+
+    if pops is not None:
+        if len(pops) > MAX_SFS_POPULATIONS:
+            return Err(
+                f"SFS supports at most {MAX_SFS_POPULATIONS} populations, got {len(pops)}: {pops}. "
+                f"Use --pops to specify ≤{MAX_SFS_POPULATIONS} populations."
+            )
+        missing = [p for p in pops if p not in valid]
+        if missing:
+            return Err(
+                f"Specified populations not found in pop_file: {missing}. "
+                f"Available: {sorted(valid.keys())}"
+            )
+        selected = pops
+        logger.info(f"Using user-specified populations for SFS: {selected}")
+    else:
+        all_pops = sorted(valid.keys())
+        selected = all_pops[:MAX_SFS_POPULATIONS]
+        if len(all_pops) > MAX_SFS_POPULATIONS:
+            logger.warning(
+                f"Found {len(all_pops)} populations ({all_pops}), "
+                f"using first {MAX_SFS_POPULATIONS}: {selected}. "
+                f"Use --pops to specify which populations to use."
+            )
+        logger.info(f"Selected populations for SFS: {selected}")
+
+    filtered = {k: valid[k] for k in selected}
+    return Ok((filtered, selected))
+
+
 def subsample_populations(
     pop_dict: Dict[str, List[str]],
     n_samples_per_pop: int,
@@ -1797,6 +1852,7 @@ def run_sfs_assessment(
     n_samples_per_pop: int = 5,
     specified_samples: Optional[List[str]] = None,
     projection: Optional[str] = None,
+    pops: Optional[List[str]] = None,
     seed: int = 42,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
@@ -1853,15 +1909,13 @@ def run_sfs_assessment(
         return Err(pop_result.unwrap_err())
     
     pop_dict = pop_result.unwrap()
-    pop_ids = sorted(pop_dict.keys())
-    
-    # Validate number of populations
-    if len(pop_ids) < 1:
-        return Err("At least one population is required")
-    if len(pop_ids) > 10:
-        logger.warning(f"Large number of populations ({len(pop_ids)}) may result in slow computation and poor visualization. "
-                       "Recommended: ≤3 populations.")
-    
+
+    # Select populations (exclude 'unknown', limit to 3)
+    pop_select_result = select_sfs_populations(pop_dict, pops)
+    if pop_select_result.is_err():
+        return Err(pop_select_result.unwrap_err())
+    pop_dict, pop_ids = pop_select_result.unwrap()
+
     logger.info(f"Populations: {pop_ids}")
     logger.info(f"Samples per pop: {[len(pop_dict[p]) for p in pop_ids]}")
     
@@ -2356,6 +2410,7 @@ def run_assess(
     n_samples_per_pop: int = 5,
     specified_samples: Optional[List[str]] = None,
     projection: Optional[str] = None,
+    pops: Optional[List[str]] = None,
     seed: int = 42,
     threads: int = 1,
     verbose: bool = False,
@@ -2447,6 +2502,7 @@ def run_assess(
             n_samples_per_pop=n_samples_per_pop,
             specified_samples=specified_samples,
             projection=projection,
+            pops=pops,
             seed=seed,
             verbose=verbose,
         )
