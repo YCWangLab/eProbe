@@ -617,6 +617,7 @@ def check_plink_available() -> Result[str, str]:
 def run_plink_ibs_distance(
     vcf_path: Path,
     output_prefix: Path,
+    threads: int = 1,
 ) -> Result[Tuple[np.ndarray, List[str]], str]:
     """
     Calculate 1-IBS distance matrix using PLINK.
@@ -649,6 +650,7 @@ def run_plink_ibs_distance(
             "--double-id",
             "--vcf", str(vcf_path),
             "--distance", "square", "1-ibs",
+            "--threads", str(threads),
             "--out", str(tmp_prefix)
         ]
         
@@ -693,6 +695,7 @@ def run_plink_pca(
     vcf_path: Path,
     output_prefix: Path,
     n_pcs: int = 10,
+    threads: int = 1,
 ) -> Result[Tuple[pd.DataFrame, Dict[str, float], List[str]], str]:
     """
     Run PCA using PLINK.
@@ -727,6 +730,7 @@ def run_plink_pca(
             "--double-id",
             "--vcf", str(vcf_path),
             "--make-bed",
+            "--threads", str(threads),
             "--out", str(bed_prefix)
         ]
         
@@ -736,6 +740,7 @@ def run_plink_pca(
             "--allow-extra-chr",
             "--bfile", str(bed_prefix),
             "--pca", str(n_pcs),
+            "--threads", str(threads),
             "--out", str(pca_prefix)
         ]
         
@@ -897,6 +902,7 @@ def run_pca_assessment(
     n_pcs: int = 10,
     n_samples: int = 100,
     seed: int = 42,
+    threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -906,11 +912,14 @@ def run_pca_assessment(
         snp_tsv_path: Path to selected SNPs TSV file
         vcf_path: Path to original VCF file
         output_prefix: Output file prefix
-        pop_file: Optional population file for coloring
+        pop_file: Optional population file. If provided, stratified subsampling
+            is used to ensure each population is represented (n_samples per pop).
+            Also used for coloring PCA plots.
         n_pcs: Number of principal components
-        n_samples: Max number of individuals to use (random subsample, default: 100).
-            Same individuals are used for both full-VCF and probe-subset analysis.
+        n_samples: If pop_file is None: max total individuals (random subsample).
+            If pop_file is provided: max individuals per population.
         seed: Random seed for subsampling
+        threads: Number of threads for PLINK and bcftools
         verbose: Enable verbose logging
 
     Returns:
@@ -958,7 +967,8 @@ def run_pca_assessment(
         tmpdir = Path(tmpdir)
 
         # === Subsample individuals from VCF ===
-        # Get all sample IDs from VCF header, then random-subsample up to n_samples.
+        # If pop_file provided: stratified sampling (n_samples per population).
+        # Otherwise: pure random subsample up to n_samples total.
         # Same individuals are used for both full-VCF and probe analyses.
         import subprocess, random as _random
         _random.seed(seed)
@@ -974,7 +984,25 @@ def run_pca_assessment(
         if not all_samples:
             return Err("No samples found in VCF header")
 
-        if len(all_samples) > n_samples:
+        if pop_file is not None:
+            # Stratified: sample n_samples per population so every pop is represented
+            pop_result = load_pop_file(pop_file)
+            if pop_result.is_err():
+                return Err(f"Failed to load pop file for stratified sampling: {pop_result.unwrap_err()}")
+            pop_dict_strat = pop_result.unwrap()
+            subsampled = []
+            for pop_id, members in pop_dict_strat.items():
+                if pop_id.lower() == 'unknown':
+                    continue
+                chosen = sorted(_random.sample(members, min(n_samples, len(members))))
+                subsampled.extend(chosen)
+            subsampled = sorted(set(subsampled))
+            logger.info(
+                f"Stratified subsampling: {len(subsampled)} individuals across "
+                f"{sum(1 for p in pop_dict_strat if p.lower() != 'unknown')} populations "
+                f"(≤{n_samples}/pop, seed={seed})"
+            )
+        elif len(all_samples) > n_samples:
             subsampled = sorted(_random.sample(all_samples, n_samples))
             logger.info(f"Subsampled {n_samples}/{len(all_samples)} individuals (seed={seed})")
         else:
@@ -982,13 +1010,13 @@ def run_pca_assessment(
             logger.info(f"Using all {len(all_samples)} individuals")
 
         full_vcf_sub = tmpdir / "full_samples_subset.vcf.gz"
-        sample_sub_result = subset_vcf_by_samples(vcf_path, subsampled, full_vcf_sub)
+        sample_sub_result = subset_vcf_by_samples(vcf_path, subsampled, full_vcf_sub, threads=threads)
         if sample_sub_result.is_err():
             return Err(f"Failed to subset VCF by samples: {sample_sub_result.unwrap_err()}")
 
         # === Run PCA on sample-subsetted full VCF ===
         logger.info("Running PCA on full VCF...")
-        full_pca_result = run_plink_pca(full_vcf_sub, tmpdir / "full", n_pcs=n_pcs)
+        full_pca_result = run_plink_pca(full_vcf_sub, tmpdir / "full", n_pcs=n_pcs, threads=threads)
 
         if full_pca_result.is_err():
             return Err(f"PCA on full VCF failed: {full_pca_result.unwrap_err()}")
@@ -999,14 +1027,14 @@ def run_pca_assessment(
         # === Create probe subset VCF (positions, from sample-subsetted VCF) ===
         logger.info("Creating probe-subset VCF...")
         probe_vcf = tmpdir / "probe_subset.vcf.gz"
-        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf)
+        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf, threads=threads)
 
         if subset_result.is_err():
             return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
 
         # === Run PCA on probe VCF ===
         logger.info("Running PCA on probe-subset VCF...")
-        probe_pca_result = run_plink_pca(probe_vcf, tmpdir / "probe", n_pcs=n_pcs)
+        probe_pca_result = run_plink_pca(probe_vcf, tmpdir / "probe", n_pcs=n_pcs, threads=threads)
 
         if probe_pca_result.is_err():
             return Err(f"PCA on probe VCF failed: {probe_pca_result.unwrap_err()}")
@@ -1521,6 +1549,7 @@ def subset_vcf_by_positions(
     vcf_path: Path,
     positions: Set[Tuple[str, int]],
     output_path: Path,
+    threads: int = 1,
 ) -> Result[Path, str]:
     """
     Create a subset VCF containing only specified positions using bcftools.
@@ -1551,6 +1580,7 @@ def subset_vcf_by_positions(
         cmd = [
             "bcftools", "view",
             "-T", regions_file,
+            "--threads", str(threads),
             "-O", "z",
             "-o", str(output_path),
             str(vcf_path)
@@ -1565,7 +1595,7 @@ def subset_vcf_by_positions(
             return Err(f"bcftools failed: {result.stderr}")
         
         # Index the output
-        subprocess.run(["bcftools", "index", "-f", str(output_path)], check=False)
+        subprocess.run(["bcftools", "index", "--threads", str(threads), "-f", str(output_path)], check=False)
 
         return Ok(output_path)
 
@@ -1577,6 +1607,7 @@ def subset_vcf_by_samples(
     vcf_path: Path,
     sample_ids: List[str],
     output_path: Path,
+    threads: int = 1,
 ) -> Result[Path, str]:
     """
     Create a subset VCF containing only specified samples using bcftools.
@@ -1606,6 +1637,7 @@ def subset_vcf_by_samples(
         cmd = [
             "bcftools", "view",
             "-S", samples_file,
+            "--threads", str(threads),
             "-O", "z",
             "-o", str(output_path),
             str(vcf_path)
@@ -1617,7 +1649,7 @@ def subset_vcf_by_samples(
         if result.returncode != 0:
             return Err(f"bcftools view -S failed (exit {result.returncode}): {result.stderr.strip()}")
 
-        subprocess.run(["bcftools", "index", "-f", str(output_path)], check=False)
+        subprocess.run(["bcftools", "index", "--threads", str(threads), "-f", str(output_path)], check=False)
         return Ok(output_path)
 
     except Exception as e:
@@ -1961,6 +1993,7 @@ def run_sfs_assessment(
     projection: Optional[str] = None,
     pops: Optional[List[str]] = None,
     seed: int = 42,
+    threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -1978,6 +2011,7 @@ def run_sfs_assessment(
         specified_samples: Optional list of specific samples to use
         projection: Projection string (e.g., "10,10,10"), auto-calculated if None
         seed: Random seed for reproducibility
+        threads: Number of threads for bcftools
         verbose: Enable verbose logging
         
     Returns:
@@ -2071,7 +2105,7 @@ def run_sfs_assessment(
         # This avoids OOM: original VCF has all samples; we only need the subsampled ones
         logger.info(f"Subsetting full VCF to {len(all_subsampled)} subsampled individuals...")
         full_vcf_sub = tmpdir / "full_samples_subset.vcf.gz"
-        full_sample_result = subset_vcf_by_samples(vcf_path, all_subsampled, full_vcf_sub)
+        full_sample_result = subset_vcf_by_samples(vcf_path, all_subsampled, full_vcf_sub, threads=threads)
         if full_sample_result.is_err():
             return Err(f"Failed to subset full VCF by samples: {full_sample_result.unwrap_err()}")
 
@@ -2093,7 +2127,7 @@ def run_sfs_assessment(
         # === Create probe subset VCF (positions only, from sample-subsetted VCF) ===
         logger.info("Creating probe-subset VCF...")
         probe_vcf = tmpdir / "probe_subset.vcf.gz"
-        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf)
+        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf, threads=threads)
 
         if subset_result.is_err():
             return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
@@ -2257,8 +2291,10 @@ def run_distance_assessment(
     vcf_path: Path,
     output_prefix: Path,
     max_sites: int = 100000,
+    pop_file: Optional[Path] = None,
     n_samples: int = 100,
     seed: int = 42,
+    threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -2276,9 +2312,12 @@ def run_distance_assessment(
         vcf_path: Path to original VCF file
         output_prefix: Output file prefix
         max_sites: Not used (kept for backwards compatibility)
-        n_samples: Max number of individuals to use (random subsample, default: 100).
-            Same individuals are used for both full-VCF and probe-subset analysis.
+        pop_file: Optional population file. If provided, stratified subsampling
+            is used to ensure each population is represented (n_samples per pop).
+        n_samples: If pop_file is None: max total individuals (random subsample).
+            If pop_file is provided: max individuals per population.
         seed: Random seed for subsampling
+        threads: Number of threads for PLINK and bcftools
         verbose: Enable verbose logging
 
     Returns:
@@ -2326,6 +2365,9 @@ def run_distance_assessment(
         tmpdir = Path(tmpdir)
 
         # === Subsample individuals ===
+        # If pop_file provided: stratified sampling (n_samples per population).
+        # Otherwise: pure random subsample up to n_samples total.
+        # Same individuals are used for both full-VCF and probe analyses.
         import subprocess, random as _random
         _random.seed(seed)
         try:
@@ -2340,7 +2382,25 @@ def run_distance_assessment(
         if not all_samples:
             return Err("No samples found in VCF header")
 
-        if len(all_samples) > n_samples:
+        if pop_file is not None:
+            # Stratified: sample n_samples per population so every pop is represented
+            pop_result = load_pop_file(pop_file)
+            if pop_result.is_err():
+                return Err(f"Failed to load pop file for stratified sampling: {pop_result.unwrap_err()}")
+            pop_dict_strat = pop_result.unwrap()
+            subsampled = []
+            for pop_id, members in pop_dict_strat.items():
+                if pop_id.lower() == 'unknown':
+                    continue
+                chosen = sorted(_random.sample(members, min(n_samples, len(members))))
+                subsampled.extend(chosen)
+            subsampled = sorted(set(subsampled))
+            logger.info(
+                f"Stratified subsampling: {len(subsampled)} individuals across "
+                f"{sum(1 for p in pop_dict_strat if p.lower() != 'unknown')} populations "
+                f"(≤{n_samples}/pop, seed={seed})"
+            )
+        elif len(all_samples) > n_samples:
             subsampled = sorted(_random.sample(all_samples, n_samples))
             logger.info(f"Subsampled {n_samples}/{len(all_samples)} individuals (seed={seed})")
         else:
@@ -2348,13 +2408,13 @@ def run_distance_assessment(
             logger.info(f"Using all {len(all_samples)} individuals")
 
         full_vcf_sub = tmpdir / "full_samples_subset.vcf.gz"
-        sample_sub_result = subset_vcf_by_samples(vcf_path, subsampled, full_vcf_sub)
+        sample_sub_result = subset_vcf_by_samples(vcf_path, subsampled, full_vcf_sub, threads=threads)
         if sample_sub_result.is_err():
             return Err(f"Failed to subset VCF by samples: {sample_sub_result.unwrap_err()}")
 
         # === Calculate IBS distance for sample-subsetted full VCF ===
         logger.info("Calculating IBS distances for full VCF using PLINK...")
-        full_ibs_result = run_plink_ibs_distance(full_vcf_sub, tmpdir / "full")
+        full_ibs_result = run_plink_ibs_distance(full_vcf_sub, tmpdir / "full", threads=threads)
 
         if full_ibs_result.is_err():
             return Err(f"Full VCF IBS failed: {full_ibs_result.unwrap_err()}")
@@ -2366,7 +2426,7 @@ def run_distance_assessment(
         # === Create probe subset VCF (positions, from sample-subsetted VCF) ===
         logger.info("Creating probe-subset VCF...")
         probe_vcf = tmpdir / "probe_subset.vcf.gz"
-        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf)
+        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf, threads=threads)
 
         if subset_result.is_err():
             err_msg = f"VCF subsetting failed: {subset_result.unwrap_err()}"
@@ -2377,7 +2437,7 @@ def run_distance_assessment(
 
         # === Calculate IBS distance for probe VCF ===
         logger.info("Calculating IBS distances for probe set using PLINK...")
-        probe_ibs_result = run_plink_ibs_distance(probe_vcf, tmpdir / "probe")
+        probe_ibs_result = run_plink_ibs_distance(probe_vcf, tmpdir / "probe", threads=threads)
 
         if probe_ibs_result.is_err():
             err_msg = f"Probe VCF IBS failed: {probe_ibs_result.unwrap_err()}"
@@ -2645,8 +2705,10 @@ def run_assess(
             vcf_path=vcf_path,
             output_prefix=output_prefix,
             max_sites=max_vcf_sites,
+            pop_file=pop_file,
             n_samples=n_samples_per_pop,
             seed=seed,
+            threads=threads,
             verbose=verbose,
         )
         
@@ -2677,6 +2739,7 @@ def run_assess(
             projection=projection,
             pops=pops,
             seed=seed,
+            threads=threads,
             verbose=verbose,
         )
         
@@ -2702,6 +2765,7 @@ def run_assess(
             pop_file=pop_file,
             n_samples=n_samples_per_pop,
             seed=seed,
+            threads=threads,
             verbose=verbose,
         )
         

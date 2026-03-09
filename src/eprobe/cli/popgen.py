@@ -1165,13 +1165,15 @@ def build(
 @click.option(
     "--pop_file",
     type=click.Path(exists=True, path_type=Path),
-    help="[sfs/pca modes] Population file (sample_id<tab>pop_id). Required for --mode sfs/pca coloring.",
+    help="[distance/pca/sfs modes] Population file (sample_id<tab>pop_id). "
+         "Required for --mode sfs. Optional for --mode pca/distance (enables stratified subsampling and plot coloring).",
 )
 @click.option(
     "--n_samples_per_pop",
     default=100,
     type=int,
-    help="[distance/pca modes] Max individuals to use (random subsample, default: 100). "
+    help="[distance/pca modes] Max individuals to use per population (with --pop_file, stratified; "
+         "without --pop_file, total random subsample). Default: 100. "
          "[sfs mode] Number of samples per population (default: 100, typical sfs usage: 5).",
 )
 @click.option(
@@ -1197,7 +1199,14 @@ def build(
     "--seed",
     default=42,
     type=int,
-    help="[sfs/pca modes] Random seed for sample subsampling (default: 42).",
+    help="[distance/pca/sfs modes] Random seed for sample subsampling (default: 42).",
+)
+@click.option(
+    "-t", "--threads",
+    "threads",
+    default=1,
+    type=int,
+    help="[distance/pca/sfs modes] Number of threads for PLINK and bcftools (default: 1).",
 )
 @click.option(
     "-c", "--compare",
@@ -1223,6 +1232,7 @@ def assess(
     projection: Optional[str],
     pops: Optional[str],
     seed: int,
+    threads: int,
     compare: Optional[Path],
 ) -> None:
     """
@@ -1325,6 +1335,7 @@ def assess(
         projection=projection,
         pops=pops_list,
         seed=seed,
+        threads=threads,
         verbose=verbose,
         compare_path=compare,
     )
