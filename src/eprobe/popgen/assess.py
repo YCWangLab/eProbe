@@ -2344,10 +2344,9 @@ def generate_assessment_plots(
             bins_interval = xlim_max / 50
             xlim = (0, xlim_max)
         elif tag.lower() == 'dimer':
-            # Center x-axis around data median
-            median_val = float(np.median(values))
-            xlim_max = max(median_val * 10, 0.05)
-            xlim_max = min(xlim_max, float(np.percentile(values, 99)) * 1.5)
+            # Use fixed x-axis range suited for ×10000 scale
+            p99 = float(np.percentile(values, 99))
+            xlim_max = max(p99 * 1.5, 5.0)
             bins_interval = xlim_max / 50
             xlim = (0, xlim_max)
         else:
@@ -2378,8 +2377,7 @@ def generate_assessment_plots(
             ax.axvline(x=18.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (18)')
             ax.legend(fontsize=14)
         elif tag.lower() == 'dimer':
-            med = float(np.median(values))
-            ax.axvline(x=med, color='red', linestyle='--', linewidth=1.5, label=f'median ({med:.4f})')
+            ax.axvline(x=2.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (2.0)')
             ax.legend(fontsize=14)
         
         # Set labels with Arial font (legacy style)
@@ -2850,10 +2848,9 @@ def run_tags_from_dataframe(
                     bins_interval = xlim_max / 50
                     xlim = (0, xlim_max)
                 elif tag.lower() == 'dimer':
-                    # Center x-axis around data median
-                    median_val = float(np.median(values))
-                    xlim_max = max(median_val * 10, 0.05)
-                    xlim_max = min(xlim_max, float(np.percentile(values, 99)) * 1.5)
+                    # Use fixed x-axis range suited for ×10000 scale
+                    p99 = float(np.percentile(values, 99))
+                    xlim_max = max(p99 * 1.5, 5.0)
                     bins_interval = xlim_max / 50
                     xlim = (0, xlim_max)
                 else:
@@ -2884,8 +2881,7 @@ def run_tags_from_dataframe(
                     ax.axvline(x=18.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (18)')
                     ax.legend(fontsize=14)
                 elif tag.lower() == 'dimer':
-                    med = float(np.median(values))
-                    ax.axvline(x=med, color='red', linestyle='--', linewidth=1.5, label=f'median ({med:.4f})')
+                    ax.axvline(x=2.0, color='red', linestyle='--', linewidth=1.5, label='filter threshold (2.0)')
                     ax.legend(fontsize=14)
                 
                 # Set labels with Arial font (legacy style)

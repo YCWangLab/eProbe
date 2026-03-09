@@ -822,10 +822,10 @@ class DimerCalculatorFast:
             return 0.0
         
         # Normalize by number of k-mers and total sequences
-        # This gives average k-mer sharing per probe
-        score = total_freq / (n_kmers * self._total_sequences) * 100
+        # This gives average k-mer sharing per probe (×10000 scale)
+        score = total_freq / (n_kmers * self._total_sequences) * 10000
         
-        return round(score, 4)
+        return round(score, 2)
     
     def calculate_all_scores(self) -> List[float]:
         """
