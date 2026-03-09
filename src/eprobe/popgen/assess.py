@@ -3026,12 +3026,17 @@ def run_tags_assessment(
 
         sequences = {}
         skipped = 0
+        skipped_by_chrom = 0
+        observed_chroms = set()
+        
         for _, row in df.iterrows():
             chrom = str(row['chr'])
             pos = int(row['pos'])
+            observed_chroms.add(chrom)
 
             if chrom not in reference:
                 skipped += 1
+                skipped_by_chrom += 1
                 continue
 
             chrom_seq = reference[chrom]
@@ -3054,8 +3059,21 @@ def run_tags_assessment(
             probe_id = f"{chrom}_{pos}"
             sequences[probe_id] = probe_seq.upper()
 
+        # Diagnose if chromosome mismatch caused all probes to be skipped
+        if len(sequences) == 0 and len(df) > 0:
+            ref_chroms = set(reference.keys())
+            missing_chroms = observed_chroms - ref_chroms
+            if missing_chroms:
+                logger.error(f"CHROMOSOME MISMATCH: {len(missing_chroms)} missing in reference")
+                logger.error(f"  TSV chromosomes: {sorted(observed_chroms)}")
+                logger.error(f"  Reference chromosomes: {sorted(ref_chroms)}")
+                logger.error(f"  Missing in reference: {sorted(missing_chroms)}")
+        
         if skipped > 0:
-            logger.warning(f"Skipped {skipped} probes (missing chrom or boundary-clipped)")
+            boundary_skipped = skipped - skipped_by_chrom
+            logger.warning(f"Skipped {skipped} probes total:")
+            logger.warning(f"  - {skipped_by_chrom} missing chromosome in reference")
+            logger.warning(f"  - {boundary_skipped} boundary-clipped (insufficient flanking)")
         logger.info(f"Generated {len(sequences)} probe sequences (length={probe_length}) from reference")
     else:
         return Err(f"Unsupported input format: {suffix}")
