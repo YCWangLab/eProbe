@@ -1126,12 +1126,12 @@ def build(
 @click.option(
     "-r", "--reference",
     type=click.Path(exists=True, path_type=Path),
-    help="Reference genome FASTA (required for --mode tags).",
+    help="[tags mode] Reference genome FASTA (required for --mode tags).",
 )
 @click.option(
     "-v", "--vcf",
     type=click.Path(exists=True, path_type=Path),
-    help="Original VCF file (required for --mode distance/sfs).",
+    help="[distance/pca/sfs modes] Original VCF file.",
 )
 @click.option(
     "-o", "--output",
@@ -1149,55 +1149,54 @@ def build(
     "--tags",
     type=str,
     default="gc,tm,complexity,hairpin,dimer",
-    help="Tags to analyze (comma-separated).",
+    help="[tags mode] Tags to analyze (comma-separated).",
 )
 @click.option(
     "--plot/--no_plot",
     default=True,
-    help="Generate distribution plots (default: yes).",
+    help="[tags/distance/pca/sfs modes] Generate distribution plots (default: yes).",
 )
 @click.option(
     "--max_vcf_sites",
     default=100000,
     type=int,
-    help="Maximum sites to load from VCF for distance mode (default: 100000).",
+    help="[distance mode] Maximum sites to load from VCF (default: 100000).",
 )
 @click.option(
     "--pop_file",
     type=click.Path(exists=True, path_type=Path),
-    help="Population file for SFS mode (sample_id<tab>pop_id). Required for --mode sfs.",
+    help="[sfs/pca modes] Population file (sample_id<tab>pop_id). Required for --mode sfs/pca coloring.",
 )
 @click.option(
     "--n_samples_per_pop",
     default=5,
     type=int,
-    help="Number of samples per population for SFS (default: 5).",
+    help="[sfs mode] Number of samples per population (default: 5).",
 )
 @click.option(
     "--samples",
     type=str,
     default=None,
-    help="Specific samples to use (comma-separated). Overrides random subsampling.",
+    help="[sfs/pca modes] Specific samples to use (comma-separated). Overrides random subsampling.",
 )
 @click.option(
     "--projection",
     type=str,
     default=None,
-    help="easySFS projection values (e.g., '10,10,10'). Auto-calculated if not specified.",
+    help="[sfs mode] easySFS projection values (e.g., '10,10,10'). Auto-calculated if not specified.",
 )
 @click.option(
     "--pops",
     type=str,
     default=None,
-    help="Populations to use for SFS analysis (comma-separated, max 3). "
-         "Samples labeled 'unknown' are always excluded. "
-         "Default: first 3 non-unknown populations found in pop_file.",
+    help="[sfs mode] Populations for SFS analysis (comma-separated, max 3). "
+         "Samples labeled 'unknown' are excluded. Default: first 3 non-unknown populations.",
 )
 @click.option(
     "--seed",
     default=42,
     type=int,
-    help="Random seed for sample subsampling (default: 42).",
+    help="[sfs/pca modes] Random seed for sample subsampling (default: 42).",
 )
 @click.pass_context
 def assess(
