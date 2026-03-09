@@ -895,19 +895,24 @@ def run_pca_assessment(
     output_prefix: Path,
     pop_file: Optional[Path] = None,
     n_pcs: int = 10,
+    n_samples: int = 100,
+    seed: int = 42,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Compare PCA between full VCF and probe-covered SNPs using PLINK.
-    
+
     Args:
         snp_tsv_path: Path to selected SNPs TSV file
         vcf_path: Path to original VCF file
         output_prefix: Output file prefix
         pop_file: Optional population file for coloring
         n_pcs: Number of principal components
+        n_samples: Max number of individuals to use (random subsample, default: 100).
+            Same individuals are used for both full-VCF and probe-subset analysis.
+        seed: Random seed for subsampling
         verbose: Enable verbose logging
-        
+
     Returns:
         Result containing PCA assessment statistics
     """
@@ -948,35 +953,64 @@ def run_pca_assessment(
         return Err(f"Failed to load SNP TSV: {e}")
     
     logger.info(f"Loaded {len(probe_positions)} probe positions")
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        
-        # === Run PCA on full VCF ===
+
+        # === Subsample individuals from VCF ===
+        # Get all sample IDs from VCF header, then random-subsample up to n_samples.
+        # Same individuals are used for both full-VCF and probe analyses.
+        import subprocess, random as _random
+        _random.seed(seed)
+        try:
+            header_result = subprocess.run(
+                ["bcftools", "query", "-l", str(vcf_path)],
+                capture_output=True, text=True, check=False
+            )
+            all_samples = [s for s in header_result.stdout.strip().splitlines() if s]
+        except Exception as e:
+            return Err(f"Failed to read sample IDs from VCF: {e}")
+
+        if not all_samples:
+            return Err("No samples found in VCF header")
+
+        if len(all_samples) > n_samples:
+            subsampled = sorted(_random.sample(all_samples, n_samples))
+            logger.info(f"Subsampled {n_samples}/{len(all_samples)} individuals (seed={seed})")
+        else:
+            subsampled = all_samples
+            logger.info(f"Using all {len(all_samples)} individuals")
+
+        full_vcf_sub = tmpdir / "full_samples_subset.vcf.gz"
+        sample_sub_result = subset_vcf_by_samples(vcf_path, subsampled, full_vcf_sub)
+        if sample_sub_result.is_err():
+            return Err(f"Failed to subset VCF by samples: {sample_sub_result.unwrap_err()}")
+
+        # === Run PCA on sample-subsetted full VCF ===
         logger.info("Running PCA on full VCF...")
-        full_pca_result = run_plink_pca(vcf_path, tmpdir / "full", n_pcs=n_pcs)
-        
+        full_pca_result = run_plink_pca(full_vcf_sub, tmpdir / "full", n_pcs=n_pcs)
+
         if full_pca_result.is_err():
             return Err(f"PCA on full VCF failed: {full_pca_result.unwrap_err()}")
-        
+
         pca_full, var_full, samples_full = full_pca_result.unwrap()
         logger.info(f"Full VCF PCA: {len(samples_full)} samples, {n_pcs} PCs")
-        
-        # === Create probe subset VCF ===
+
+        # === Create probe subset VCF (positions, from sample-subsetted VCF) ===
         logger.info("Creating probe-subset VCF...")
         probe_vcf = tmpdir / "probe_subset.vcf.gz"
-        subset_result = subset_vcf_by_positions(vcf_path, probe_positions, probe_vcf)
-        
+        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf)
+
         if subset_result.is_err():
             return Err(f"VCF subsetting failed: {subset_result.unwrap_err()}")
-        
+
         # === Run PCA on probe VCF ===
         logger.info("Running PCA on probe-subset VCF...")
         probe_pca_result = run_plink_pca(probe_vcf, tmpdir / "probe", n_pcs=n_pcs)
-        
+
         if probe_pca_result.is_err():
             return Err(f"PCA on probe VCF failed: {probe_pca_result.unwrap_err()}")
-        
+
         pca_probe, var_probe, samples_probe = probe_pca_result.unwrap()
         logger.info(f"Probe VCF PCA: {len(samples_probe)} samples, {n_pcs} PCs")
     
@@ -2223,27 +2257,30 @@ def run_distance_assessment(
     vcf_path: Path,
     output_prefix: Path,
     max_sites: int = 100000,
+    n_samples: int = 100,
+    seed: int = 42,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Run IBS distance comparison between full VCF and probe-covered SNPs using PLINK.
-    
+
     Compares pairwise genetic distances calculated from:
     1. Full VCF (all SNPs)
     2. Probe-covered SNPs only
-    
+
     Uses PLINK's 1-IBS distance calculation for consistency with standard
     population genetics workflows.
-    
-    Generates combined heatmap and scatter plot for comparison.
-    
+
     Args:
         snp_tsv_path: Path to selected SNPs TSV file
         vcf_path: Path to original VCF file
         output_prefix: Output file prefix
         max_sites: Not used (kept for backwards compatibility)
+        n_samples: Max number of individuals to use (random subsample, default: 100).
+            Same individuals are used for both full-VCF and probe-subset analysis.
+        seed: Random seed for subsampling
         verbose: Enable verbose logging
-        
+
     Returns:
         Result containing distance assessment statistics
     """
@@ -2281,28 +2318,55 @@ def run_distance_assessment(
         return Err(f"Failed to load SNP TSV: {e}")
     
     logger.info(f"Loaded {len(probe_positions)} probe positions")
-    
+
     # Create output directory
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        
-        # === Calculate IBS distance for full VCF ===
+
+        # === Subsample individuals ===
+        import subprocess, random as _random
+        _random.seed(seed)
+        try:
+            header_result = subprocess.run(
+                ["bcftools", "query", "-l", str(vcf_path)],
+                capture_output=True, text=True, check=False
+            )
+            all_samples = [s for s in header_result.stdout.strip().splitlines() if s]
+        except Exception as e:
+            return Err(f"Failed to read sample IDs from VCF: {e}")
+
+        if not all_samples:
+            return Err("No samples found in VCF header")
+
+        if len(all_samples) > n_samples:
+            subsampled = sorted(_random.sample(all_samples, n_samples))
+            logger.info(f"Subsampled {n_samples}/{len(all_samples)} individuals (seed={seed})")
+        else:
+            subsampled = all_samples
+            logger.info(f"Using all {len(all_samples)} individuals")
+
+        full_vcf_sub = tmpdir / "full_samples_subset.vcf.gz"
+        sample_sub_result = subset_vcf_by_samples(vcf_path, subsampled, full_vcf_sub)
+        if sample_sub_result.is_err():
+            return Err(f"Failed to subset VCF by samples: {sample_sub_result.unwrap_err()}")
+
+        # === Calculate IBS distance for sample-subsetted full VCF ===
         logger.info("Calculating IBS distances for full VCF using PLINK...")
-        full_ibs_result = run_plink_ibs_distance(vcf_path, tmpdir / "full")
-        
+        full_ibs_result = run_plink_ibs_distance(full_vcf_sub, tmpdir / "full")
+
         if full_ibs_result.is_err():
             return Err(f"Full VCF IBS failed: {full_ibs_result.unwrap_err()}")
-        
+
         dist_full, samples_full = full_ibs_result.unwrap()
         n_sites_full = _count_vcf_sites(vcf_path)
         logger.info(f"Full VCF: {len(samples_full)} samples, ~{n_sites_full} sites")
-        
-        # === Create probe subset VCF ===
+
+        # === Create probe subset VCF (positions, from sample-subsetted VCF) ===
         logger.info("Creating probe-subset VCF...")
         probe_vcf = tmpdir / "probe_subset.vcf.gz"
-        subset_result = subset_vcf_by_positions(vcf_path, probe_positions, probe_vcf)
+        subset_result = subset_vcf_by_positions(full_vcf_sub, probe_positions, probe_vcf)
 
         if subset_result.is_err():
             err_msg = f"VCF subsetting failed: {subset_result.unwrap_err()}"
@@ -2581,6 +2645,8 @@ def run_assess(
             vcf_path=vcf_path,
             output_prefix=output_prefix,
             max_sites=max_vcf_sites,
+            n_samples=n_samples_per_pop,
+            seed=seed,
             verbose=verbose,
         )
         
@@ -2634,6 +2700,8 @@ def run_assess(
             vcf_path=vcf_path,
             output_prefix=output_prefix,
             pop_file=pop_file,
+            n_samples=n_samples_per_pop,
+            seed=seed,
             verbose=verbose,
         )
         

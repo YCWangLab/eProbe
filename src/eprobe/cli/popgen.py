@@ -1169,9 +1169,10 @@ def build(
 )
 @click.option(
     "--n_samples_per_pop",
-    default=5,
+    default=100,
     type=int,
-    help="[sfs mode] Number of samples per population (default: 5).",
+    help="[distance/pca modes] Max individuals to use (random subsample, default: 100). "
+         "[sfs mode] Number of samples per population (default: 100, typical sfs usage: 5).",
 )
 @click.option(
     "--samples",
