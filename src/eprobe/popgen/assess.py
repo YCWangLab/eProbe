@@ -3079,6 +3079,17 @@ def run_tags_assessment(
             probe_id = f"{chrom}_{pos}"
             sequences[probe_id] = probe_seq.upper()
 
+        # Verify all sequences have the expected length (for data quality)
+        if sequences:
+            seq_lengths = {len(seq) for seq in sequences.values()}
+            if len(seq_lengths) > 1:
+                logger.warning(f"UNEXPECTED: Generated {len(seq_lengths)} different probe lengths!")
+                for length in sorted(seq_lengths):
+                    count = sum(1 for seq in sequences.values() if len(seq) == length)
+                    logger.warning(f"  - {length}bp: {count} probes")
+            elif list(seq_lengths)[0] != probe_length:
+                logger.warning(f"UNEXPECTED: All {len(sequences)} probes are {list(seq_lengths)[0]}bp, not {probe_length}bp!")
+
         # Diagnose if chromosome mismatch caused all probes to be skipped
         if len(sequences) == 0 and len(df) > 0:
             ref_chroms = set(reference.keys())
