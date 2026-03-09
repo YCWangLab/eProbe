@@ -419,8 +419,8 @@ def extract(
 @click.option(
     "--dimer",
     type=float,
-    default=0.30,
-    help="Smart dimer filter sensitivity (default: 0.30). "
+    default=0.50,
+    help="Smart dimer filter sensitivity (default: 0.50). "
          "Identifies groups of cross-hybridizing probes via canonical k-mer sharing "
          "and keeps only one representative per risk group. "
          "Value = minimum fraction of shared k-mers to form a dimer edge: "
