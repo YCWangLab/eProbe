@@ -5,16 +5,17 @@ Benchmark eProbe biophysical metrics against open-source tools.
 Compares:
   - Tm:      eProbe (Biopython Tm_NN, R_DNA_NN1)  vs  primer3 (SantaLucia 1998)
   - Hairpin:  eProbe (PairwiseAligner self-RC)      vs  primer3 calc_hairpin (ΔG)
-                                                    vs  seqfold MFE (Zuker)
+                                                    vs  ViennaRNA MFE (Zuker, C)
+                                                    vs  seqfold MFE (Zuker, Python)
   - Dimer:    eProbe (k-mer frequency)              vs  primer3 calc_homodimer (ΔG)
   - GC:       eProbe  vs  simple count (should be identical, sanity check)
-  - Complexity: eProbe DUST  vs  seqfold MFE (secondary structure propensity)
+  - Complexity: eProbe DUST  vs  ViennaRNA MFE (secondary structure propensity)
 
 Usage:
     python scripts/benchmark_biophysics.py -f probes.fasta -o benchmark_output [-n 2000]
     python scripts/benchmark_biophysics.py -f selected.tsv -r ref.fa -o benchmark_output
 
-Requires: pip install primer3-py seqfold
+Requires: pip install primer3-py seqfold ViennaRNA
 """
 
 from __future__ import annotations
@@ -181,7 +182,23 @@ def primer3_homodimer_dg(seqs: Dict[str, str]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# seqfold calculations (Zuker MFE)
+# ViennaRNA calculations (Zuker MFE, C implementation — fast, no length limit)
+# ---------------------------------------------------------------------------
+
+def vienna_mfe(seqs: Dict[str, str]) -> np.ndarray:
+    import RNA
+    vals = []
+    for seq in seqs.values():
+        try:
+            _ss, mfe = RNA.fold(seq)
+            vals.append(mfe)
+        except Exception:
+            vals.append(np.nan)
+    return np.array(vals)
+
+
+# ---------------------------------------------------------------------------
+# seqfold calculations (Zuker MFE, pure Python — slow, no length limit)
 # ---------------------------------------------------------------------------
 
 def seqfold_mfe(seqs: Dict[str, str]) -> np.ndarray:
@@ -265,6 +282,7 @@ def run_benchmark(
         ("primer3_tm",          primer3_tm),
         ("primer3_hairpin_dg",  primer3_hairpin_dg),
         ("primer3_homodimer_dg", primer3_homodimer_dg),
+        ("vienna_mfe",         vienna_mfe),
         ("seqfold_mfe",        seqfold_mfe),
     ]
 
@@ -288,16 +306,18 @@ def run_benchmark(
         # (x_key, y_key, xlabel, ylabel, title)
         ("eprobe_tm", "primer3_tm",
          "eProbe Tm (°C)", "primer3 Tm (°C)", "Tm: eProbe vs primer3"),
+        ("eprobe_hairpin", "vienna_mfe",
+         "eProbe Hairpin Score", "ViennaRNA MFE (kcal/mol)", "Hairpin: eProbe vs ViennaRNA"),
         ("eprobe_hairpin", "primer3_hairpin_dg",
          "eProbe Hairpin Score", "primer3 Hairpin ΔG (kcal/mol)", "Hairpin: eProbe vs primer3"),
-        ("eprobe_hairpin", "seqfold_mfe",
-         "eProbe Hairpin Score", "seqfold MFE ΔG (kcal/mol)", "Hairpin: eProbe vs seqfold"),
+        ("vienna_mfe", "primer3_hairpin_dg",
+         "ViennaRNA MFE (kcal/mol)", "primer3 Hairpin ΔG (kcal/mol)", "ViennaRNA vs primer3 hairpin"),
+        ("vienna_mfe", "seqfold_mfe",
+         "ViennaRNA MFE (kcal/mol)", "seqfold MFE (kcal/mol)", "ViennaRNA vs seqfold (both Zuker)"),
         ("eprobe_dimer", "primer3_homodimer_dg",
          "eProbe Dimer Score", "primer3 Homodimer ΔG (kcal/mol)", "Dimer: eProbe vs primer3"),
-        ("eprobe_dust", "seqfold_mfe",
-         "eProbe DUST Score", "seqfold MFE ΔG (kcal/mol)", "Complexity vs secondary structure"),
-        ("primer3_hairpin_dg", "seqfold_mfe",
-         "primer3 Hairpin ΔG (kcal/mol)", "seqfold MFE ΔG (kcal/mol)", "primer3 hairpin vs seqfold MFE"),
+        ("eprobe_dust", "vienna_mfe",
+         "eProbe DUST Score", "ViennaRNA MFE (kcal/mol)", "Complexity vs secondary structure"),
     ]
 
     # --- Plot ---
