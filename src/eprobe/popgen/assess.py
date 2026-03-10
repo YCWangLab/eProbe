@@ -2237,6 +2237,8 @@ def run_sfs_assessment(
         return Err(subsample_result.unwrap_err())
     
     subsampled_pops = subsample_result.unwrap()
+    # Update n_samples_per_pop to actual count (may be smaller if a pop was limiting)
+    n_samples_per_pop = min(len(s) for s in subsampled_pops.values())
     logger.info(f"Subsampled to {n_samples_per_pop} samples per pop")
     
     # Load probe positions
@@ -2346,22 +2348,41 @@ def run_sfs_assessment(
             full_1d = parse_dadi_1d_sfs(full_sfs_dir, pop)
             probe_1d = parse_dadi_1d_sfs(probe_sfs_dir, pop)
             
-            if full_1d.is_ok() and probe_1d.is_ok():
-                f_sfs = full_1d.unwrap()
-                p_sfs = probe_1d.unwrap()
-                
-                # Normalize
-                f_sfs = f_sfs / np.sum(f_sfs) if np.sum(f_sfs) > 0 else f_sfs
-                p_sfs = p_sfs / np.sum(p_sfs) if np.sum(p_sfs) > 0 else p_sfs
-                
-                # Ensure same length
-                min_len = min(len(f_sfs), len(p_sfs))
-                f_sfs = f_sfs[:min_len]
-                p_sfs = p_sfs[:min_len]
-                
-                if not np.all(f_sfs == 0) and not np.all(p_sfs == 0):
-                    corr, _ = stats.pearsonr(f_sfs, p_sfs)
-                    sfs_correlations[pop] = corr
+            if full_1d.is_err():
+                logger.warning(f"Could not load full 1D SFS for {pop}: {full_1d.unwrap_err()}")
+                continue
+            if probe_1d.is_err():
+                logger.warning(f"Could not load probe 1D SFS for {pop}: {probe_1d.unwrap_err()}")
+                continue
+
+            f_sfs = full_1d.unwrap()
+            p_sfs = probe_1d.unwrap()
+            
+            # Normalize to proportions
+            f_total = np.sum(f_sfs)
+            p_total = np.sum(p_sfs)
+            if f_total == 0 or p_total == 0:
+                logger.warning(f"SFS for {pop} is all zeros (full_sum={f_total}, probe_sum={p_total})")
+                continue
+            f_sfs = f_sfs / f_total
+            p_sfs = p_sfs / p_total
+            
+            # Ensure same length
+            min_len = min(len(f_sfs), len(p_sfs))
+            f_sfs = f_sfs[:min_len]
+            p_sfs = p_sfs[:min_len]
+            
+            # Exclude monomorphic bins (first=all ancestral, last=all derived)
+            if min_len > 2:
+                f_sfs = f_sfs[1:-1]
+                p_sfs = p_sfs[1:-1]
+            
+            if np.std(f_sfs) == 0 or np.std(p_sfs) == 0:
+                logger.warning(f"SFS for {pop} has zero variance after normalization")
+                continue
+
+            corr, _ = stats.pearsonr(f_sfs, p_sfs)
+            sfs_correlations[pop] = corr
         
         avg_correlation = np.mean(list(sfs_correlations.values())) if sfs_correlations else np.nan
         
