@@ -2052,9 +2052,23 @@ def generate_multipop_sfs_heatmap(
                     ax.set_yticks([])
                     
             else:
-                # Upper triangle: empty (white), no border
-                ax.axis('off')
-            
+                # Upper triangle: symmetric mirror (transpose) of the corresponding lower block
+                key = (pop_col, pop_row) if (pop_col, pop_row) in plot_sfs_2d else (pop_row, pop_col)
+                if key in plot_sfs_2d:
+                    sfs_data = plot_sfs_2d[key]
+                    if key == (pop_row, pop_col):
+                        sfs_data = sfs_data.T
+                    im = ax.imshow(
+                        sfs_data,
+                        aspect='auto',
+                        cmap=cmap,
+                        vmin=0,
+                        vmax=vmax,
+                        origin='upper',
+                    )
+                else:
+                    ax.set_facecolor('white')
+
             # Y-axis: only show ticks on leftmost column
             if j == 0 and i >= j:
                 if i == j and pop_row in plot_sfs_1d:
@@ -2069,22 +2083,19 @@ def generate_multipop_sfs_heatmap(
                             sfs_data = sfs_data.T
                         ax.set_yticks(range(sfs_data.shape[0]))
                         ax.set_yticklabels(range(sfs_data.shape[0]), fontsize=7)
-            elif i >= j:
+            else:
                 ax.set_yticks([])
-                # Also hide tick marks on non-leftmost columns
                 ax.tick_params(left=False)
-            
+
             # X-axis: hide all ticks
-            if i >= j:
-                ax.set_xticks([])
-                ax.tick_params(bottom=False)
-            
-            # Black border only for diagonal and lower triangle
-            if i >= j:
-                for spine in ax.spines.values():
-                    spine.set_visible(True)
-                    spine.set_color('black')
-                    spine.set_linewidth(1.5)
+            ax.set_xticks([])
+            ax.tick_params(bottom=False)
+
+            # Black border on all visible cells
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_color('black')
+                spine.set_linewidth(1.5)
     
     # Add population labels on top (X-axis titles)
     for j, pop_col in enumerate(pop_ids):
@@ -2104,7 +2115,15 @@ def generate_multipop_sfs_heatmap(
     )
     cbar.set_label('log\u2081\u2080(count + 1)', fontsize=9)
     cbar.ax.tick_params(labelsize=8)
-    
+
+    # Add gray legend patch for masked (monomorphic/fixed) cells
+    import matplotlib.patches as mpatches
+    gray_patch = mpatches.Patch(facecolor='lightgray', edgecolor='gray',
+                                label='Monomorphic / Fixed')
+    fig.legend(handles=[gray_patch], loc='lower right',
+               bbox_to_anchor=(0.89, 0.08), fontsize=8,
+               frameon=True, framealpha=0.9)
+
     # Add title
     fig.suptitle(title, fontsize=13, fontweight='bold', y=0.98)
     
