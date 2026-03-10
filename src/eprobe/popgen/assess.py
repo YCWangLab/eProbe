@@ -2907,6 +2907,8 @@ def generate_assessment_plots(
             ax.set_xticks(tick_positions_custom)
             ax.set_xticklabels(tick_labels_custom, fontsize=15, rotation=30, ha='right',
                                fontname='Arial')
+        elif tag == 'gc':
+            ax.set_xticks(np.arange(xlim[0], xlim[1] + 0.5, 2))
         for label in ax.get_xticklabels() + ax.get_yticklabels():
             label.set_fontname('Arial')
 
@@ -3368,7 +3370,7 @@ def run_tags_assessment(
     # Apply default plot preset ranges (user overrides take precedence)
     default_xlim = {
         "gc": (20.0, 80.0),
-        "tm": (60.0, 80.0),
+        "tm": (65.0, 85.0),
         "complexity": (0.0, 2.0),
     }
     default_bin_size = {
@@ -3583,6 +3585,8 @@ def run_tags_from_dataframe(
                     ax.set_xticks(tick_positions_custom)
                     ax.set_xticklabels(tick_labels_custom, fontsize=15, rotation=30, ha='right',
                                        fontname='Arial')
+                elif tag == 'gc':
+                    ax.set_xticks(np.arange(xlim[0], xlim[1] + 0.5, 2))
                 for label in ax.get_xticklabels() + ax.get_yticklabels():
                     label.set_fontname('Arial')
 
