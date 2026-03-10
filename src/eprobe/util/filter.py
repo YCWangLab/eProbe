@@ -381,7 +381,7 @@ def _run_impl(  # noqa: C901 — complex by nature
                 gc_min=gc_range[0], gc_max=gc_range[1],
                 tm_min=tm_range[0], tm_max=tm_range[1],
                 complexity_max=max_complexity,
-                hairpin=max_hairpin if max_hairpin is not None else 0.95,
+                hairpin=max_hairpin if max_hairpin is not None else 15.0,
                 dimer=max_dimer if max_dimer is not None else 0.95,
                 nn_table=nn_table,
                 na_conc=na_conc,

@@ -946,9 +946,9 @@ def rename(
     help="Max DUST complexity (filter mode, default: 2.0). Set -1 to disable.",
 )
 @click.option(
-    "--hairpin", default=0.95, type=float,
-    help="Hairpin |MFE| threshold (default: 0.95 percentile, keep 95%%). "
-         ">=1: absolute kcal/mol; <1: percentile. Set -1 to disable.",
+    "--hairpin", default=15.0, type=float,
+    help="Hairpin |MFE| threshold in kcal/mol (default: 15.0). "
+         ">=1: absolute kcal/mol; <1: percentile (e.g. 0.95 keeps 95%%). Set -1 to disable.",
 )
 @click.option(
     "--dimer", default=0.15, type=float,
@@ -1501,8 +1501,8 @@ def target(
 @click.option(
     "--hairpin",
     type=float,
-    default=0.95,
-    help="Hairpin |MFE| threshold (default: 0.95 percentile, keep 95%%). "
+    default=15.0,
+    help="Hairpin |MFE| threshold in kcal/mol (default: 15.0). "
          ">=1: absolute kcal/mol; <1: percentile (e.g. 0.95 keeps 95%%). "
          "Powered by ViennaRNA DNA thermodynamics. Set -1 to disable.",
 )
