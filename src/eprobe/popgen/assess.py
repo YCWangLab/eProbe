@@ -2782,6 +2782,7 @@ def generate_assessment_plots(
     xlim_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
     ylim_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
     bins_overrides: Optional[Dict[str, int]] = None,
+    bin_size_overrides: Optional[Dict[str, float]] = None,
 ) -> Result[List[Path], str]:
     """
     Generate distribution plots for assessment metrics.
@@ -2794,6 +2795,7 @@ def generate_assessment_plots(
         xlim_overrides: Per-tag x-axis limits, e.g. {"gc": (0.0, 1.0)}
         ylim_overrides: Per-tag y-axis limits, e.g. {"gc": (0.0, 50.0)}
         bins_overrides: Per-tag bin count, e.g. {"gc": 100}
+        bin_size_overrides: Per-tag fixed bin width, e.g. {"gc": 1.0, "complexity": 0.1}
 
     Returns:
         Result containing list of generated plot paths
@@ -2817,10 +2819,14 @@ def generate_assessment_plots(
 
         tag_bins = (bins_overrides or {}).get(tag, 50)
         xlim_fixed = (xlim_overrides or {}).get(tag)
+        bin_size = (bin_size_overrides or {}).get(tag)
 
         if xlim_fixed is not None:
             xlim = xlim_fixed
-            bin_edges = np.linspace(xlim[0], xlim[1], tag_bins + 1)
+            if bin_size is not None:
+                bin_edges = np.arange(xlim[0], xlim[1] + bin_size * 1e-6, bin_size)
+            else:
+                bin_edges = np.linspace(xlim[0], xlim[1], tag_bins + 1)
         else:
             xlim, bin_edges = _smart_plot_limits(values, n_bins=tag_bins)
 
@@ -3118,6 +3124,7 @@ def run_tags_assessment(
     plot_xlim: Optional[Dict[str, Tuple[float, float]]] = None,
     plot_ylim: Optional[Dict[str, Tuple[float, float]]] = None,
     plot_bins: Optional[Dict[str, int]] = None,
+    plot_bin_size: Optional[Dict[str, float]] = None,
     probe_length: int = 81,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
@@ -3137,6 +3144,7 @@ def run_tags_assessment(
         plot_xlim: Per-tag x-axis limits override. Preset defaults: gc=(20,80), tm=(60,80), complexity=(0,2)
         plot_ylim: Per-tag y-axis limits override, e.g. {"gc": (0.0, 50.0)}
         plot_bins: Per-tag bin count override, e.g. {"gc": 100}
+        plot_bin_size: Per-tag fixed bin width override. Preset defaults: gc=1.0, tm=1.0, complexity=0.1
         verbose: Enable verbose logging
         
     Returns:
@@ -3363,9 +3371,15 @@ def run_tags_assessment(
         "tm": (60.0, 80.0),
         "complexity": (0.0, 2.0),
     }
+    default_bin_size = {
+        "gc": 1.0,
+        "tm": 1.0,
+        "complexity": 0.1,
+    }
     xlim_final = {**default_xlim, **(plot_xlim or {})}
     ylim_final = plot_ylim or {}
     bins_final = plot_bins or {}
+    bin_size_final = {**default_bin_size, **(plot_bin_size or {})}
     
     # Generate plots
     plot_paths = []
@@ -3375,6 +3389,7 @@ def run_tags_assessment(
             xlim_overrides=xlim_final,
             ylim_overrides=ylim_final,
             bins_overrides=bins_final,
+            bin_size_overrides=bin_size_final,
         )
         if plot_result.is_ok():
             plot_paths = plot_result.unwrap()
@@ -3402,6 +3417,7 @@ def run_tags_from_dataframe(
     xlim_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
     ylim_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
     bins_overrides: Optional[Dict[str, int]] = None,
+    bin_size_overrides: Optional[Dict[str, float]] = None,
 ) -> Result[Dict[str, Any], str]:
     """
     Run tags assessment using existing biophysical columns in DataFrame.
@@ -3417,6 +3433,7 @@ def run_tags_from_dataframe(
         xlim_overrides: Per-tag x-axis limits override
         ylim_overrides: Per-tag y-axis limits override
         bins_overrides: Per-tag bin count override
+        bin_size_overrides: Per-tag fixed bin width override
 
     Returns:
         Result with assessment statistics
@@ -3481,10 +3498,14 @@ def run_tags_from_dataframe(
 
                 tag_bins = (bins_overrides or {}).get(tag, 50)
                 xlim_fixed = (xlim_overrides or {}).get(tag)
+                bin_size = (bin_size_overrides or {}).get(tag)
 
                 if xlim_fixed is not None:
                     xlim = xlim_fixed
-                    bin_edges = np.linspace(xlim[0], xlim[1], tag_bins + 1)
+                    if bin_size is not None:
+                        bin_edges = np.arange(xlim[0], xlim[1] + bin_size * 1e-6, bin_size)
+                    else:
+                        bin_edges = np.linspace(xlim[0], xlim[1], tag_bins + 1)
                 else:
                     xlim, bin_edges = _smart_plot_limits(values, n_bins=tag_bins)
 
