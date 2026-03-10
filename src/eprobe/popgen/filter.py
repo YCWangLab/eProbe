@@ -73,7 +73,7 @@ class BiophysicalThresholds:
         gc_min/gc_max: GC content range (default: 35-65%). Set -1 to disable.
         tm_min/tm_max: Melting temp range (default: 55-75°C). Set -1 to disable.
         complexity_max: Max DUST complexity score (default: 2.0). Set -1 to disable.
-        hairpin: Hairpin threshold (default: 0.95 percentile). Set -1 to disable.
+        hairpin: Hairpin |MFE| threshold in kcal/mol (default: 0.95 percentile). Set -1 to disable.
         dimer: Smart dimer sensitivity (default: 0.50 = 50% k-mer sharing).
             Lower = more sensitive (more groups detected, more removed).
             Higher = more conservative. Set -1 to disable.
@@ -85,8 +85,8 @@ class BiophysicalThresholds:
     tm_min: float = 55.0
     tm_max: float = 75.0
     complexity_max: float = 2.0
-    # Hairpin: >=1 absolute, 0<x<1 percentile, <=0 skip
-    hairpin: float = 50.0
+    # Hairpin: >=1 absolute |MFE| kcal/mol, 0<x<1 percentile, <=0 skip
+    hairpin: float = 0.95
     # Dimer: >0 smart filter sensitivity (k-mer sharing fraction), <=0 skip
     dimer: float = 0.50
     # Tm calculation parameters

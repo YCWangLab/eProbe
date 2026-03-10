@@ -30,7 +30,6 @@ from eprobe.biophysics.biophysics import (
     calculate_all_stats_fast,
     DimerCalculatorFast,
     calculate_percentile_threshold,
-    HAS_PARASAIL,
 )
 
 
@@ -153,11 +152,11 @@ def test_dust():
 
 
 def test_hairpin():
-    """Test hairpin score calculation (stem method, normalized by log4(L))."""
+    """Test hairpin score calculation (ViennaRNA |MFE| in kcal/mol)."""
     print("\n" + "="*60)
-    print("Testing Hairpin Score Calculation (stem method)")
-    print("  Score = max_stem_bp / log4(probe_length)")
-    print("  Random DNA ~ 1.8, real hairpin > 3.0")
+    print("Testing Hairpin Score Calculation (ViennaRNA MFE)")
+    print("  Score = |ΔG| in kcal/mol (higher = more self-folding)")
+    print("  Random DNA ~ 0-5, strong hairpin > 5.0")
     print("="*60)
     
     # Sequences with different hairpin potential

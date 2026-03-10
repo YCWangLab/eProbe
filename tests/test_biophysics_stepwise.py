@@ -224,27 +224,21 @@ def test_hairpin():
     
     print("""
 【实现方式】
-- 检测序列自身形成发夹结构的倾向
-- K-mer 方法: 
-  1. 提取序列的所有 k-mer (默认 k=8)
-  2. 生成反向互补序列的所有 k-mer
-  3. 寻找匹配的 k-mer 对
-  4. 评估连续匹配区域长度
+- 使用 ViennaRNA (Zuker MFE算法) 计算DNA二级结构
+- 加载 DNA 热力学参数 (Mathews 2004)
+- 返回 |ΔG| (kcal/mol), 值越高自折叠越强
   
 【注意】
-- 使用 Biopython pairwise2 作为 fallback
-- 分数反映与反向互补序列的相似度
+- 需要安装 ViennaRNA: pip install ViennaRNA
+- C 实现, 81bp探针约 1.8ms, 无序列长度限制
 
 【期望行为】
-- 使用百分位阈值 (默认保留 top 90%)
-- 自互补序列 (AT重复) 会有最高分数
-- 设计的发夹结构 (stem-loop-stem) 会有较高分数
-- 随机序列: ~1.8 (归一化后稳定)
-- Poly-A: 0 (没有互补区域, A的互补是T)
+- 自互补序列 (AT重复) 会有最高 |MFE|
+- 设计的发夹结构 (stem-loop-stem) 会有较高 |MFE|
+- 随机序列: 通常 0-5 kcal/mol
+- Poly-A: 0 (无二级结构)
 
-Note: Using "stem" method - score = max_stem_bp / log4(probe_length).
-Normalized score is stable across different probe lengths.
-Random DNA ~ 1.8 at any length, real hairpin > 3.0.
+Score = |MFE| in kcal/mol. Higher = more self-folding = worse for probes.
 """)
     
     print_subheader("测试用例")
@@ -266,17 +260,17 @@ Random DNA ~ 1.8 at any length, real hairpin > 3.0.
     
     test_cases = [
         ("自互补 (AT重复)", "AT" * 40 + "A", "极高", "最高分"),
-        ("设计发夹 (stem-loop)", hairpin_seq, ">3.0", "高分"),
-        ("随机序列", random_seq, "~1.8", "低分"),
-        ("Poly-A", "A" * 81, "0 (无互补)", "最低分"),
+        ("设计发夹 (stem-loop)", hairpin_seq, ">5.0", "高分"),
+        ("随机序列", random_seq, "~0-5", "低分"),
+        ("Poly-A", "A" * 81, "0 (无二级结构)", "最低分"),
     ]
     
-    print("分数分布 (stem method, normalized by log4(L)):")
+    print("分数分布 (ViennaRNA |MFE| kcal/mol):")
     scores = []
     for name, seq, expected, note in test_cases:
-        score = calculate_hairpin_fast(seq, method="stem")
+        score = calculate_hairpin_fast(seq)
         scores.append((name, score, note))
-        print(f"  {name:25s}: {score:.2f} ({note})")
+        print(f"  {name:25s}: {score:.2f} kcal/mol ({note})")
     
     # Verify ordering
     print("\n验证分数排序:")
@@ -288,7 +282,7 @@ Random DNA ~ 1.8 at any length, real hairpin > 3.0.
     checks = [
         (at_score > hp_score, "AT重复 > 设计发夹"),
         (hp_score > rand_score, "设计发夹 > 随机"),
-        (rand_score > poly_score, "随机 > Poly-A"),
+        (rand_score >= poly_score, "随机 >= Poly-A"),
     ]
     
     all_passed = True
@@ -298,11 +292,11 @@ Random DNA ~ 1.8 at any length, real hairpin > 3.0.
             all_passed = False
         print(f"  {status} {desc}")
     
-    # Show random distribution across multiple lengths
-    print("\n【统计】归一化分数在不同探针长度下的稳定性:")
+    # Show distribution across multiple lengths
+    print("\n【统计】|MFE|在不同探针长度下的分布:")
     for probe_len in [51, 81, 121]:
         random.seed(42)
-        rand_scores = [calculate_hairpin_fast(''.join(random.choices('ATCG', k=probe_len)), method="stem") for _ in range(100)]
+        rand_scores = [calculate_hairpin_fast(''.join(random.choices('ATCG', k=probe_len))) for _ in range(100)]
         print(f"    {probe_len}bp: 平均={sum(rand_scores)/len(rand_scores):.2f}, "
               f"范围={min(rand_scores):.2f}-{max(rand_scores):.2f}")
     

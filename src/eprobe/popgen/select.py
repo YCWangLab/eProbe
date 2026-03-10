@@ -353,7 +353,7 @@ def calculate_snp_score(
     gc_score = max(0, 1.0 - abs(gc - targets[0]) / _NORMALIZE_RANGE[0])
     tm_score = max(0, 1.0 - abs(tm - targets[1]) / _NORMALIZE_RANGE[1])
     complexity_score = max(0, 1.0 - abs(complexity - targets[2]) / _NORMALIZE_RANGE[2])
-    hairpin_score = max(0, 1.0 - hairpin) if targets[3] == 0 else max(0, 1.0 - abs(hairpin - targets[3]))
+    hairpin_score = max(0, 1.0 - hairpin / 50.0) if targets[3] == 0 else max(0, 1.0 - abs(hairpin - targets[3]) / 50.0)
     dimer_score = max(0, 1.0 - dimer) if targets[4] == 0 else max(0, 1.0 - abs(dimer - targets[4]))
     
     total_score = (

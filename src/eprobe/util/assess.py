@@ -61,7 +61,7 @@ class FilterThresholds:
     tm_min: float = 55.0
     tm_max: float = 75.0
     complexity_max: float = 2.0
-    hairpin: float = 18.0
+    hairpin: float = 0.95
     dimer: float = 0.95
 
 
@@ -278,7 +278,7 @@ def run_assess(
     tm_min: float = 55.0,
     tm_max: float = 75.0,
     complexity_max: float = 2.0,
-    hairpin: float = 18.0,
+    hairpin: float = 0.95,
     dimer: float = 0.95,
     generate_plots: bool = True,
     verbose: bool = False,
