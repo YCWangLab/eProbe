@@ -223,6 +223,40 @@ def snp_in_priority_region(
     return False
 
 
+_BIOPHYSICAL_LABELS = {
+    'gc': 'GC (%)',
+    'tm': 'Tm (°C)',
+    'complexity': 'Complexity',
+    'hairpin': 'Hairpin',
+    'dimer': 'Dimer',
+}
+
+
+def _log_biophysical_comparison(
+    input_df: pd.DataFrame,
+    selected_df: pd.DataFrame,
+) -> None:
+    """Log before/after biophysical stats after SNP selection."""
+    available = [c for c in BIOPHYSICAL_COLUMNS if c in input_df.columns and c in selected_df.columns]
+    if not available:
+        return
+
+    col_w = 10
+    divider = '-' * (18 + col_w * 3 + 3)
+    logger.info("Biophysical metrics: input pool → selected set")
+    logger.info(divider)
+    logger.info(f"  {'Metric':<16} {'Input':>{col_w}} {'Selected':>{col_w}} {'Δ (mean)':>{col_w}}")
+    logger.info(divider)
+    for col in available:
+        label = _BIOPHYSICAL_LABELS.get(col, col)
+        b = float(input_df[col].dropna().mean())
+        a = float(selected_df[col].dropna().mean())
+        d = a - b
+        sign = '+' if d >= 0 else ''
+        logger.info(f"  {label:<16} {b:>{col_w}.3f} {a:>{col_w}.3f} {sign}{d:>{col_w - 1}.3f}")
+    logger.info(divider)
+
+
 # Default target values for biophysical scoring
 # [gc%, tm°C, complexity, hairpin, dimer]
 DEFAULT_TARGETS = [50.0, 70.0, 0.0, 0.0, 0.0]
@@ -881,6 +915,7 @@ def run_select(
                 if merge_details:
                     stats["merge_details"] = merge_details
                 
+                _log_biophysical_comparison(raw_df, selected_with_biophysical)
                 logger.info(f"Selection complete: {len(selected)} SNPs selected")
                 logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
                 logger.info(f"Output saved to {output_path}")
@@ -943,6 +978,7 @@ def run_select(
                     if merge_details:
                         stats["merge_details"] = merge_details
                     
+                    _log_biophysical_comparison(raw_df, selected_with_biophysical)
                     logger.info(f"Selection complete: {len(selected)} SNPs selected")
                     logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
                     logger.info(f"Output saved to {output_path}")
@@ -990,6 +1026,20 @@ def run_select(
     if merge_details:
         stats["merge_details"] = merge_details
     
+    # Log biophysical comparison for non-weighted strategies (if biophysical cols available)
+    if any(c in raw_df.columns for c in BIOPHYSICAL_COLUMNS):
+        sel_keys = set(zip(
+            (str(s.chrom) for s in selected),
+            (int(s.pos) for s in selected)
+        ))
+        sel_bio_df = raw_df[
+            pd.Series(
+                list(zip(raw_df['chr'].astype(str), raw_df['pos'].astype(int))),
+                index=raw_df.index
+            ).isin(sel_keys)
+        ]
+        _log_biophysical_comparison(raw_df, sel_bio_df)
+
     logger.info(f"Selection complete: {len(selected)} SNPs selected")
     logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
     logger.info(f"Output saved to {output_path}")
