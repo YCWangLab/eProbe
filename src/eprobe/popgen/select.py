@@ -257,6 +257,49 @@ def _log_biophysical_comparison(
     logger.info(divider)
 
 
+def _write_biophysical_summary(
+    input_df: pd.DataFrame,
+    selected_df: pd.DataFrame,
+    output_prefix: Path,
+    stats: Dict[str, Any],
+) -> Path:
+    """Write before/after biophysical distribution summary to {output_prefix}.select_summary.txt."""
+    summary_path = Path(str(output_prefix) + ".select_summary.txt")
+    available = [c for c in BIOPHYSICAL_COLUMNS if c in input_df.columns and c in selected_df.columns]
+
+    with open(summary_path, 'w') as f:
+        f.write("eProbe SNP Selection Summary\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Strategy:        {stats.get('strategy', '-')}\n")
+        f.write(f"Window size:     {stats.get('window_size', 0):,} bp\n")
+        f.write(f"Input SNPs:      {stats.get('initial_count', 0):,}\n")
+        f.write(f"Selected SNPs:   {stats.get('selected', 0):,}\n")
+        f.write(f"Target count:    {stats.get('target_count', 0):,}\n")
+        coverage = stats.get('coverage', {})
+        f.write(f"Windows covered: {coverage.get('windows_covered', '-')}\n")
+        f.write(f"Chromosomes:     {coverage.get('chromosomes', '-')}\n")
+        f.write("\n")
+
+        if available:
+            f.write("Biophysical Metrics: Before \u2192 After Selection\n")
+            f.write("-" * 50 + "\n\n")
+            for col in available:
+                label = _BIOPHYSICAL_LABELS.get(col, col)
+                in_s = input_df[col].dropna()
+                sel_s = selected_df[col].dropna()
+                d_mean = float(sel_s.mean()) - float(in_s.mean())
+                sign = '+' if d_mean >= 0 else ''
+                f.write(f"{label}:\n")
+                f.write(f"  Input:    Mean={float(in_s.mean()):.3f}  Std={float(in_s.std()):.3f}  "
+                        f"Median={float(in_s.median()):.3f}  Min={float(in_s.min()):.3f}  Max={float(in_s.max()):.3f}\n")
+                f.write(f"  Selected: Mean={float(sel_s.mean()):.3f}  Std={float(sel_s.std()):.3f}  "
+                        f"Median={float(sel_s.median()):.3f}  Min={float(sel_s.min()):.3f}  Max={float(sel_s.max()):.3f}\n")
+                f.write(f"  \u0394 Mean:   {sign}{d_mean:.3f}\n\n")
+
+    logger.info(f"Selection summary saved to {summary_path}")
+    return summary_path
+
+
 # Default target values for biophysical scoring
 # [gc%, tm°C, complexity, hairpin, dimer]
 DEFAULT_TARGETS = [50.0, 70.0, 0.0, 0.0, 0.0]
@@ -916,6 +959,8 @@ def run_select(
                     stats["merge_details"] = merge_details
                 
                 _log_biophysical_comparison(raw_df, selected_with_biophysical)
+                summary_path = _write_biophysical_summary(raw_df, selected_with_biophysical, output_prefix, stats)
+                stats["summary_file"] = str(summary_path)
                 logger.info(f"Selection complete: {len(selected)} SNPs selected")
                 logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
                 logger.info(f"Output saved to {output_path}")
@@ -979,6 +1024,8 @@ def run_select(
                         stats["merge_details"] = merge_details
                     
                     _log_biophysical_comparison(raw_df, selected_with_biophysical)
+                    summary_path = _write_biophysical_summary(raw_df, selected_with_biophysical, output_prefix, stats)
+                    stats["summary_file"] = str(summary_path)
                     logger.info(f"Selection complete: {len(selected)} SNPs selected")
                     logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
                     logger.info(f"Output saved to {output_path}")
@@ -1027,6 +1074,7 @@ def run_select(
         stats["merge_details"] = merge_details
     
     # Log biophysical comparison for non-weighted strategies (if biophysical cols available)
+    sel_bio_df = pd.DataFrame()
     if any(c in raw_df.columns for c in BIOPHYSICAL_COLUMNS):
         sel_keys = set(zip(
             (str(s.chrom) for s in selected),
@@ -1040,6 +1088,8 @@ def run_select(
         ]
         _log_biophysical_comparison(raw_df, sel_bio_df)
 
+    summary_path = _write_biophysical_summary(raw_df, sel_bio_df, output_prefix, stats)
+    stats["summary_file"] = str(summary_path)
     logger.info(f"Selection complete: {len(selected)} SNPs selected")
     logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
     logger.info(f"Output saved to {output_path}")
