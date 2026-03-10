@@ -3347,24 +3347,115 @@ def run_tags_assessment(
     df.to_csv(output_path, sep='\t', index=False)
     logger.info(f"Saved detailed stats to {output_path}")
     
+    # === Load and assess compare file (if provided) ===
+    compare_results = None
+    compare_summary = None
+    if compare_path is not None and compare_path.exists():
+        logger.info(f"Loading compare file: {compare_path}")
+        cmp_suffix = compare_path.suffix.lower()
+        cmp_sequences: Dict[str, str] = {}
+
+        if cmp_suffix in ['.fa', '.fasta', '.fna']:
+            cmp_fasta = read_fasta(compare_path)
+            if cmp_fasta.is_ok():
+                cmp_sequences = cmp_fasta.unwrap()
+            else:
+                logger.warning(f"Could not load compare FASTA: {cmp_fasta.unwrap_err()}")
+        elif cmp_suffix == '.tsv' and reference_path is not None:
+            cmp_snp_result = SNPDataFrame.from_tsv(compare_path)
+            if cmp_snp_result.is_ok():
+                cmp_df = cmp_snp_result.unwrap().df
+                for _, row in cmp_df.iterrows():
+                    chrom = str(row['chr'])
+                    pos = int(row['pos'])
+                    if chrom not in reference:
+                        continue
+                    chrom_seq = reference[chrom]
+                    left_end = pos - 1
+                    right_start = pos
+                    start_pos = max(0, left_end - left_flank_len)
+                    end_pos = min(len(chrom_seq), right_start + right_flank_len)
+                    ref_base = str(row['ref']).upper() if 'ref' in cmp_df.columns else chrom_seq[pos - 1].upper()
+                    probe_seq = chrom_seq[start_pos:left_end] + ref_base + chrom_seq[right_start:end_pos]
+                    if len(probe_seq) == probe_length:
+                        cmp_sequences[f"{chrom}_{pos}"] = probe_seq.upper()
+            else:
+                logger.warning(f"Could not load compare TSV: {cmp_snp_result.unwrap_err()}")
+
+        if cmp_sequences:
+            cmp_tags_without_dimer = [t for t in tags if t != "dimer"]
+            compare_results = assess_probes(cmp_sequences, cmp_tags_without_dimer)
+            if "dimer" in tags:
+                cmp_dimer = calculate_dimer_scores(cmp_sequences, sample_dimer)
+                for r in compare_results:
+                    r.dimer = cmp_dimer.get(r.probe_id, 0.0)
+            compare_summary = calculate_summary_statistics(compare_results, tags)
+            logger.info(f"Loaded {len(cmp_sequences)} compare probes")
+        else:
+            logger.warning("Compare file loaded but no valid probe sequences extracted")
+
     # Save summary
     summary_path = Path(str(output_prefix) + ".tags_summary.txt")
     with open(summary_path, 'w') as f:
         f.write("eProbe Biophysical Tags Assessment Summary\n")
         f.write("=" * 50 + "\n\n")
-        f.write(f"Input: {input_path}\n")
-        f.write(f"Total probes: {len(sequences)}\n\n")
-        
-        for tag, stats in summary.items():
-            f.write(f"{AVAILABLE_TAGS.get(tag, tag)}:\n")
-            f.write(f"  Mean:   {stats['mean']:.3f}\n")
-            f.write(f"  Std:    {stats['std']:.3f}\n")
-            f.write(f"  Min:    {stats['min']:.3f}\n")
-            f.write(f"  Max:    {stats['max']:.3f}\n")
-            f.write(f"  Median: {stats['median']:.3f}\n\n")
-    
+        f.write(f"Input:   {input_path}\n")
+        if compare_path is not None:
+            f.write(f"Compare: {compare_path}\n")
+        f.write(f"Total probes (input):   {len(sequences)}\n")
+        if compare_summary is not None:
+            f.write(f"Total probes (compare): {sum(v['count'] for v in compare_summary.values()) // max(len(compare_summary), 1)}\n")
+        f.write("\n")
+
+        if compare_summary is not None:
+            # Before / After / Δ table
+            col_w = 10
+            f.write(f"{'Metric':<22} {'Input':>{col_w}} {'Compare':>{col_w}} {'Δ (mean)':>{col_w}}\n")
+            f.write("-" * (22 + col_w * 3 + 3) + "\n")
+            for tag, stats in summary.items():
+                tag_label = AVAILABLE_TAGS.get(tag, tag)
+                cmp_stats = compare_summary.get(tag)
+                if cmp_stats:
+                    delta = cmp_stats['mean'] - stats['mean']
+                    sign = '+' if delta >= 0 else ''
+                    f.write(f"  {tag_label:<20} {stats['mean']:>{col_w}.3f} {cmp_stats['mean']:>{col_w}.3f} {sign}{delta:>{col_w - 1}.3f}\n")
+                else:
+                    f.write(f"  {tag_label:<20} {stats['mean']:>{col_w}.3f} {'N/A':>{col_w}}\n")
+            f.write("\n")
+
+            # Detailed per-metric breakdown
+            f.write("Detailed Statistics:\n")
+            f.write("=" * 50 + "\n\n")
+            for tag, stats in summary.items():
+                tag_label = AVAILABLE_TAGS.get(tag, tag)
+                cmp_stats = compare_summary.get(tag)
+                f.write(f"{tag_label}:\n")
+                if cmp_stats:
+                    f.write(f"  {'':12} {'Input':>10} {'Compare':>10} {'Δ':>10}\n")
+                    for metric in ('mean', 'std', 'min', 'max', 'median'):
+                        v = stats[metric]
+                        c = cmp_stats[metric]
+                        d = c - v
+                        sign = '+' if d >= 0 else ''
+                        f.write(f"  {metric.capitalize():<12} {v:>10.3f} {c:>10.3f} {sign}{d:>9.3f}\n")
+                else:
+                    f.write(f"  Mean:   {stats['mean']:.3f}\n")
+                    f.write(f"  Std:    {stats['std']:.3f}\n")
+                    f.write(f"  Min:    {stats['min']:.3f}\n")
+                    f.write(f"  Max:    {stats['max']:.3f}\n")
+                    f.write(f"  Median: {stats['median']:.3f}\n")
+                f.write("\n")
+        else:
+            for tag, stats in summary.items():
+                f.write(f"{AVAILABLE_TAGS.get(tag, tag)}:\n")
+                f.write(f"  Mean:   {stats['mean']:.3f}\n")
+                f.write(f"  Std:    {stats['std']:.3f}\n")
+                f.write(f"  Min:    {stats['min']:.3f}\n")
+                f.write(f"  Max:    {stats['max']:.3f}\n")
+                f.write(f"  Median: {stats['median']:.3f}\n\n")
+
     logger.info(f"Saved summary to {summary_path}")
-    
+
     # Apply default plot preset ranges (user overrides take precedence)
     default_xlim = {
         "gc": (20.0, 80.0),
@@ -3380,12 +3471,13 @@ def run_tags_assessment(
     ylim_final = plot_ylim or {}
     bins_final = plot_bins or {}
     bin_size_final = {**default_bin_size, **(plot_bin_size or {})}
-    
+
     # Generate plots
     plot_paths = []
     if generate_plots:
         plot_result = generate_assessment_plots(
             results, tags, output_prefix,
+            compare_results=compare_results,
             xlim_overrides=xlim_final,
             ylim_overrides=ylim_final,
             bins_overrides=bins_final,
