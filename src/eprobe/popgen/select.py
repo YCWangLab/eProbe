@@ -604,40 +604,21 @@ def select_weighted(
     
     df = snp_df.copy()
     
-    # === VECTORIZED SCORE CALCULATION (FAST) ===
-    # Normalize each metric: score = 1 - |value - target| / range  (clamped to [0,1])
+    # === WINDOW-BASED RANK SCORING ===
+    # Compute |value - target| as raw distance for each metric.
+    # Within each window, convert distances to ranks and normalise to [0,1].
+    # This ensures every metric contributes equally regardless of its natural
+    # scale (e.g. GC% vs complexity) — only the relative ordering within a
+    # window matters.
     
-    # GC: distance from target
-    df['gc_score'] = (1.0 - np.abs(df['gc'] - targets[0]) / _NORMALIZE_RANGE[0]).clip(lower=0)
+    dist_cols = []
+    for col, tgt in zip(BIOPHYSICAL_COLUMNS, targets):
+        dcol = f'_dist_{col}'
+        df[dcol] = np.abs(df[col] - tgt)
+        dist_cols.append(dcol)
     
-    # Tm: distance from target
-    df['tm_score'] = (1.0 - np.abs(df['tm'] - targets[1]) / _NORMALIZE_RANGE[1]).clip(lower=0)
-    
-    # Complexity: distance from target
-    df['complexity_score'] = (1.0 - np.abs(df['complexity'] - targets[2]) / _NORMALIZE_RANGE[2]).clip(lower=0)
-    
-    # Hairpin: distance from target (data-driven normalization)
-    max_hairpin = max(df['hairpin'].max(), 1.0)
-    df['hairpin_score'] = (1.0 - np.abs(df['hairpin'] - targets[3]) / max_hairpin).clip(lower=0)
-    
-    # Dimer: distance from target (data-driven normalization)
-    max_dimer = max(df['dimer'].max(), 1.0)
-    df['dimer_score'] = (1.0 - np.abs(df['dimer'] - targets[4]) / max_dimer).clip(lower=0)
-    
-    # Weighted composite score
-    df['weighted_score'] = (
-        weights[0] * df['gc_score'] +
-        weights[1] * df['tm_score'] +
-        weights[2] * df['complexity_score'] +
-        weights[3] * df['hairpin_score'] +
-        weights[4] * df['dimer_score']
-    )
-    
-    # === WINDOW-BASED SELECTION ===
-    # Calculate window index
+    # Window key
     df['window'] = df['pos'] // window_size
-    
-    # Group by chromosome and window
     df['window_key'] = df['chr'].astype(str) + '_' + df['window'].astype(str)
     
     total_windows = df['window_key'].nunique()
@@ -646,11 +627,28 @@ def select_weighted(
     if total_windows == 0:
         return Ok([])
     
+    # Rank distances within each window (ascending: smallest distance = rank 1 = best).
+    # Normalise ranks to [0,1]: rank_score = 1 - (rank - 1) / (n - 1).
+    # When a window has only 1 SNP, rank_score = 1.0 for all metrics.
+    score_cols = [f'{col}_score' for col in BIOPHYSICAL_COLUMNS]
+    for dcol, scol in zip(dist_cols, score_cols):
+        # rank with method='average' handles ties symmetrically
+        df[scol] = df.groupby('window_key')[dcol].rank(method='average', ascending=True)
+        window_counts = df.groupby('window_key')[dcol].transform('count')
+        df[scol] = 1.0 - (df[scol] - 1.0) / (window_counts - 1.0).replace(0, np.nan).fillna(1.0)
+    
+    # Drop distance columns
+    df.drop(columns=dist_cols, inplace=True)
+    
+    # Weighted composite score from rank scores
+    df['weighted_score'] = sum(
+        w * df[sc] for w, sc in zip(weights, score_cols)
+    )
+    
     # Calculate SNPs per window
     base_per_window = max(1, target_count // total_windows)
     
-    # Select top N from each window based on weighted score.
-    # With threads > 1, each chromosome is processed in a separate thread.
+    # Select top N from each window based on weighted rank score.
     def _process_windows(chrom_df: pd.DataFrame) -> List:
         indices = []
         for _, group in chrom_df.groupby('window_key'):
