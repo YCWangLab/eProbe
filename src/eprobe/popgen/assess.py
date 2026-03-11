@@ -1911,6 +1911,7 @@ def generate_multipop_sfs_heatmap(
     output_path: Path,
     title: str = "Site Frequency Spectrum",
     projection_values: Optional[Dict[str, int]] = None,
+    vmax: Optional[float] = None,
 ) -> Result[Path, str]:
     """
     Generate multi-population SFS heatmap like the reference image.
@@ -1924,6 +1925,8 @@ def generate_multipop_sfs_heatmap(
         output_path: Output image path
         title: Plot title
         projection_values: Dict of pop_id -> projection value for axis labels
+        vmax: Upper limit for colorbar. If None, computed from the data.
+            Pass an explicit value to synchronise two plots (e.g. full vs probe).
         
     Returns:
         Result containing output path
@@ -1985,14 +1988,14 @@ def generate_multipop_sfs_heatmap(
         masked[0, 0] = np.ma.masked    # mask all-monomorphic corner
         plot_sfs_2d[key] = masked
 
-    # Global vmax from unmasked log-transformed values
-    all_values = []
-    for arr in plot_sfs_1d.values():
-        all_values.extend(arr.compressed())
-    for arr in plot_sfs_2d.values():
-        all_values.extend(arr.compressed())
-    
-    vmax = max(all_values) if all_values else 1.0
+    # Global vmax from unmasked log-transformed values (use caller-supplied value if given)
+    if vmax is None:
+        all_values = []
+        for arr in plot_sfs_1d.values():
+            all_values.extend(arr.compressed())
+        for arr in plot_sfs_2d.values():
+            all_values.extend(arr.compressed())
+        vmax = max(all_values) if all_values else 1.0
     
     # Create figure with custom layout
     # Main grid for heatmaps + space for colorbar
@@ -2347,12 +2350,32 @@ def run_sfs_assessment(
         
         # === Generate comparison plots ===
         logger.info("Generating SFS heatmaps...")
-        
+
+        # Compute shared colorbar vmax across both datasets so the two heatmaps
+        # are directly comparable (same color scale).
+        _shared_vals: list[float] = []
+        for _sfs_dir in (full_sfs_dir, probe_sfs_dir):
+            for _pop in pop_ids:
+                _r1 = parse_dadi_1d_sfs(_sfs_dir, _pop)
+                if _r1.is_ok():
+                    _log = np.log10(1.0 + _r1.unwrap())
+                    _shared_vals.extend(_log[1:].tolist())  # skip index 0 (monomorphic)
+            for _i, _p1 in enumerate(pop_ids):
+                for _j, _p2 in enumerate(pop_ids):
+                    if _i < _j:
+                        _r2 = parse_dadi_2d_sfs(_sfs_dir, _p1, _p2)
+                        if _r2.is_ok():
+                            _log2 = np.log10(1.0 + _r2.unwrap())
+                            _log2[0, 0] = 0.0  # exclude monomorphic corner
+                            _shared_vals.extend(_log2.flatten().tolist())
+        shared_vmax = max(_shared_vals) if _shared_vals else 1.0
+
         # Full VCF heatmap
         full_plot_path = Path(str(output_prefix) + ".sfs_full.png")
         full_plot_result = generate_multipop_sfs_heatmap(
             full_sfs_dir, pop_ids, full_plot_path,
-            title=f"Full VCF SFS (n={n_sites_full:,} sites)"
+            title=f"Full VCF SFS (n={n_sites_full:,} sites)",
+            vmax=shared_vmax,
         )
         if full_plot_result.is_err():
             logger.warning(f"Full SFS plot failed: {full_plot_result.unwrap_err()}")
@@ -2361,7 +2384,8 @@ def run_sfs_assessment(
         probe_plot_path = Path(str(output_prefix) + ".sfs_probe.png")
         probe_plot_result = generate_multipop_sfs_heatmap(
             probe_sfs_dir, pop_ids, probe_plot_path,
-            title=f"Probe Set SFS (n={n_sites_probe:,} sites)"
+            title=f"Probe Set SFS (n={n_sites_probe:,} sites)",
+            vmax=shared_vmax,
         )
         if probe_plot_result.is_err():
             logger.warning(f"Probe SFS plot failed: {probe_plot_result.unwrap_err()}")
