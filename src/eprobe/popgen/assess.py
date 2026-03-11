@@ -1427,6 +1427,7 @@ def run_easysfs(
     output_dir: Path,
     projection: Optional[str] = None,
     preview_only: bool = False,
+    folded: bool = True,
 ) -> Result[Path, str]:
     """
     Run easySFS to calculate Site Frequency Spectrum from VCF.
@@ -1437,6 +1438,10 @@ def run_easysfs(
         output_dir: Output directory for SFS files
         projection: Projection values (e.g., "10,10,10" for 3 pops)
         preview_only: If True, only run preview mode
+        folded: If True (default), compute folded SFS (minor allele frequency).
+            Folded SFS does not require ancestral state information and avoids
+            spurious fixed-derived corners when REF != ancestral allele.
+            Set False only if VCF has correct ancestral allele annotations.
         
     Returns:
         Result containing path to output directory
@@ -1465,6 +1470,8 @@ def run_easysfs(
         if projection is not None:
             cmd.extend(["--proj", projection])
         cmd.extend(["-a", "-f", "-y"])  # -a: all SNPs, -f: force overwrite, -y: no prompt
+        if folded:
+            cmd.append("--fold")  # fold on minor allele; no ancestral state needed
 
     logger.info(f"Running easySFS: {' '.join(cmd)}")
 
@@ -1968,16 +1975,14 @@ def generate_multipop_sfs_heatmap(
     for pop, arr in sfs_1d.items():
         log_arr = np.log10(1.0 + arr)
         masked = np.ma.array(log_arr)
-        masked[0] = np.ma.masked   # mask monomorphic (all ancestral)
-        masked[-1] = np.ma.masked  # mask fixed (all derived)
+        masked[0] = np.ma.masked   # mask zero-count bin (non-segregating)
         plot_sfs_1d[pop] = masked
 
     plot_sfs_2d = {}
     for key, arr in sfs_2d.items():
         log_arr = np.log10(1.0 + arr)
         masked = np.ma.array(log_arr)
-        masked[0, 0] = np.ma.masked    # mask all-ancestral corner
-        masked[-1, -1] = np.ma.masked  # mask all-derived corner
+        masked[0, 0] = np.ma.masked    # mask all-monomorphic corner
         plot_sfs_2d[key] = masked
 
     # Global vmax from unmasked log-transformed values
@@ -2119,7 +2124,7 @@ def generate_multipop_sfs_heatmap(
     # Add gray legend patch for masked (monomorphic/fixed) cells
     import matplotlib.patches as mpatches
     gray_patch = mpatches.Patch(facecolor='lightgray', edgecolor='gray',
-                                label='Monomorphic / Fixed')
+                                label='Monomorphic (count = 0)')
     fig.legend(handles=[gray_patch], loc='lower right',
                bbox_to_anchor=(0.89, 0.08), fontsize=8,
                frameon=True, framealpha=0.9)
@@ -2305,7 +2310,7 @@ def run_sfs_assessment(
 
         full_result = run_easysfs(
             full_vcf_sub, sub_pop_file, full_sfs_dir,
-            projection=projection, preview_only=False
+            projection=projection, preview_only=False, folded=True
         )
         
         if full_result.is_err():
@@ -2332,7 +2337,7 @@ def run_sfs_assessment(
 
         probe_result = run_easysfs(
             probe_vcf, sub_pop_file, probe_sfs_dir,
-            projection=projection, preview_only=False
+            projection=projection, preview_only=False, folded=True
         )
         
         if probe_result.is_err():
