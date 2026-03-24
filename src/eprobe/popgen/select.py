@@ -236,25 +236,67 @@ def _log_biophysical_comparison(
     input_df: pd.DataFrame,
     selected_df: pd.DataFrame,
 ) -> None:
-    """Log before/after biophysical stats after SNP selection."""
+    """Log before/after biophysical stats (mean ± std) after SNP selection."""
     available = [c for c in BIOPHYSICAL_COLUMNS if c in input_df.columns and c in selected_df.columns]
     if not available:
         return
 
-    col_w = 10
-    divider = '-' * (18 + col_w * 3 + 3)
-    logger.info("Biophysical metrics: input pool → selected set")
-    logger.info(divider)
-    logger.info(f"  {'Metric':<16} {'Input':>{col_w}} {'Selected':>{col_w}} {'Δ (mean)':>{col_w}}")
-    logger.info(divider)
+    n_input = len(input_df)
+    n_selected = len(selected_df)
+
+    logger.info("")
+    logger.info("=" * 78)
+    logger.info("Biophysical Comparison: Input Pool → Selected Set")
+    if n_input > 0:
+        logger.info(f"  SNPs: {n_input:,} (input) → {n_selected:,} (selected)  "
+                    f"[{n_selected / n_input * 100:.1f}% retained]")
+    else:
+        logger.info(f"  SNPs: {n_input:,} (input) → {n_selected:,} (selected)")
+    logger.info("=" * 78)
+    header = (f"  {'Metric':<14} {'Input Mean':>12} {'Input Std':>12} "
+              f"{'Sel Mean':>12} {'Sel Std':>12} {'Δ Mean':>10}")
+    logger.info(header)
+    logger.info("-" * 78)
     for col in available:
         label = _BIOPHYSICAL_LABELS.get(col, col)
-        b = float(input_df[col].dropna().mean())
-        a = float(selected_df[col].dropna().mean())
-        d = a - b
+        in_s = input_df[col].dropna()
+        sel_s = selected_df[col].dropna()
+        in_mean = float(in_s.mean()) if len(in_s) > 0 else 0.0
+        in_std = float(in_s.std()) if len(in_s) > 1 else 0.0
+        sel_mean = float(sel_s.mean()) if len(sel_s) > 0 else 0.0
+        sel_std = float(sel_s.std()) if len(sel_s) > 1 else 0.0
+        d = sel_mean - in_mean
         sign = '+' if d >= 0 else ''
-        logger.info(f"  {label:<16} {b:>{col_w}.3f} {a:>{col_w}.3f} {sign}{d:>{col_w - 1}.3f}")
-    logger.info(divider)
+        logger.info(f"  {label:<14} {in_mean:>12.3f} {in_std:>12.3f} "
+                    f"{sel_mean:>12.3f} {sel_std:>12.3f} {sign}{d:>9.3f}")
+    logger.info("=" * 78)
+    logger.info("")
+
+
+def _build_biophysical_comparison(
+    input_df: pd.DataFrame,
+    selected_df: pd.DataFrame,
+) -> List[Dict[str, Any]]:
+    """Build a list of per-metric comparison dicts for embedding in stats."""
+    available = [c for c in BIOPHYSICAL_COLUMNS if c in input_df.columns and c in selected_df.columns]
+    comparison = []
+    for col in available:
+        in_s = input_df[col].dropna()
+        sel_s = selected_df[col].dropna()
+        in_mean = float(in_s.mean()) if len(in_s) > 0 else 0.0
+        in_std = float(in_s.std()) if len(in_s) > 1 else 0.0
+        sel_mean = float(sel_s.mean()) if len(sel_s) > 0 else 0.0
+        sel_std = float(sel_s.std()) if len(sel_s) > 1 else 0.0
+        comparison.append({
+            'column': col,
+            'label': _BIOPHYSICAL_LABELS.get(col, col),
+            'input_mean': in_mean,
+            'input_std': in_std,
+            'sel_mean': sel_mean,
+            'sel_std': sel_std,
+            'delta_mean': sel_mean - in_mean,
+        })
+    return comparison
 
 
 def _write_biophysical_summary(
@@ -1024,12 +1066,13 @@ def run_select(
                     stats["merge_details"] = merge_details
                 
                 _log_biophysical_comparison(raw_df, selected_with_biophysical)
+                stats["biophysical_comparison"] = _build_biophysical_comparison(raw_df, selected_with_biophysical)
                 summary_path = _write_biophysical_summary(raw_df, selected_with_biophysical, output_prefix, stats)
                 stats["summary_file"] = str(summary_path)
                 logger.info(f"Selection complete: {len(selected)} SNPs selected")
                 logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
                 logger.info(f"Output saved to {output_path}")
-                
+
                 return Ok(stats)
             else:
                 return Err(result.unwrap_err())
@@ -1089,12 +1132,13 @@ def run_select(
                         stats["merge_details"] = merge_details
                     
                     _log_biophysical_comparison(raw_df, selected_with_biophysical)
+                    stats["biophysical_comparison"] = _build_biophysical_comparison(raw_df, selected_with_biophysical)
                     summary_path = _write_biophysical_summary(raw_df, selected_with_biophysical, output_prefix, stats)
                     stats["summary_file"] = str(summary_path)
                     logger.info(f"Selection complete: {len(selected)} SNPs selected")
                     logger.info(f"Windows covered: {coverage_stats['windows_covered']}")
                     logger.info(f"Output saved to {output_path}")
-                    
+
                     return Ok(stats)
                 else:
                     selected = unwrapped
@@ -1152,6 +1196,7 @@ def run_select(
             ).isin(sel_keys)
         ]
         _log_biophysical_comparison(raw_df, sel_bio_df)
+        stats["biophysical_comparison"] = _build_biophysical_comparison(raw_df, sel_bio_df)
 
     summary_path = _write_biophysical_summary(raw_df, sel_bio_df, output_prefix, stats)
     stats["summary_file"] = str(summary_path)

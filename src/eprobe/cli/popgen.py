@@ -971,19 +971,24 @@ def select(
         echo_info(f"After merge ({merge_mode}): {len(merged_snps)} SNPs")
 
         # Find input file with biophysical columns for reference
-        # Check each input file for biophysical columns (gc, tm, complexity, hairpin, dimer)
+        # Pick the file with the most biophysical columns (any of: gc, tm, complexity, hairpin, dimer)
         biophysical_cols = {'gc', 'tm', 'complexity', 'hairpin', 'dimer'}
+        import pandas as pd
+        best_match_count = 0
         for f in input:
             try:
-                import pandas as pd
                 df_head = pd.read_csv(f, sep='\t', nrows=1)
-                if biophysical_cols.issubset(set(df_head.columns)):
+                file_cols = set(df_head.columns)
+                match_count = len(biophysical_cols & file_cols)
+                if match_count > best_match_count:
+                    best_match_count = match_count
                     biophysical_reference = f
-                    break
             except Exception:
                 continue
 
         input_path = biophysical_reference if biophysical_reference else input[0]
+        if best_match_count > 0:
+            echo_info(f"Found {best_match_count} biophysical columns in {biophysical_reference.name}")
         merged_data = merged_snps
 
         # Create merge details for reporting
@@ -994,8 +999,6 @@ def select(
             "merged_count": len(merged_snps),
         }
 
-        if biophysical_reference:
-            echo_info(f"Using {biophysical_reference.name} for biophysical metrics")
     else:
         input_path = input[0]
         merged_data = None
@@ -1027,8 +1030,10 @@ def select(
         raise SystemExit(1)
     
     stats = result.unwrap()
-    echo_success(f"\n→ Selection Summary:")
-    
+    echo_success(f"\n{'=' * 60}")
+    echo_success(f"Selection Summary")
+    echo_success(f"{'=' * 60}")
+
     # Show merge info if available in stats
     if "merge_details" in stats:
         merge_info = stats["merge_details"]
@@ -1037,12 +1042,33 @@ def select(
         for i, f in enumerate(merge_info['files'], 1):
             echo_info(f"    │  {i}. {Path(f).name}")
         echo_info(f"    └─ After merge: {merge_info['merged_count']} SNPs")
-    
-    echo_info(f"  Input: {stats['initial_count']} SNPs")
-    echo_info(f"  Selected: {stats['selected']} SNPs")
+
+    initial = stats['initial_count']
+    selected = stats['selected']
+    pct = selected / initial * 100 if initial > 0 else 0
+    echo_info(f"  Input:    {initial:>10,} SNPs")
+    echo_info(f"  Selected: {selected:>10,} SNPs  ({pct:.1f}% retained)")
     echo_info(f"  Windows covered: {stats['windows']}")
     echo_info(f"  Strategy: {stats['strategy']}")
-    echo_info(f"  Output: {stats['output_file']}")
+
+    # Show biophysical before/after comparison
+    if "biophysical_comparison" in stats:
+        bio = stats["biophysical_comparison"]
+        echo_info("")
+        echo_info(f"  {'Metric':<14} {'Input Mean':>12} {'Input Std':>12} "
+                  f"{'Sel Mean':>12} {'Sel Std':>12} {'Δ Mean':>10}")
+        echo_info(f"  {'-' * 72}")
+        for col_stats in bio:
+            sign = '+' if col_stats['delta_mean'] >= 0 else ''
+            echo_info(f"  {col_stats['label']:<14} "
+                      f"{col_stats['input_mean']:>12.3f} {col_stats['input_std']:>12.3f} "
+                      f"{col_stats['sel_mean']:>12.3f} {col_stats['sel_std']:>12.3f} "
+                      f"{sign}{col_stats['delta_mean']:>9.3f}")
+        echo_info(f"  {'-' * 72}")
+
+    echo_info(f"\n  Output: {stats['output_file']}")
+    if "summary_file" in stats:
+        echo_info(f"  Summary: {stats['summary_file']}")
 
 
 @popgen.command()
