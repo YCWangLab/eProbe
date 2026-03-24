@@ -143,53 +143,63 @@ def calculate_dimer_scores_legacy(
     k: int = 11,
 ) -> Dict[str, float]:
     """
-    Calculate dimer scores using legacy formula: D(g) = (100/N) * Σ c_i(g)
+    Calculate dimer scores using legacy formula with RC k-mer index: D(g) = (100/N) * Σ c_i(g)
     
-    Where c_i(g) is the frequency of k-mer i from sequence g in the entire probe pool.
-    This reflects how many times each k-mer appears across all probes.
+    Where c_i(g) is the frequency of RC k-mers from sequence g found in the entire pool.
+    This properly reflects Watson-Crick hybridization risk (dimer formation).
     
-    Paper reference: the original eProbe formulation for inter-probe complementarity.
+    Algorithm:
+        1. Build RC (reverse-complement) k-mer frequency dictionary from all probes
+        2. For each probe: query its forward k-mers against the RC index
+        3. Matches indicate potential Watson-Crick pairing (actual dimer risk)
+        4. Score = (100/N) * Σ(match frequency)
     
     Args:
         sequences: Dictionary of probe_id -> sequence
         k: K-mer size (default: 11)
         
     Returns:
-        Dictionary of probe_id -> dimer score (percentage, 0-100)
-    
-    Algorithm:
-        1. Build k-mer frequency dictionary from all probes
-        2. For each probe: sum up the frequencies of all its k-mers
-        3. Normalize by total # of probes * 100 to get percentage
+        Dictionary of probe_id -> dimer score (percentage, 0-100+)
     """
     if len(sequences) <= 1:
         return {pid: 0.0 for pid in sequences.keys()}
+    
+    def _reverse_complement(seq: str) -> str:
+        """Get reverse complement of sequence."""
+        complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C', 'N': 'N'}
+        return ''.join(complement.get(base, 'N') for base in reversed(seq))
     
     probe_ids = list(sequences.keys())
     probe_seqs = list(sequences.values())
     N = len(probe_seqs)
     
-    # Step 1: Build k-mer frequency dictionary from entire pool
-    kmer_freq: Dict[str, int] = {}
+    # Step 1: Build RC k-mer frequency dictionary from entire pool
+    # This represents what other probes' complement sequences contain
+    rc_kmer_freq: Dict[str, int] = {}
     for seq in probe_seqs:
         seq_upper = seq.upper()
-        for i in range(len(seq_upper) - k + 1):
-            kmer = seq_upper[i : i + k]
-            if "N" not in kmer:  # Skip k-mers with N
-                kmer_freq[kmer] = kmer_freq.get(kmer, 0) + 1
+        rc_seq = _reverse_complement(seq_upper)
+        for i in range(len(rc_seq) - k + 1):
+            kmer = rc_seq[i : i + k]
+            if "N" not in kmer:
+                rc_kmer_freq[kmer] = rc_kmer_freq.get(kmer, 0) + 1
     
     # Step 2: Calculate dimer score for each probe
+    # Query each probe's forward k-mers against the RC index
     dimer_scores = {}
     for pid, seq in zip(probe_ids, probe_seqs):
         seq_upper = seq.upper()
         kmer_sum = 0
         
+        # Query forward k-mers against RC k-mer pool
         for i in range(len(seq_upper) - k + 1):
             kmer = seq_upper[i : i + k]
-            if "N" not in kmer and kmer in kmer_freq:
-                kmer_sum += kmer_freq[kmer]
+            if "N" not in kmer and kmer in rc_kmer_freq:
+                # This k-mer matches an RC k-mer in the pool
+                # Indicates potential Watson-Crick pairing
+                kmer_sum += rc_kmer_freq[kmer]
         
-        # Normalize: (100/N) * sum as in formula D(g) = (100/N) * Σ c_i(g)
+        # Normalize: (100/N) * sum
         score = (kmer_sum / N) * 100.0
         dimer_scores[pid] = round(score, 4)
     
