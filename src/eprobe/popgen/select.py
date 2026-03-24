@@ -500,13 +500,13 @@ def select_by_priority(
     targets: Optional[List[float]] = None,
 ) -> Result[Union[List[SNP], Tuple[List[SNP], pd.DataFrame]], str]:
     """
-    Select SNPs with priority for specific genomic regions.
-    
-    Prioritizes SNPs that fall within priority regions (e.g., exons).
-    Uses window-based selection to maintain uniform distribution.
-    If weights are provided and snp_df has biophysical columns, uses
-    weighted selection within priority regions.
-    
+    Select SNPs with window-based priority for specific genomic regions.
+
+    For each genomic window:
+    - If the window contains SNPs in priority regions (e.g., exons), select from those first
+    - If no priority SNPs in the window, select from non-priority SNPs
+    - This ensures uniform genomic coverage while preferring priority regions
+
     Args:
         snps: Input SNP list
         target_count: Target number of SNPs to select
@@ -516,108 +516,173 @@ def select_by_priority(
         weights: Optional biophysical weights [gc, tm, complexity, hairpin, dimer]
         snp_df: Optional DataFrame with biophysical columns for weighted selection
         targets: Target values [gc, tm, complexity, hairpin, dimer]. Default: [50,70,0,0,0]
-        
+
     Returns:
         Result containing selected SNP list (or tuple with DataFrame if weighted)
     """
     if not snps:
         return Ok([])
-    
+
     random.seed(seed)
-    
+    np.random.seed(seed)
+
     logger.info(f"Priority selection: {len(snps)} → {target_count} SNPs")
     logger.info(f"Priority regions: {len(priority_regions)}")
-    
+    logger.info(f"Window size: {window_size:,} bp")
+
     # Check if we can use weighted selection
     use_weighted = False
     if weights is not None and snp_df is not None:
         missing_cols = [col for col in BIOPHYSICAL_COLUMNS if col not in snp_df.columns]
         if not missing_cols:
             use_weighted = True
-            logger.info("Using weighted selection within priority regions")
+            logger.info("Using weighted selection within windows")
         else:
             logger.warning(f"Cannot use weighted selection: missing columns {missing_cols}")
-    
-    # Separate SNPs into priority and non-priority
-    priority_snps = []
-    other_snps = []
-    priority_indices = []
-    other_indices = []
-    
+
+    # Build SNP index for DataFrame lookup if needed
+    snp_to_idx = {}
+    if snp_df is not None:
+        for idx, row in snp_df.iterrows():
+            key = (str(row['chr']), int(row['pos']))
+            snp_to_idx[key] = idx
+
+    # Group SNPs by window and mark priority status
+    # window_key -> {'priority': [snp_indices], 'other': [snp_indices]}
+    window_snps: Dict[Tuple[str, int], Dict[str, List[int]]] = defaultdict(lambda: {'priority': [], 'other': []})
+
+    total_priority = 0
+    total_other = 0
+
     for i, snp in enumerate(snps):
+        window_idx = calculate_window_index(snp.pos, window_size)
+        key = (snp.chrom, window_idx)
+
         if snp_in_priority_region(snp, priority_regions):
-            priority_snps.append(snp)
-            priority_indices.append(i)
+            window_snps[key]['priority'].append(i)
+            total_priority += 1
         else:
-            other_snps.append(snp)
-            other_indices.append(i)
-    
-    logger.info(f"SNPs in priority regions: {len(priority_snps)}")
-    logger.info(f"SNPs outside priority regions: {len(other_snps)}")
-    
-    # Select from priority regions first
-    selected = []
-    selected_df = None
-    
-    if len(priority_snps) >= target_count:
-        # All from priority regions
-        if use_weighted:
-            # Filter DataFrame to priority SNPs only
-            priority_df = snp_df.iloc[priority_indices].copy()
-            result = select_weighted(priority_snps, target_count, weights, window_size, seed, snp_df=priority_df, targets=targets)
-            if result.is_err():
-                return result
-            selected, selected_df = result.unwrap()
-        else:
-            result = select_uniform(priority_snps, target_count, window_size, seed)
-            if result.is_err():
-                return result
-            selected = result.unwrap()
-    else:
-        # All priority + selection from others
-        if use_weighted:
-            # Use all priority SNPs with weighted selection
-            priority_df = snp_df.iloc[priority_indices].copy()
-            if len(priority_snps) > 0:
-                # Select best from priority using weights
-                result = select_weighted(priority_snps, len(priority_snps), weights, window_size, seed, snp_df=priority_df, targets=targets)
-                if result.is_err():
-                    return result
-                selected, selected_df = result.unwrap()
-            
-            remaining = target_count - len(selected)
-            
-            if remaining > 0 and other_snps:
-                # Also use weighted for remaining from other regions
-                other_df = snp_df.iloc[other_indices].copy()
-                result = select_weighted(other_snps, remaining, weights, window_size, seed, snp_df=other_df, targets=targets)
-                if result.is_err():
-                    return result
-                other_selected, other_df_selected = result.unwrap()
-                selected.extend(other_selected)
-                if selected_df is not None:
-                    selected_df = pd.concat([selected_df, other_df_selected], ignore_index=True)
+            window_snps[key]['other'].append(i)
+            total_other += 1
+
+    logger.info(f"Total SNPs in priority regions: {total_priority}")
+    logger.info(f"Total SNPs outside priority regions: {total_other}")
+    logger.info(f"Total windows with SNPs: {len(window_snps)}")
+
+    # Count windows with priority SNPs
+    windows_with_priority = sum(1 for w in window_snps.values() if w['priority'])
+    logger.info(f"Windows with priority SNPs: {windows_with_priority}")
+
+    # Calculate SNPs per window
+    total_windows = len(window_snps)
+    if total_windows == 0:
+        return Ok([])
+
+    base_per_window = target_count // total_windows
+    remainder = target_count % total_windows
+
+    # Sort windows for deterministic selection
+    sorted_windows = sorted(window_snps.keys())
+
+    # Select SNPs from each window
+    selected_indices: List[int] = []
+
+    for i, window_key in enumerate(sorted_windows):
+        window_data = window_snps[window_key]
+        priority_indices = window_data['priority']
+        other_indices = window_data['other']
+
+        # Calculate how many to select from this window
+        n_select = base_per_window + (1 if i < remainder else 0)
+
+        if n_select <= 0:
+            continue
+
+        # Prioritize priority SNPs, then fill with other SNPs
+        if priority_indices:
+            # Window has priority SNPs - select from them first
+            if use_weighted and snp_df is not None:
+                # Use weighted selection within priority SNPs
+                candidates = priority_indices
+                if len(candidates) <= n_select:
+                    selected_indices.extend(candidates)
+                    # If we need more, add from other
+                    remaining = n_select - len(candidates)
+                    if remaining > 0 and other_indices:
+                        if len(other_indices) <= remaining:
+                            selected_indices.extend(other_indices)
+                        else:
+                            # Select best from other based on weights
+                            other_scores = []
+                            for idx in other_indices:
+                                snp = snps[idx]
+                                score = calculate_biophysical_score(snp, weights, targets)
+                                other_scores.append((idx, score))
+                            other_scores.sort(key=lambda x: -x[1])
+                            selected_indices.extend([x[0] for x in other_scores[:remaining]])
                 else:
-                    selected_df = other_df_selected
+                    # More priority SNPs than needed - select best by score
+                    priority_scores = []
+                    for idx in candidates:
+                        snp = snps[idx]
+                        score = calculate_biophysical_score(snp, weights, targets)
+                        priority_scores.append((idx, score))
+                    priority_scores.sort(key=lambda x: -x[1])
+                    selected_indices.extend([x[0] for x in priority_scores[:n_select]])
+            else:
+                # Random selection within priority SNPs
+                if len(priority_indices) <= n_select:
+                    selected_indices.extend(priority_indices)
+                    # If we need more, add from other
+                    remaining = n_select - len(priority_indices)
+                    if remaining > 0 and other_indices:
+                        if len(other_indices) <= remaining:
+                            selected_indices.extend(other_indices)
+                        else:
+                            selected_indices.extend(random.sample(other_indices, remaining))
+                else:
+                    selected_indices.extend(random.sample(priority_indices, n_select))
         else:
-            selected.extend(priority_snps)
-            remaining = target_count - len(priority_snps)
-            
-            if remaining > 0 and other_snps:
-                result = select_uniform(other_snps, remaining, window_size, seed)
-                if result.is_err():
-                    return result
-                selected.extend(result.unwrap())
-    
+            # No priority SNPs in this window - select from other
+            if use_weighted and snp_df is not None:
+                if len(other_indices) <= n_select:
+                    selected_indices.extend(other_indices)
+                else:
+                    other_scores = []
+                    for idx in other_indices:
+                        snp = snps[idx]
+                        score = calculate_biophysical_score(snp, weights, targets)
+                        other_scores.append((idx, score))
+                    other_scores.sort(key=lambda x: -x[1])
+                    selected_indices.extend([x[0] for x in other_scores[:n_select]])
+            else:
+                if len(other_indices) <= n_select:
+                    selected_indices.extend(other_indices)
+                else:
+                    selected_indices.extend(random.sample(other_indices, n_select))
+
+    # Build selected SNP list
+    selected = [snps[i] for i in selected_indices]
+
     # Sort by chromosome and position
     selected.sort(key=lambda s: (s.chrom, s.pos))
-    if selected_df is not None:
-        selected_df = selected_df.sort_values(['chr', 'pos']).reset_index(drop=True)
-    
-    logger.info(f"Selected {len(selected)} SNPs ({len([s for s in selected if snp_in_priority_region(s, priority_regions)])} in priority regions)")
-    
-    if use_weighted and selected_df is not None:
-        return Ok((selected, selected_df))
+
+    # Count how many selected are in priority regions
+    n_priority_selected = sum(1 for s in selected if snp_in_priority_region(s, priority_regions))
+    logger.info(f"Selected {len(selected)} SNPs ({n_priority_selected} from priority regions, "
+                f"{len(selected) - n_priority_selected} from other regions)")
+
+    # Build DataFrame if weighted selection was used
+    if use_weighted and snp_df is not None:
+        selected_df_indices = []
+        for snp in selected:
+            key = (snp.chrom, snp.pos)
+            if key in snp_to_idx:
+                selected_df_indices.append(snp_to_idx[key])
+        if selected_df_indices:
+            selected_df = snp_df.loc[selected_df_indices].copy().reset_index(drop=True)
+            return Ok((selected, selected_df))
+
     return Ok(selected)
 
 

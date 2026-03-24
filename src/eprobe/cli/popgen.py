@@ -918,11 +918,12 @@ def select(
                  Selects top-scoring SNP(s) from each window.
                  Use --weights to adjust priorities, --targets to set optimal values.
 
-      priority - Prioritize SNPs in specific genomic regions (e.g., exons).
-                 REQUIRES --priority_bed file defining priority regions.
-                 First fills quota from priority regions, then supplements
-                 from remaining genome if needed. Can combine with --weights
-                 for weighted selection within priority regions.
+      priority - Window-based selection with priority for specific genomic regions.
+                 REQUIRES --priority_bed file defining priority regions (e.g., exons).
+                 For EACH WINDOW: if SNPs exist in priority regions, select from those;
+                 otherwise select from non-priority SNPs. This ensures uniform genomic
+                 coverage while maximizing SNPs in priority regions.
+                 Can combine with --weights for weighted selection within windows.
 
     \b
     Output files:
