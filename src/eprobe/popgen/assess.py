@@ -2064,9 +2064,21 @@ def generate_multipop_sfs_heatmap(
 
     plot_sfs_2d = {}
     for key, arr in sfs_2d.items():
-        log_arr = np.log10(1.0 + arr)
+        # Mirror folded 2D SFS to fill the full matrix.
+        # In a folded SFS, entries beyond the fold line are 0; their
+        # mirror at (dim0-1-i, dim1-1-j) holds the actual count.
+        d0, d1 = arr.shape
+        full = arr.copy()
+        for ii in range(d0):
+            for jj in range(d1):
+                if full[ii, jj] == 0:
+                    mi, mj = d0 - 1 - ii, d1 - 1 - jj
+                    if 0 <= mi < d0 and 0 <= mj < d1:
+                        full[ii, jj] = arr[mi, mj]
+        log_arr = np.log10(1.0 + full)
         masked = np.ma.array(log_arr)
         masked[0, 0] = np.ma.masked    # mask all-monomorphic corner
+        masked[d0 - 1, d1 - 1] = np.ma.masked  # mask mirrored corner too
         plot_sfs_2d[key] = masked
 
     # Global vmax from unmasked log-transformed values (use caller-supplied value if given)
@@ -2095,12 +2107,17 @@ def generate_multipop_sfs_heatmap(
     )
     
     axes = {}
-    
+
     for i, pop_row in enumerate(pop_ids):
         for j, pop_col in enumerate(pop_ids):
             ax = fig.add_subplot(gs[i, j])
             axes[(i, j)] = ax
-            
+
+            if i < j:
+                # Upper triangle of panel: hide completely
+                ax.set_visible(False)
+                continue
+
             if i == j:
                 # Diagonal: 1D SFS as column heatmap
                 if pop_row in plot_sfs_1d:
@@ -2118,25 +2135,14 @@ def generate_multipop_sfs_heatmap(
                     ax.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=10)
                     ax.set_xticks([])
                     ax.set_yticks([])
-                    
+
             else:
-                # Off-diagonal (i ≠ j): 2D joint SFS - symmetric upper and lower triangles
-                # Always use canonical key order: (pop_min, pop_max) from pop_ids
-                if i > j:
-                    pop_min, pop_max = pop_col, pop_row
-                else:
-                    pop_min, pop_max = pop_row, pop_col
-                
+                # Lower triangle (i > j): 2D joint SFS (full matrix, mirrored)
+                pop_min, pop_max = pop_col, pop_row
                 key = (pop_min, pop_max)
                 if key in plot_sfs_2d:
-                    sfs_data = plot_sfs_2d[key]
-                    
-                    # Transpose for display orientation: 
-                    # axes should correspond to row-pop (Y-axis) and col-pop (X-axis)
-                    if i > j:
-                        # Lower triangle: show transposed (flip axes)
-                        sfs_data = sfs_data.T
-                    
+                    sfs_data = plot_sfs_2d[key].T  # transpose so Y=pop_row, X=pop_col
+
                     im = ax.imshow(
                         sfs_data,
                         aspect='auto',
@@ -2146,28 +2152,21 @@ def generate_multipop_sfs_heatmap(
                         origin='upper'
                     )
                 else:
-                    if i < j:
-                        ax.set_facecolor('white')
-                    else:
-                        ax.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=10)
-                        ax.set_xticks([])
-                        ax.set_yticks([])
+                    ax.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=10)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
 
             # Y-axis: only show ticks on leftmost column
-            if j == 0 and i >= j:
+            if j == 0:
                 if i == j and pop_row in plot_sfs_1d:
                     n_bins = len(plot_sfs_1d[pop_row])
                     ax.set_yticks(range(n_bins))
                     ax.set_yticklabels(range(n_bins), fontsize=7)
                 elif i > j:
-                    # Off-diagonal lower triangle: use canonical key order
                     pop_min, pop_max = pop_col, pop_row
                     key = (pop_min, pop_max)
                     if key in plot_sfs_2d:
-                        sfs_data = plot_sfs_2d[key]
-                        # Y-axis corresponds to the column population (pop_row)
-                        # After transpose, shape becomes (pop_row_bins, pop_col_bins)
-                        sfs_data = sfs_data.T
+                        sfs_data = plot_sfs_2d[key].T
                         ax.set_yticks(range(sfs_data.shape[0]))
                         ax.set_yticklabels(range(sfs_data.shape[0]), fontsize=7)
             else:
@@ -2184,18 +2183,19 @@ def generate_multipop_sfs_heatmap(
                 spine.set_color('black')
                 spine.set_linewidth(1.5)
     
-    # Add population labels on top (X-axis titles)
+    # Add population labels on top — only for columns that have a visible diagonal cell
     for j, pop_col in enumerate(pop_ids):
-        ax = axes[(0, j)]
+        # The diagonal cell (j, j) is always visible; use it for the column title
+        ax = axes[(j, j)]
         ax.set_title(pop_col, fontsize=11, fontweight='bold', pad=8)
-    
+
     # Add population labels on left (Y-axis titles)
     for i, pop_row in enumerate(pop_ids):
         ax = axes[(i, 0)]
         ax.set_ylabel(pop_row, fontsize=11, fontweight='bold', labelpad=8)
-    
-    # Add colorbar on the right side (shortened to half height)
-    cbar_ax = fig.add_axes([0.91, 0.65, 0.025, 0.175])  # Height reduced from 0.35 to 0.175
+
+    # Add colorbar on the right side
+    cbar_ax = fig.add_axes([0.91, 0.55, 0.025, 0.25])
     cbar = fig.colorbar(
         plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, vmax)),
         cax=cbar_ax
@@ -2203,12 +2203,12 @@ def generate_multipop_sfs_heatmap(
     cbar.set_label('log\u2081\u2080(count + 1)', fontsize=9)
     cbar.ax.tick_params(labelsize=8)
 
-    # Add gray legend patch for masked (monomorphic/fixed) cells
+    # Add gray legend patch for masked (monomorphic/fixed) cells, near colorbar
     import matplotlib.patches as mpatches
     gray_patch = mpatches.Patch(facecolor='lightgray', edgecolor='gray',
                                 label='Monomorphic (count = 0)')
-    fig.legend(handles=[gray_patch], loc='lower right',
-               bbox_to_anchor=(0.89, 0.08), fontsize=8,
+    fig.legend(handles=[gray_patch], loc='right',
+               bbox_to_anchor=(0.98, 0.48), fontsize=8,
                frameon=True, framealpha=0.9)
 
     # Add title
