@@ -432,12 +432,11 @@ def extract(
     type=click.Choice([
         "DNA_NN1", "DNA_NN2", "DNA_NN3", "DNA_NN4", "R_DNA_NN1"
     ]),
-    default="DNA_NN4",
+    default="R_DNA_NN1",
     help="Nearest-neighbor thermodynamic table for Tm calculation. "
-         "DNA_NN tables for DNA/DNA hybridization, R_DNA_NN1 for RNA/DNA. "
-         "Options: DNA_NN1 (Breslauer 1986), DNA_NN2 (Sugimoto 1996), "
-         "DNA_NN3 (Allawi 1997), DNA_NN4 (SantaLucia 1998, default). "
-         "R_DNA_NN1 for RNA probes hybridizing to DNA targets.",
+         "R_DNA_NN1 (Sugimoto 1995, default) for RNA probes hybridizing to DNA targets. "
+         "DNA_NN tables for DNA/DNA hybridization: DNA_NN1 (Breslauer 1986), "
+         "DNA_NN2 (Sugimoto 1996), DNA_NN3 (Allawi 1997), DNA_NN4 (SantaLucia 1998).",
 )
 @click.option(
     "--na-conc",

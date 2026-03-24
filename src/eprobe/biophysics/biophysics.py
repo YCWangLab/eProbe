@@ -86,45 +86,45 @@ NN_TABLE_OPTIONS = {
 
 
 def calculate_tm_fast(
-    sequence: str, 
+    sequence: str,
     na_conc: float = 50.0,
-    nn_table: str = "DNA_NN4",
+    nn_table: str = "R_DNA_NN1",
     dnac1: float = 250.0,
     dnac2: float = 0.0,
 ) -> float:
     """
     Calculate melting temperature using nearest-neighbor method.
-    
+
     Uses Biopython's Tm_NN with user-selectable NN parameter tables.
     For short sequences (<14bp), uses Wallace rule as fallback.
-    
+
     Args:
         sequence: DNA sequence
         na_conc: Na+ concentration in mM (default: 50)
         nn_table: NN parameter table name. Options:
+            RNA/DNA hybrid (for RNA baits, recommended for liquid-phase capture):
+            - "R_DNA_NN1": Sugimoto 1995 (default)
+
             DNA/DNA hybridization:
             - "DNA_NN1": Breslauer 1986 (older parameters)
             - "DNA_NN2": Sugimoto 1996
             - "DNA_NN3": Allawi 1997
-            - "DNA_NN4": SantaLucia 1998 (recommended, default)
-            
-            RNA/DNA hybrid (for RNA baits):
-            - "R_DNA_NN1": Sugimoto 1995
-            
+            - "DNA_NN4": SantaLucia 1998
+
         dnac1: Concentration of higher concentrated strand (nM, default: 250)
         dnac2: Concentration of lower concentrated strand (nM, default: 0 = excess)
-        
+
     Returns:
         Melting temperature in °C
-        
+
     Raises:
         ValueError: If sequence is invalid or nn_table not recognized
-        
+
     Note:
         For capture probe design:
-        - DNA probes + DNA targets: use "DNA_NN4" (default)
-        - RNA probes + DNA targets: use "R_DNA_NN1"
-        
+        - RNA probes + DNA targets: use "R_DNA_NN1" (default, for liquid-phase RNA baits)
+        - DNA probes + DNA targets: use "DNA_NN4"
+
         References:
         - Breslauer et al. (1986) PNAS 83:3746-3750
         - Sugimoto et al. (1995) Biochemistry 34:11211-11216
@@ -175,9 +175,9 @@ def calculate_tm_fast(
 
 
 def calculate_tm_batch_fast(
-    sequences: List[str], 
+    sequences: List[str],
     na_conc: float = 50.0,
-    nn_table: str = "DNA_NN4",
+    nn_table: str = "R_DNA_NN1",
 ) -> List[float]:
     """
     Calculate Tm for multiple sequences (optimized).

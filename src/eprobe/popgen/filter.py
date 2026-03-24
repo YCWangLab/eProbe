@@ -90,8 +90,8 @@ class BiophysicalThresholds:
     # Dimer: >0 smart filter sensitivity (k-mer sharing fraction), <=0 skip
     dimer: float = 0.50
     # Tm calculation parameters
-    nn_table: str = "DNA_NN4"  # SantaLucia 1998, most widely used
-    na_conc: float = 50.0      # mM Na+ concentration
+    nn_table: str = "R_DNA_NN1"  # Sugimoto 1995, for RNA probes / DNA targets (liquid-phase RNA baits)
+    na_conc: float = 50.0       # mM Na+ concentration
 
 
 @dataclass
@@ -1221,7 +1221,7 @@ def filter_biophysical(
         hairpin_threshold = _resolve_threshold(thresholds.hairpin, hairpin_scores)
         mode_label = _threshold_mode_label(thresholds.hairpin)
         
-        logger.info(f"Hairpin threshold: {hairpin_threshold:.2f} ({mode_label})")
+        logger.info(f"Hairpin threshold: {hairpin_threshold:.2f} kcal/mol ({mode_label})")
         
         # Store distribution stats
         if hairpin_scores:
@@ -2438,7 +2438,7 @@ def run_filter(
     max_complexity: float = 2.0,
     max_hairpin: Optional[float] = None,
     max_dimer: Optional[float] = None,
-    nn_table: str = "DNA_NN4",
+    nn_table: str = "R_DNA_NN1",
     na_conc: float = 50.0,
     probe_length: int = 100,
     threads: int = 1,
@@ -2481,7 +2481,7 @@ def run_filter(
         max_hairpin: Maximum hairpin score (optional)
         max_dimer: Maximum dimer score (optional)
         nn_table: Nearest-neighbor thermodynamic table for Tm calculation.
-            Options: DNA_NN1-4 for DNA/DNA, R_DNA_NN1 for RNA/DNA (default: DNA_NN4)
+            Options: R_DNA_NN1 for RNA/DNA (default), DNA_NN1-4 for DNA/DNA
         na_conc: Sodium ion concentration in mM (default: 50.0)
         probe_length: Length of probe sequences (for flanking calculation)
         threads: Number of threads

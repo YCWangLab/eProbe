@@ -147,10 +147,10 @@ biophysics:
     min: 55.0
     max: 75.0
     # Nearest-neighbor thermodynamic table for Tm calculation
+    # RNA/DNA: R_DNA_NN1 (Sugimoto 1995, default) for RNA probes hybridizing to DNA targets
     # DNA/DNA: DNA_NN1 (Breslauer 1986), DNA_NN2 (Sugimoto 1996),
-    #          DNA_NN3 (Allawi 1997), DNA_NN4 (SantaLucia 1998, default)
-    # RNA/DNA: R_DNA_NN1 for RNA probes hybridizing to DNA targets
-    nn_table: DNA_NN4
+    #          DNA_NN3 (Allawi 1997), DNA_NN4 (SantaLucia 1998)
+    nn_table: R_DNA_NN1
     # Sodium concentration in mM
     na_conc: 50.0
   complexity:

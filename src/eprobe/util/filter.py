@@ -95,7 +95,7 @@ def run_util_filter(
     max_complexity: float = 2.0,
     max_hairpin: Optional[float] = None,
     max_dimer: Optional[float] = None,
-    nn_table: str = "DNA_NN4",
+    nn_table: str = "R_DNA_NN1",
     na_conc: float = 50.0,
     # General
     keep_temp: bool = False,

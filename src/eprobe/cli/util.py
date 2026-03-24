@@ -1517,8 +1517,8 @@ def target(
 @click.option(
     "--nn-table",
     type=click.Choice(["DNA_NN1", "DNA_NN2", "DNA_NN3", "DNA_NN4", "R_DNA_NN1"]),
-    default="DNA_NN4",
-    help="Nearest-neighbor table for Tm (default: DNA_NN4).",
+    default="R_DNA_NN1",
+    help="Nearest-neighbor table for Tm. R_DNA_NN1 (default) for RNA/DNA hybrid, DNA_NN1-4 for DNA/DNA.",
 )
 @click.option(
     "--na-conc",
