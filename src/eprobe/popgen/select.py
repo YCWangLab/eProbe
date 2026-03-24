@@ -1005,21 +1005,25 @@ def run_select(
         raw_df = raw_df[raw_df['chr'].isin(chromosomes)]
         logger.info(f"After chromosome filter: {len(snps)} SNPs")
     
-    # Determine target count
-    # For window-based strategies (weighted, uniform, priority) without an explicit
-    # target, default to 1 SNP per window instead of keeping all SNPs.
-    if target_count:
-        probe_number = target_count
-    elif strategy.lower() in ("weighted", "uniform", "priority"):
-        # Estimate window count from data to set target = 1 per window
+    # Determine probe_number for window-based selection.
+    # For weighted/uniform/priority: always select 1 per window first,
+    # then downsample to --target_count if specified and exceeded.
+    strategy_lower = strategy.lower()
+    if strategy_lower in ("weighted", "uniform", "priority"):
         _window_keys = set()
         for snp in snps:
             _window_keys.add((snp.chrom, snp.pos // window_size))
-        probe_number = len(_window_keys)
-        logger.info(f"No --target_count specified; defaulting to 1 per window = {probe_number}")
+        n_windows = len(_window_keys)
+        # First pass always selects 1 per window
+        probe_number = n_windows
+        logger.info(f"Window-based selection: {n_windows} windows → 1 per window")
+        if target_count and target_count < n_windows:
+            logger.info(f"Will downsample to --target_count={target_count} after window selection")
+    elif target_count:
+        probe_number = target_count
     else:
         probe_number = len(snps)
-    logger.info(f"Target count: {probe_number}")
+    logger.info(f"Target count (window pass): {probe_number}")
     
     # Variable to hold DataFrame with biophysical columns (for weighted selection)
     selected_with_biophysical: Optional[pd.DataFrame] = None
@@ -1030,8 +1034,6 @@ def run_select(
         selected = snps
     else:
         # Apply selection strategy
-        strategy_lower = strategy.lower()
-        
         if strategy_lower == "uniform":
             result = select_uniform(snps, probe_number, window_size, seed)
         elif strategy_lower == "random":
@@ -1043,6 +1045,22 @@ def run_select(
             # Weighted returns (snps, df_with_biophysical)
             if result.is_ok():
                 selected_snps, selected_with_biophysical = result.unwrap()
+                logger.info(f"After 1-per-window selection: {len(selected_snps)} SNPs")
+
+                # Downsample to --target_count if specified and exceeded
+                if target_count and len(selected_snps) > target_count:
+                    logger.info(f"Downsampling {len(selected_snps)} → {target_count} (--target_count)")
+                    selected_with_biophysical = selected_with_biophysical.sample(
+                        n=target_count, random_state=seed
+                    ).sort_values(['chr', 'pos'])
+                    # Rebuild SNP list from downsampled DataFrame
+                    selected_snps = [
+                        SNP(chrom=row['chr'], pos=int(row['pos']),
+                            ref=row['ref'], alt=row['alt'],
+                            mutation_type=row['type'])
+                        for _, row in selected_with_biophysical.iterrows()
+                    ]
+
                 selected = selected_snps
                 # Calculate coverage statistics
                 coverage_stats = calculate_coverage_stats(selected, window_size)
@@ -1110,8 +1128,23 @@ def run_select(
                 if isinstance(unwrapped, tuple):
                     # Weighted selection was used within priority
                     selected_snps, selected_with_biophysical = unwrapped
+                    logger.info(f"After 1-per-window selection: {len(selected_snps)} SNPs")
+
+                    # Downsample to --target_count if specified and exceeded
+                    if target_count and len(selected_snps) > target_count:
+                        logger.info(f"Downsampling {len(selected_snps)} → {target_count} (--target_count)")
+                        selected_with_biophysical = selected_with_biophysical.sample(
+                            n=target_count, random_state=seed
+                        ).sort_values(['chr', 'pos'])
+                        selected_snps = [
+                            SNP(chrom=row['chr'], pos=int(row['pos']),
+                                ref=row['ref'], alt=row['alt'],
+                                mutation_type=row['type'])
+                            for _, row in selected_with_biophysical.iterrows()
+                        ]
+
                     selected = selected_snps
-                    
+
                     # Calculate coverage statistics
                     coverage_stats = calculate_coverage_stats(selected, window_size)
                     
