@@ -831,8 +831,11 @@ def filter(
     "--strategy",
     type=click.Choice(["random", "uniform", "weighted", "priority"]),
     default="random",
-    help="Selection strategy: random (default), uniform (even distribution), "
-         "weighted (biophysical score), priority (BED regions first).",
+    help="Selection strategy: "
+         "random (simple random sampling), "
+         "uniform (even genomic distribution via windows), "
+         "weighted (best biophysical score per window, requires filter output), "
+         "priority (prioritize BED regions, requires --priority_bed).",
 )
 @click.option(
     "--weights",
@@ -891,20 +894,36 @@ def select(
 ) -> None:
     """
     Select optimal SNPs using window-based sampling.
-    
+
     Supports multiple input files with merge operations:
     - intersection (default): Keep SNPs in ALL files
     - union: Combine all SNPs
     - difference: Only in first file
     - symmetric_diff: In one file only
-    
+
     \b
     Selection strategies:
-      random   - Random selection (default)
-      uniform  - Uniform distribution across windows
-      weighted - Select SNP with best biophysical score (use --weights)
-      priority - Prioritize SNPs in BED regions (use --priority_bed)
-    
+      random   - Simple random sampling without genomic distribution constraints.
+                 Randomly selects target_count SNPs from input pool.
+
+      uniform  - Window-based uniform distribution across genome.
+                 Divides genome into windows (--window_size), calculates
+                 SNPs per window = target_count / total_windows, then
+                 randomly samples within each window to ensure even coverage.
+
+      weighted - Window-based selection using biophysical scores.
+                 REQUIRES biophysical columns (gc, tm, complexity, hairpin, dimer).
+                 Calculates composite score = Σ(weight_i × distance_to_target_i).
+                 Default targets: gc=50%, tm=70°C, complexity=0, hairpin=0, dimer=0.
+                 Selects top-scoring SNP(s) from each window.
+                 Use --weights to adjust priorities, --targets to set optimal values.
+
+      priority - Prioritize SNPs in specific genomic regions (e.g., exons).
+                 REQUIRES --priority_bed file defining priority regions.
+                 First fills quota from priority regions, then supplements
+                 from remaining genome if needed. Can combine with --weights
+                 for weighted selection within priority regions.
+
     \b
     Output files:
       {output}.selected.tsv  - Selected SNPs
