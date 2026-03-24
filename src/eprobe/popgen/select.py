@@ -1006,7 +1006,19 @@ def run_select(
         logger.info(f"After chromosome filter: {len(snps)} SNPs")
     
     # Determine target count
-    probe_number = target_count if target_count else len(snps)
+    # For window-based strategies (weighted, uniform, priority) without an explicit
+    # target, default to 1 SNP per window instead of keeping all SNPs.
+    if target_count:
+        probe_number = target_count
+    elif strategy.lower() in ("weighted", "uniform", "priority"):
+        # Estimate window count from data to set target = 1 per window
+        _window_keys = set()
+        for snp in snps:
+            _window_keys.add((snp.chrom, snp.pos // window_size))
+        probe_number = len(_window_keys)
+        logger.info(f"No --target_count specified; defaulting to 1 per window = {probe_number}")
+    else:
+        probe_number = len(snps)
     logger.info(f"Target count: {probe_number}")
     
     # Variable to hold DataFrame with biophysical columns (for weighted selection)
