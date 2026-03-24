@@ -1551,8 +1551,8 @@ def run_easysfs(
         if projection is not None:
             cmd.extend(["--proj", projection])
         cmd.extend(["-a", "-f", "-y"])  # -a: all SNPs, -f: force overwrite, -y: no prompt
-        if folded:
-            cmd.append("--fold")  # fold on minor allele; no ancestral state needed
+        if not folded:
+            cmd.append("--unfolded")  # Use unfolded SFS if ancestral alleles are correctly polarized in VCF
 
     logger.info(f"Running easySFS: {' '.join(cmd)}")
 
