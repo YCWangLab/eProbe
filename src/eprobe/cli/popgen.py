@@ -1325,6 +1325,12 @@ def build(
     type=int,
     help="[tags mode] Probe length when generating sequences from TSV (default: 81).",
 )
+@click.option(
+    "--force/--no_force",
+    default=False,
+    help="Force re-run all steps, overwriting existing outputs (default: no). "
+         "Without --force, completed steps are skipped automatically.",
+)
 @click.pass_context
 def assess(
     ctx: click.Context,
@@ -1348,6 +1354,7 @@ def assess(
     ylim: tuple,
     bins: tuple,
     probe_length: int,
+    force: bool,
 ) -> None:
     """
     Assess quality of probe set.
@@ -1408,6 +1415,7 @@ def assess(
         -t, --threads      Number of threads (default: 1)
         --seed             Random seed for subsampling (default: 42)
         --plot             Generate plots (default: yes, use --no_plot to disable)
+        --force            Re-run all steps even if outputs exist (default: skip completed)
     
     \b
     Output files (depends on mode):
@@ -1502,6 +1510,9 @@ def assess(
     plot_ylim = _parse_range(ylim) or None
     plot_bins = _parse_bins(bins) or None
 
+    if force:
+        echo_info("Force mode: all existing outputs will be overwritten")
+
     result = run_assess(
         input_path=input,
         output_prefix=output,
@@ -1524,6 +1535,7 @@ def assess(
         plot_xlim=plot_xlim,
         plot_ylim=plot_ylim,
         plot_bins=plot_bins,
+        force=force,
     )
     
     if result.is_err():
@@ -1536,67 +1548,79 @@ def assess(
     # Print summary based on mode
     if "distance" in stats:
         dist_stats = stats["distance"]
-        corr = dist_stats.get("correlation", {})
-        echo_info(f"\n→ 1-IBS Distance Comparison:")
-        echo_info(f"    ├─ Samples: {dist_stats.get('n_samples', 'N/A')}")
-        echo_info(f"    ├─ Full VCF sites: {dist_stats.get('n_sites_full', 'N/A')}")
-        echo_info(f"    ├─ Probe sites: {dist_stats.get('n_sites_probe', 'N/A')}")
-        echo_info(f"    ├─ Pearson r: {corr.get('pearson_r', 'N/A'):.4f}")
-        echo_info(f"    ├─ Spearman rho: {corr.get('spearman_r', 'N/A'):.4f}")
-        echo_info(f"    └─ Manhattan: {corr.get('manhattan_distance', 'N/A'):.4f}")
-    
+        if dist_stats.get("skipped"):
+            echo_info(f"\n→ 1-IBS Distance: SKIPPED (outputs exist)")
+        else:
+            corr = dist_stats.get("correlation", {})
+            echo_info(f"\n→ 1-IBS Distance Comparison:")
+            echo_info(f"    ├─ Samples: {dist_stats.get('n_samples', 'N/A')}")
+            echo_info(f"    ├─ Full VCF sites: {dist_stats.get('n_sites_full', 'N/A')}")
+            echo_info(f"    ├─ Probe sites: {dist_stats.get('n_sites_probe', 'N/A')}")
+            echo_info(f"    ├─ Pearson r: {corr.get('pearson_r', 'N/A'):.4f}")
+            echo_info(f"    ├─ Spearman rho: {corr.get('spearman_r', 'N/A'):.4f}")
+            echo_info(f"    └─ Manhattan: {corr.get('manhattan_distance', 'N/A'):.4f}")
+
     if "sfs" in stats:
         sfs_stats = stats["sfs"]
-        echo_info(f"\n→ Site Frequency Spectrum (easySFS):")
-        echo_info(f"    ├─ Populations: {', '.join(sfs_stats.get('populations', []))}")
-        echo_info(f"    ├─ Samples per pop: {sfs_stats.get('n_samples_per_pop', 'N/A')}")
-        echo_info(f"    ├─ Full VCF sites: {sfs_stats.get('n_sites_full', 'N/A'):,}")
-        echo_info(f"    ├─ Probe sites: {sfs_stats.get('n_sites_probe', 'N/A'):,}")
-        
-        # Per-population correlations
-        corrs = sfs_stats.get("sfs_correlations", {})
-        if corrs:
-            echo_info(f"    ├─ SFS correlations:")
-            for pop, corr in corrs.items():
-                echo_info(f"    │     {pop}: {corr:.4f}")
-        
-        avg_corr = sfs_stats.get("avg_correlation")
-        if avg_corr is not None:
-            echo_info(f"    └─ Average correlation: {avg_corr:.4f}")
+        if sfs_stats.get("skipped"):
+            echo_info(f"\n→ SFS Assessment: SKIPPED (outputs exist)")
         else:
-            echo_info(f"    └─ Average correlation: N/A")
+            echo_info(f"\n→ Site Frequency Spectrum (easySFS):")
+            echo_info(f"    ├─ Populations: {', '.join(sfs_stats.get('populations', []))}")
+            echo_info(f"    ├─ Samples per pop: {sfs_stats.get('n_samples_per_pop', 'N/A')}")
+            echo_info(f"    ├─ Full VCF sites: {sfs_stats.get('n_sites_full', 'N/A'):,}")
+            echo_info(f"    ├─ Probe sites: {sfs_stats.get('n_sites_probe', 'N/A'):,}")
+
+            # Per-population correlations
+            corrs = sfs_stats.get("sfs_correlations", {})
+            if corrs:
+                echo_info(f"    ├─ SFS correlations:")
+                for pop, corr in corrs.items():
+                    echo_info(f"    │     {pop}: {corr:.4f}")
+
+            avg_corr = sfs_stats.get("avg_correlation")
+            if avg_corr is not None:
+                echo_info(f"    └─ Average correlation: {avg_corr:.4f}")
+            else:
+                echo_info(f"    └─ Average correlation: N/A")
     
     if "pca" in stats:
         pca_stats = stats["pca"]
-        echo_info(f"\n→ Principal Component Analysis (PLINK):")
-        echo_info(f"    ├─ Samples: {pca_stats.get('n_samples', 'N/A')}")
-        echo_info(f"    ├─ Probe positions: {pca_stats.get('n_probe_positions', 'N/A')}")
-        
-        # Variance explained for PC1-3
-        var_full = pca_stats.get("variance_full", {})
-        var_probe = pca_stats.get("variance_probe", {})
-        if var_full and var_probe:
-            echo_info(f"    ├─ Variance explained (PC1/PC2/PC3):")
-            pc1_f = var_full.get("PC1", 0)
-            pc2_f = var_full.get("PC2", 0)
-            pc3_f = var_full.get("PC3", 0)
-            pc1_p = var_probe.get("PC1", 0)
-            pc2_p = var_probe.get("PC2", 0)
-            pc3_p = var_probe.get("PC3", 0)
-            echo_info(f"    │     Full VCF:  {pc1_f:.1f}% / {pc2_f:.1f}% / {pc3_f:.1f}%")
-            echo_info(f"    │     Probe Set: {pc1_p:.1f}% / {pc2_p:.1f}% / {pc3_p:.1f}%")
-        
-        procrustes = pca_stats.get("procrustes_similarity")
-        if procrustes is not None:
-            echo_info(f"    └─ Procrustes similarity: {procrustes:.4f}")
+        if pca_stats.get("skipped"):
+            echo_info(f"\n→ PCA Assessment: SKIPPED (outputs exist)")
         else:
-            echo_info(f"    └─ Procrustes similarity: N/A")
-    
+            echo_info(f"\n→ Principal Component Analysis (PLINK):")
+            echo_info(f"    ├─ Samples: {pca_stats.get('n_samples', 'N/A')}")
+            echo_info(f"    ├─ Probe positions: {pca_stats.get('n_probe_positions', 'N/A')}")
+
+            # Variance explained for PC1-3
+            var_full = pca_stats.get("variance_full", {})
+            var_probe = pca_stats.get("variance_probe", {})
+            if var_full and var_probe:
+                echo_info(f"    ├─ Variance explained (PC1/PC2/PC3):")
+                pc1_f = var_full.get("PC1", 0)
+                pc2_f = var_full.get("PC2", 0)
+                pc3_f = var_full.get("PC3", 0)
+                pc1_p = var_probe.get("PC1", 0)
+                pc2_p = var_probe.get("PC2", 0)
+                pc3_p = var_probe.get("PC3", 0)
+                echo_info(f"    │     Full VCF:  {pc1_f:.1f}% / {pc2_f:.1f}% / {pc3_f:.1f}%")
+                echo_info(f"    │     Probe Set: {pc1_p:.1f}% / {pc2_p:.1f}% / {pc3_p:.1f}%")
+
+            procrustes = pca_stats.get("procrustes_similarity")
+            if procrustes is not None:
+                echo_info(f"    └─ Procrustes similarity: {procrustes:.4f}")
+            else:
+                echo_info(f"    └─ Procrustes similarity: N/A")
+
     if "tags" in stats:
         tag_stats = stats["tags"]
-        echo_info(f"\n→ Biophysical Tags:")
-        echo_info(f"    ├─ Probes analyzed: {tag_stats.get('probe_count', 'N/A')}")
-        echo_info(f"    └─ Summary: {tag_stats.get('summary_file', 'N/A')}")
+        if tag_stats.get("skipped"):
+            echo_info(f"\n→ Tags Assessment: SKIPPED (outputs exist)")
+        else:
+            echo_info(f"\n→ Biophysical Tags:")
+            echo_info(f"    ├─ Probes analyzed: {tag_stats.get('probe_count', 'N/A')}")
+            echo_info(f"    └─ Summary: {tag_stats.get('summary_file', 'N/A')}")
     
     if plot:
         echo_info(f"\nPlots saved to {output}.*")

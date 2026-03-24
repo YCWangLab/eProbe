@@ -3051,6 +3051,18 @@ def generate_assessment_plots(
     return Ok(plot_paths)
 
 
+def _check_mode_outputs_exist(output_prefix: Path, mode: str) -> bool:
+    """Check whether key output files for a given assessment mode already exist."""
+    checks = {
+        "distance": [".distance_summary.txt", ".ibs_heatmap.png"],
+        "sfs": [".sfs_summary.txt"],
+        "pca": [".pca_summary.txt"],
+        "tags": [".tags_summary.txt"],
+    }
+    required = checks.get(mode, [])
+    return all((Path(str(output_prefix) + suffix)).exists() for suffix in required)
+
+
 def run_assess(
     input_path: Path,
     output_prefix: Path,
@@ -3074,6 +3086,7 @@ def run_assess(
     plot_xlim: Optional[Dict[str, Tuple[float, float]]] = None,
     plot_ylim: Optional[Dict[str, Tuple[float, float]]] = None,
     plot_bins: Optional[Dict[str, int]] = None,
+    force: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
     Assess quality of probe set.
@@ -3107,7 +3120,8 @@ def run_assess(
         plot_xlim: Per-tag x-axis limits, e.g. {"gc": (0.0, 1.0)}
         plot_ylim: Per-tag y-axis limits, e.g. {"gc": (0.0, 50.0)}
         plot_bins: Per-tag bin count, e.g. {"gc": 100}
-        
+        force: Force re-run all steps even if output files already exist
+
     Returns:
         Result containing assessment statistics
     """
@@ -3124,120 +3138,150 @@ def run_assess(
     
     mode = mode.lower()
     all_stats = {}
-    
+
+    if force:
+        logger.info("Force mode: all existing outputs will be overwritten")
+
+    # Determine which sub-modes to run
+    modes_to_run = [mode] if mode != "all" else ["distance", "sfs", "pca", "tags"]
+
     # === DISTANCE MODE ===
-    if mode in ["distance", "all"]:
+    if "distance" in modes_to_run:
         if vcf_path is None:
             return Err("Distance mode requires --vcf parameter")
-        
-        logger.info("=" * 50)
-        logger.info("Running IBS Distance Assessment")
-        logger.info("=" * 50)
-        
-        dist_result = run_distance_assessment(
-            snp_tsv_path=input_path,
-            vcf_path=vcf_path,
-            output_prefix=output_prefix,
-            max_sites=max_vcf_sites,
-            pop_file=pop_file,
-            n_samples=n_samples_per_pop,
-            seed=seed,
-            threads=threads,
-            verbose=verbose,
-        )
-        
-        if dist_result.is_err():
-            return Err(f"Distance assessment failed: {dist_result.unwrap_err()}")
-        
-        all_stats["distance"] = dist_result.unwrap()
-        logger.info("Distance assessment complete")
-    
+
+        if not force and _check_mode_outputs_exist(output_prefix, "distance"):
+            logger.info("=" * 50)
+            logger.info("IBS Distance Assessment: SKIPPED (outputs exist, use --force to re-run)")
+            logger.info("=" * 50)
+            all_stats["distance"] = {"skipped": True, "reason": "outputs already exist"}
+        else:
+            logger.info("=" * 50)
+            logger.info("Running IBS Distance Assessment")
+            logger.info("=" * 50)
+
+            dist_result = run_distance_assessment(
+                snp_tsv_path=input_path,
+                vcf_path=vcf_path,
+                output_prefix=output_prefix,
+                max_sites=max_vcf_sites,
+                pop_file=pop_file,
+                n_samples=n_samples_per_pop,
+                seed=seed,
+                threads=threads,
+                verbose=verbose,
+            )
+
+            if dist_result.is_err():
+                return Err(f"Distance assessment failed: {dist_result.unwrap_err()}")
+
+            all_stats["distance"] = dist_result.unwrap()
+            logger.info("Distance assessment complete")
+
     # === SFS MODE ===
-    if mode in ["sfs", "all"]:
+    if "sfs" in modes_to_run:
         if vcf_path is None:
             return Err("SFS mode requires --vcf parameter")
         if pop_file is None:
             return Err("SFS mode requires --pop_file parameter")
-        
-        logger.info("=" * 50)
-        logger.info("Running SFS Assessment (easySFS)")
-        logger.info("=" * 50)
-        
-        sfs_result = run_sfs_assessment(
-            snp_tsv_path=input_path,
-            vcf_path=vcf_path,
-            output_prefix=output_prefix,
-            pop_file=pop_file,
-            n_samples_per_pop=n_samples_per_pop,
-            specified_samples=specified_samples,
-            projection=projection,
-            pops=pops,
-            seed=seed,
-            threads=threads,
-            verbose=verbose,
-        )
-        
-        if sfs_result.is_err():
-            return Err(f"SFS assessment failed: {sfs_result.unwrap_err()}")
-        
-        all_stats["sfs"] = sfs_result.unwrap()
-        logger.info("SFS assessment complete")
-    
+
+        if not force and _check_mode_outputs_exist(output_prefix, "sfs"):
+            logger.info("=" * 50)
+            logger.info("SFS Assessment: SKIPPED (outputs exist, use --force to re-run)")
+            logger.info("=" * 50)
+            all_stats["sfs"] = {"skipped": True, "reason": "outputs already exist"}
+        else:
+            logger.info("=" * 50)
+            logger.info("Running SFS Assessment (easySFS)")
+            logger.info("=" * 50)
+
+            sfs_result = run_sfs_assessment(
+                snp_tsv_path=input_path,
+                vcf_path=vcf_path,
+                output_prefix=output_prefix,
+                pop_file=pop_file,
+                n_samples_per_pop=n_samples_per_pop,
+                specified_samples=specified_samples,
+                projection=projection,
+                pops=pops,
+                seed=seed,
+                threads=threads,
+                verbose=verbose,
+            )
+
+            if sfs_result.is_err():
+                return Err(f"SFS assessment failed: {sfs_result.unwrap_err()}")
+
+            all_stats["sfs"] = sfs_result.unwrap()
+            logger.info("SFS assessment complete")
+
     # === PCA MODE ===
-    if mode in ["pca", "all"]:
+    if "pca" in modes_to_run:
         if vcf_path is None:
             return Err("PCA mode requires --vcf parameter")
-        
-        logger.info("=" * 50)
-        logger.info("Running PCA Assessment (PLINK)")
-        logger.info("=" * 50)
-        
-        pca_result = run_pca_assessment(
-            snp_tsv_path=input_path,
-            vcf_path=vcf_path,
-            output_prefix=output_prefix,
-            pop_file=pop_file,
-            n_samples=n_samples_per_pop,
-            seed=seed,
-            threads=threads,
-            verbose=verbose,
-        )
-        
-        if pca_result.is_err():
-            return Err(f"PCA assessment failed: {pca_result.unwrap_err()}")
-        
-        all_stats["pca"] = pca_result.unwrap()
-        logger.info("PCA assessment complete")
-    
+
+        if not force and _check_mode_outputs_exist(output_prefix, "pca"):
+            logger.info("=" * 50)
+            logger.info("PCA Assessment: SKIPPED (outputs exist, use --force to re-run)")
+            logger.info("=" * 50)
+            all_stats["pca"] = {"skipped": True, "reason": "outputs already exist"}
+        else:
+            logger.info("=" * 50)
+            logger.info("Running PCA Assessment (PLINK)")
+            logger.info("=" * 50)
+
+            pca_result = run_pca_assessment(
+                snp_tsv_path=input_path,
+                vcf_path=vcf_path,
+                output_prefix=output_prefix,
+                pop_file=pop_file,
+                n_samples=n_samples_per_pop,
+                seed=seed,
+                threads=threads,
+                verbose=verbose,
+            )
+
+            if pca_result.is_err():
+                return Err(f"PCA assessment failed: {pca_result.unwrap_err()}")
+
+            all_stats["pca"] = pca_result.unwrap()
+            logger.info("PCA assessment complete")
+
     # === TAGS MODE ===
-    if mode in ["tags", "all"]:
-        logger.info("=" * 50)
-        logger.info("Running Biophysical Tags Assessment")
-        logger.info("=" * 50)
-        
-        tags_result = run_tags_assessment(
-            input_path=input_path,
-            output_prefix=output_prefix,
-            reference_path=reference_path,
-            tags=tags,
-            generate_plots=generate_plots,
-            sample_dimer=sample_dimer,
-            compare_path=compare_path,
-            plot_xlim=plot_xlim,
-            plot_ylim=plot_ylim,
-            plot_bins=plot_bins,
-            probe_length=probe_length,
-            verbose=verbose,
-        )
-        
-        if tags_result.is_err():
-            return Err(f"Tags assessment failed: {tags_result.unwrap_err()}")
-        
-        all_stats["tags"] = tags_result.unwrap()
-        logger.info("Tags assessment complete")
-    
+    if "tags" in modes_to_run:
+        if not force and _check_mode_outputs_exist(output_prefix, "tags"):
+            logger.info("=" * 50)
+            logger.info("Tags Assessment: SKIPPED (outputs exist, use --force to re-run)")
+            logger.info("=" * 50)
+            all_stats["tags"] = {"skipped": True, "reason": "outputs already exist"}
+        else:
+            logger.info("=" * 50)
+            logger.info("Running Biophysical Tags Assessment")
+            logger.info("=" * 50)
+
+            tags_result = run_tags_assessment(
+                input_path=input_path,
+                output_prefix=output_prefix,
+                reference_path=reference_path,
+                tags=tags,
+                generate_plots=generate_plots,
+                sample_dimer=sample_dimer,
+                compare_path=compare_path,
+                plot_xlim=plot_xlim,
+                plot_ylim=plot_ylim,
+                plot_bins=plot_bins,
+                probe_length=probe_length,
+                verbose=verbose,
+            )
+
+            if tags_result.is_err():
+                return Err(f"Tags assessment failed: {tags_result.unwrap_err()}")
+
+            all_stats["tags"] = tags_result.unwrap()
+            logger.info("Tags assessment complete")
+
     if not all_stats:
-        return Err(f"Unknown mode: {mode}. Use: tags, distance, sfs, all")
+        return Err(f"Unknown mode: {mode}. Use: tags, distance, sfs, pca, all")
     
     return Ok(all_stats)
 
