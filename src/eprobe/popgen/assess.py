@@ -46,7 +46,7 @@ AVAILABLE_TAGS = {
     "tm": "Melting temperature (°C)",
     "complexity": "DUST complexity score",
     "hairpin": "Self-complementarity score",
-    "dimer": "Inter-probe complementarity score",
+    "dimer": "Inter-probe complementarity score (legacy formula: D(g)=(100/N)*Σc_i(g))",
     "entropy": "Shannon entropy",
 }
 
@@ -109,6 +109,9 @@ def assess_probes(
     """
     Assess all probes for specified metrics.
     
+    Note: Dimer scores require pool-level information, so they are calculated
+    separately using all sequences before per-probe assessment.
+    
     Args:
         sequences: Dictionary of probe_id -> sequence
         tags: List of metrics to calculate
@@ -118,11 +121,79 @@ def assess_probes(
     """
     results = []
     
+    # Pre-calculate dimer scores (pool-level calculation)
+    dimer_scores = {}
+    if "dimer" in tags:
+        dimer_scores = calculate_dimer_scores_legacy(sequences)
+    
     for probe_id, sequence in sequences.items():
         result = assess_single_probe(probe_id, sequence, tags)
+        
+        # Add pre-calculated dimer score if requested
+        if "dimer" in tags:
+            result.dimer = dimer_scores.get(probe_id, 0.0)
+        
         results.append(result)
     
     return results
+
+
+def calculate_dimer_scores_legacy(
+    sequences: Dict[str, str],
+    k: int = 11,
+) -> Dict[str, float]:
+    """
+    Calculate dimer scores using legacy formula: D(g) = (100/N) * Σ c_i(g)
+    
+    Where c_i(g) is the frequency of k-mer i from sequence g in the entire probe pool.
+    This reflects how many times each k-mer appears across all probes.
+    
+    Paper reference: the original eProbe formulation for inter-probe complementarity.
+    
+    Args:
+        sequences: Dictionary of probe_id -> sequence
+        k: K-mer size (default: 11)
+        
+    Returns:
+        Dictionary of probe_id -> dimer score (percentage, 0-100)
+    
+    Algorithm:
+        1. Build k-mer frequency dictionary from all probes
+        2. For each probe: sum up the frequencies of all its k-mers
+        3. Normalize by total # of probes * 100 to get percentage
+    """
+    if len(sequences) <= 1:
+        return {pid: 0.0 for pid in sequences.keys()}
+    
+    probe_ids = list(sequences.keys())
+    probe_seqs = list(sequences.values())
+    N = len(probe_seqs)
+    
+    # Step 1: Build k-mer frequency dictionary from entire pool
+    kmer_freq: Dict[str, int] = {}
+    for seq in probe_seqs:
+        seq_upper = seq.upper()
+        for i in range(len(seq_upper) - k + 1):
+            kmer = seq_upper[i : i + k]
+            if "N" not in kmer:  # Skip k-mers with N
+                kmer_freq[kmer] = kmer_freq.get(kmer, 0) + 1
+    
+    # Step 2: Calculate dimer score for each probe
+    dimer_scores = {}
+    for pid, seq in zip(probe_ids, probe_seqs):
+        seq_upper = seq.upper()
+        kmer_sum = 0
+        
+        for i in range(len(seq_upper) - k + 1):
+            kmer = seq_upper[i : i + k]
+            if "N" not in kmer and kmer in kmer_freq:
+                kmer_sum += kmer_freq[kmer]
+        
+        # Normalize: (100/N) * sum as in formula D(g) = (100/N) * Σ c_i(g)
+        score = (kmer_sum / N) * 100.0
+        dimer_scores[pid] = round(score, 4)
+    
+    return dimer_scores
 
 
 def calculate_dimer_scores(
@@ -3368,10 +3439,10 @@ def run_tags_assessment(
     tags_without_dimer = [t for t in tags if t != "dimer"]
     results = assess_probes(sequences, tags_without_dimer)
     
-    # Calculate dimer scores separately (sampling-based)
+    # Calculate dimer scores separately (legacy formula: D(g) = (100/N)*Σc_i(g))
     if "dimer" in tags:
-        logger.info(f"Calculating dimer scores (sampling {sample_dimer} pairs)...")
-        dimer_scores = calculate_dimer_scores(sequences, sample_dimer)
+        logger.info("Calculating dimer scores using legacy formula...")
+        dimer_scores = calculate_dimer_scores_legacy(sequences)
         
         for result in results:
             result.dimer = dimer_scores.get(result.probe_id, 0.0)
