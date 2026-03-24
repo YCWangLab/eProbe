@@ -952,24 +952,40 @@ def select(
         if len(target_values) != 5:
             echo_error("Targets must have 5 values: gc,tm,complexity,hairpin,dimer")
             raise SystemExit(1)
-    
+
     # Handle multiple input files
     merge_details = None
+    biophysical_reference = None  # Path to file with biophysical columns
+
     if len(input) > 1:
         echo_info(f"Merging {len(input)} input files using {merge_mode} mode")
         for i, f in enumerate(input, 1):
             echo_info(f"  {i}. {f}")
-        
+
         merge_result = merge_snp_files(list(input), merge_mode, threads=threads)
         if merge_result.is_err():
             echo_error(f"Failed to merge inputs: {merge_result.unwrap_err()}")
             raise SystemExit(1)
-        
+
         merged_snps = merge_result.unwrap()
         echo_info(f"After merge ({merge_mode}): {len(merged_snps)} SNPs")
-        input_path = input[0]  # Use first file path as reference
+
+        # Find input file with biophysical columns for reference
+        # Check each input file for biophysical columns (gc, tm, complexity, hairpin, dimer)
+        biophysical_cols = {'gc', 'tm', 'complexity', 'hairpin', 'dimer'}
+        for f in input:
+            try:
+                import pandas as pd
+                df_head = pd.read_csv(f, sep='\t', nrows=1)
+                if biophysical_cols.issubset(set(df_head.columns)):
+                    biophysical_reference = f
+                    break
+            except Exception:
+                continue
+
+        input_path = biophysical_reference if biophysical_reference else input[0]
         merged_data = merged_snps
-        
+
         # Create merge details for reporting
         merge_details = {
             "mode": merge_mode,
@@ -977,6 +993,9 @@ def select(
             "files": [str(f) for f in input],
             "merged_count": len(merged_snps),
         }
+
+        if biophysical_reference:
+            echo_info(f"Using {biophysical_reference.name} for biophysical metrics")
     else:
         input_path = input[0]
         merged_data = None
