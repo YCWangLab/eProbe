@@ -24,6 +24,14 @@ import pandas as pd
 
 from eprobe.core.result import Result, Ok, Err
 from eprobe.core.models import SNP, SNPDataFrame
+from eprobe.core.fasta import read_fasta
+from eprobe.biophysics.biophysics import (
+    calculate_gc_fast,
+    calculate_tm_fast,
+    calculate_dust_fast,
+    calculate_hairpin_fast,
+    DimerCalculatorFast,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +305,91 @@ def _build_biophysical_comparison(
             'delta_mean': sel_mean - in_mean,
         })
     return comparison
+
+
+def _compute_biophysical_columns(
+    df: pd.DataFrame,
+    reference_path: Path,
+    probe_length: int = 81,
+) -> pd.DataFrame:
+    """Compute gc, tm, complexity, hairpin, dimer columns from reference genome.
+
+    Generates probe sequences (flanking around each SNP) and calculates
+    biophysical metrics, adding them as new columns to *df* (in-place copy).
+    """
+    logger.info(f"Computing biophysical columns from reference (probe_length={probe_length})")
+    ref_result = read_fasta(reference_path)
+    if ref_result.is_err():
+        raise RuntimeError(f"Failed to read reference: {ref_result.unwrap_err()}")
+    ref_dict = ref_result.unwrap()
+
+    # Flanking logic (same as filter.py / assess.py)
+    is_odd = probe_length % 2 == 1
+    if is_odd:
+        left_flank_len = (probe_length - 1) // 2
+        right_flank_len = (probe_length - 1) // 2
+    else:
+        left_flank_len = probe_length // 2 - 1
+        right_flank_len = probe_length // 2
+
+    has_ref_col = 'ref' in df.columns
+    sequences: Dict[int, str] = {}  # index -> probe sequence
+
+    for idx, row in df.iterrows():
+        chrom = str(row['chr'])
+        pos = int(row['pos'])
+        if chrom not in ref_dict:
+            continue
+        chrom_seq = ref_dict[chrom]
+        left_end = pos - 1
+        right_start = pos
+        start_pos = max(0, left_end - left_flank_len)
+        end_pos = min(len(chrom_seq), right_start + right_flank_len)
+        left_flank = chrom_seq[start_pos:left_end] if left_end > start_pos else ""
+        right_flank = chrom_seq[right_start:end_pos] if end_pos > right_start else ""
+        ref_base = str(row['ref']).upper() if has_ref_col else chrom_seq[pos - 1].upper()
+        probe_seq = (left_flank + ref_base + right_flank).upper()
+        if len(probe_seq) == probe_length:
+            sequences[idx] = probe_seq
+
+    logger.info(f"Generated {len(sequences)} probe sequences")
+
+    # Compute metrics
+    gc_vals = {}
+    tm_vals = {}
+    complexity_vals = {}
+    hairpin_vals = {}
+
+    for idx, seq in sequences.items():
+        gc_vals[idx] = calculate_gc_fast(seq)
+        tm_vals[idx] = calculate_tm_fast(seq)
+        complexity_vals[idx] = calculate_dust_fast(seq)
+        hairpin_vals[idx] = calculate_hairpin_fast(seq)
+
+    # Dimer: build index on all sequences, score each
+    all_seqs = list(sequences.values())
+    all_idxs = list(sequences.keys())
+    dimer_calc = DimerCalculatorFast(k=7)
+    dimer_calc.build_index(all_seqs)
+    dimer_scores = dimer_calc.score_all(all_seqs)
+    dimer_vals = {idx: score for idx, score in zip(all_idxs, dimer_scores)}
+
+    df = df.copy()
+    df['gc'] = df.index.map(gc_vals)
+    df['tm'] = df.index.map(tm_vals)
+    df['complexity'] = df.index.map(complexity_vals)
+    df['hairpin'] = df.index.map(hairpin_vals)
+    df['dimer'] = df.index.map(dimer_vals)
+
+    # Drop rows that could not be sequenced (boundary SNPs)
+    before = len(df)
+    df = df.dropna(subset=BIOPHYSICAL_COLUMNS)
+    after = len(df)
+    if before > after:
+        logger.info(f"Dropped {before - after} SNPs without complete biophysical data (boundary)")
+
+    logger.info("Biophysical columns computed successfully")
+    return df
 
 
 def _write_biophysical_summary(
@@ -928,6 +1021,8 @@ def run_select(
     merged_snps: Optional[List[SNP]] = None,
     merge_details: Optional[Dict[str, Any]] = None,
     threads: int = 1,
+    reference_path: Optional[Path] = None,
+    probe_length: int = 81,
     verbose: bool = False,
     **kwargs,  # Accept extra kwargs for CLI compatibility
 ) -> Result[Dict[str, Any], str]:
@@ -994,7 +1089,18 @@ def run_select(
     
     # Keep the raw DataFrame for weighted selection
     raw_df = snp_df_obj.df.copy()
-    
+
+    # For weighted/priority strategies: compute biophysical columns if missing
+    if strategy.lower() in ("weighted", "priority"):
+        missing_cols = [c for c in BIOPHYSICAL_COLUMNS if c not in raw_df.columns]
+        if missing_cols:
+            if reference_path is None:
+                return Err(
+                    f"Weighted selection requires biophysical columns {missing_cols}. "
+                    f"Provide --reference to compute them automatically."
+                )
+            raw_df = _compute_biophysical_columns(raw_df, reference_path, probe_length)
+
     # Filter by chromosomes if specified
     if chromosomes:
         chrom_result = select_chromosomes(snps, chromosomes)

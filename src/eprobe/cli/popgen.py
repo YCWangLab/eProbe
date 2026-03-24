@@ -876,6 +876,20 @@ def filter(
     default=False,
     help="Keep biophysical columns (gc, tm, complexity, hairpin, dimer) in output. Default: False.",
 )
+@click.option(
+    "-r", "--reference",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Reference genome FASTA. Required for weighted/priority strategy when "
+         "input files lack biophysical columns (gc, tm, complexity, hairpin, dimer). "
+         "Probe sequences are generated and metrics computed automatically.",
+)
+@click.option(
+    "-l", "--probe_length",
+    default=81,
+    type=int,
+    help="Probe length for biophysical computation (default: 81). Only used with --reference.",
+)
 @click.pass_context
 def select(
     ctx: click.Context,
@@ -891,6 +905,8 @@ def select(
     seed: int,
     threads: int,
     keep_biophysical: bool,
+    reference: Optional[Path],
+    probe_length: int,
 ) -> None:
     """
     Select optimal SNPs using window-based sampling.
@@ -1022,6 +1038,8 @@ def select(
         merged_snps=merged_data,
         merge_details=merge_details,
         threads=threads,
+        reference_path=reference,
+        probe_length=probe_length,
         verbose=verbose,
     )
     
