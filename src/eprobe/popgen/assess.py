@@ -2038,12 +2038,22 @@ def generate_multipop_sfs_heatmap(
                     ax.set_xticks([])
                     ax.set_yticks([])
                     
-            elif i > j:
-                # Lower triangle: 2D joint SFS
-                key = (pop_col, pop_row) if (pop_col, pop_row) in plot_sfs_2d else (pop_row, pop_col)
+            else:
+                # Off-diagonal (i ≠ j): 2D joint SFS - symmetric upper and lower triangles
+                # Always use canonical key order: (pop_min, pop_max) from pop_ids
+                if i > j:
+                    pop_min, pop_max = pop_col, pop_row
+                else:
+                    pop_min, pop_max = pop_row, pop_col
+                
+                key = (pop_min, pop_max)
                 if key in plot_sfs_2d:
                     sfs_data = plot_sfs_2d[key]
-                    if key == (pop_row, pop_col):
+                    
+                    # Transpose for display orientation: 
+                    # axes should correspond to row-pop (Y-axis) and col-pop (X-axis)
+                    if i > j:
+                        # Lower triangle: show transposed (flip axes)
                         sfs_data = sfs_data.T
                     
                     im = ax.imshow(
@@ -2055,27 +2065,12 @@ def generate_multipop_sfs_heatmap(
                         origin='upper'
                     )
                 else:
-                    ax.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=10)
-                    ax.set_xticks([])
-                    ax.set_yticks([])
-                    
-            else:
-                # Upper triangle: symmetric mirror (transpose) of the corresponding lower block
-                key = (pop_col, pop_row) if (pop_col, pop_row) in plot_sfs_2d else (pop_row, pop_col)
-                if key in plot_sfs_2d:
-                    sfs_data = plot_sfs_2d[key]
-                    if key == (pop_row, pop_col):
-                        sfs_data = sfs_data.T
-                    im = ax.imshow(
-                        sfs_data,
-                        aspect='auto',
-                        cmap=cmap,
-                        vmin=0,
-                        vmax=vmax,
-                        origin='upper',
-                    )
-                else:
-                    ax.set_facecolor('white')
+                    if i < j:
+                        ax.set_facecolor('white')
+                    else:
+                        ax.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=10)
+                        ax.set_xticks([])
+                        ax.set_yticks([])
 
             # Y-axis: only show ticks on leftmost column
             if j == 0 and i >= j:
@@ -2084,11 +2079,14 @@ def generate_multipop_sfs_heatmap(
                     ax.set_yticks(range(n_bins))
                     ax.set_yticklabels(range(n_bins), fontsize=7)
                 elif i > j:
-                    key = (pop_col, pop_row) if (pop_col, pop_row) in plot_sfs_2d else (pop_row, pop_col)
+                    # Off-diagonal lower triangle: use canonical key order
+                    pop_min, pop_max = pop_col, pop_row
+                    key = (pop_min, pop_max)
                     if key in plot_sfs_2d:
                         sfs_data = plot_sfs_2d[key]
-                        if key == (pop_row, pop_col):
-                            sfs_data = sfs_data.T
+                        # Y-axis corresponds to the column population (pop_row)
+                        # After transpose, shape becomes (pop_row_bins, pop_col_bins)
+                        sfs_data = sfs_data.T
                         ax.set_yticks(range(sfs_data.shape[0]))
                         ax.set_yticklabels(range(sfs_data.shape[0]), fontsize=7)
             else:
