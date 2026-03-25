@@ -3023,39 +3023,8 @@ def generate_assessment_plots(
                 combined = np.concatenate([values, cmp_values])
                 xlim, bin_edges = _smart_plot_limits(combined, n_bins=tag_bins)
 
-        # --- Hairpin-specific: equal-spaced stem-bp transform ---
-        tick_positions_custom = None
-        tick_labels_custom = None
         plot_vals = values
         plot_cmp = cmp_values
-        if tag == 'hairpin' and xlim_fixed is None:
-            unique_raw = np.sort(
-                np.unique(np.concatenate([values, cmp_values]))
-                if len(cmp_values) > 0 else np.unique(values)
-            )
-            val_to_idx = {v: i for i, v in enumerate(unique_raw)}
-            plot_vals = np.array([val_to_idx[v] for v in values], dtype=float)
-            plot_cmp = (np.array([val_to_idx[v] for v in cmp_values], dtype=float)
-                        if len(cmp_values) > 0 else cmp_values)
-            n_cat = len(unique_raw)
-            bin_edges = np.arange(-0.5, n_cat, 1.0)
-            xlim = (-0.5, n_cat - 0.5)
-            tick_positions_custom = np.arange(n_cat, dtype=float)
-            # Convert scores to stem bp labels
-            _log4 = np.log(4)
-            nonzero = unique_raw[unique_raw > 0]
-            if len(nonzero) > 0:
-                min_nz = float(nonzero.min())
-                labels = []
-                for v in unique_raw:
-                    if v == 0:
-                        labels.append('<4bp')
-                    else:
-                        n = round(np.log(v / min_nz) / _log4) + 1 if v > min_nz * 0.5 else 1
-                        labels.append(f'{n + 3}bp')
-                tick_labels_custom = labels
-            else:
-                tick_labels_custom = [f'{v:.2f}' for v in unique_raw]
 
         color = colors[idx % len(colors)]
         sns.set(style='darkgrid')
@@ -3079,18 +3048,11 @@ def generate_assessment_plots(
         if ylim_fixed is not None:
             ax.set_ylim(ylim_fixed)
         ax.set_title('Distribution Plot', fontsize=22, fontname=PLOT_FONT, pad=20)
-        ax.set_xlabel(
-            'Estimated stem length (bp)' if tick_positions_custom is not None else 'Values',
-            fontsize=20, fontname=PLOT_FONT, labelpad=10,
-        )
+        ax.set_xlabel('Values', fontsize=20, fontname=PLOT_FONT, labelpad=10)
         ax.set_ylabel('Percent (%)', fontsize=18, fontname=PLOT_FONT, labelpad=10)
         ax.tick_params(axis='both', labelsize=18)
         ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-        if tick_positions_custom is not None:
-            ax.set_xticks(tick_positions_custom)
-            ax.set_xticklabels(tick_labels_custom, fontsize=15, rotation=30, ha='right',
-                               fontname=PLOT_FONT)
-        elif tag == 'gc':
+        if tag == 'gc':
             ax.set_xticks(np.arange(xlim[0], xlim[1] + 0.5, 2))
         for label in ax.get_xticklabels() + ax.get_yticklabels():
             label.set_fontname(PLOT_FONT)
@@ -3748,38 +3710,8 @@ def run_tags_from_dataframe(
                         combined = np.concatenate([values, cmp_values])
                         xlim, bin_edges = _smart_plot_limits(combined, n_bins=tag_bins)
 
-                # --- Hairpin-specific: equal-spaced stem-bp transform ---
-                tick_positions_custom = None
-                tick_labels_custom = None
                 plot_vals = values
                 plot_cmp = cmp_values
-                if tag == 'hairpin' and xlim_fixed is None:
-                    unique_raw = np.sort(
-                        np.unique(np.concatenate([values, cmp_values]))
-                        if len(cmp_values) > 0 else np.unique(values)
-                    )
-                    val_to_idx = {v: i for i, v in enumerate(unique_raw)}
-                    plot_vals = np.array([val_to_idx[v] for v in values], dtype=float)
-                    plot_cmp = (np.array([val_to_idx[v] for v in cmp_values], dtype=float)
-                                if len(cmp_values) > 0 else cmp_values)
-                    n_cat = len(unique_raw)
-                    bin_edges = np.arange(-0.5, n_cat, 1.0)
-                    xlim = (-0.5, n_cat - 0.5)
-                    tick_positions_custom = np.arange(n_cat, dtype=float)
-                    _log4 = np.log(4)
-                    nonzero = unique_raw[unique_raw > 0]
-                    if len(nonzero) > 0:
-                        min_nz = float(nonzero.min())
-                        labels = []
-                        for v in unique_raw:
-                            if v == 0:
-                                labels.append('<4bp')
-                            else:
-                                n = round(np.log(v / min_nz) / _log4) + 1 if v > min_nz * 0.5 else 1
-                                labels.append(f'{n + 3}bp')
-                        tick_labels_custom = labels
-                    else:
-                        tick_labels_custom = [f'{v:.2f}' for v in unique_raw]
 
                 color = colors[idx % len(colors)]
                 sns.set(style='darkgrid')
@@ -3803,18 +3735,11 @@ def run_tags_from_dataframe(
                 if ylim_fixed is not None:
                     ax.set_ylim(ylim_fixed)
                 ax.set_title('Distribution Plot', fontsize=22, fontname=PLOT_FONT, pad=20)
-                ax.set_xlabel(
-                    'Estimated stem length (bp)' if tick_positions_custom is not None else 'Values',
-                    fontsize=20, fontname=PLOT_FONT, labelpad=10,
-                )
+                ax.set_xlabel('Values', fontsize=20, fontname=PLOT_FONT, labelpad=10)
                 ax.set_ylabel('Percent (%)', fontsize=18, fontname=PLOT_FONT, labelpad=10)
                 ax.tick_params(axis='both', labelsize=18)
                 ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-                if tick_positions_custom is not None:
-                    ax.set_xticks(tick_positions_custom)
-                    ax.set_xticklabels(tick_labels_custom, fontsize=15, rotation=30, ha='right',
-                                       fontname=PLOT_FONT)
-                elif tag == 'gc':
+                if tag == 'gc':
                     ax.set_xticks(np.arange(xlim[0], xlim[1] + 0.5, 2))
                 for label in ax.get_xticklabels() + ax.get_yticklabels():
                     label.set_fontname(PLOT_FONT)
