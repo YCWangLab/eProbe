@@ -3559,18 +3559,30 @@ def run_tags_assessment(
     logger.info(f"Saved summary to {summary_path}")
     
     # Apply default plot preset ranges (user overrides take precedence)
+    # Default ylim: 0-40% for all tags
     default_xlim = {
-        "gc": (20.0, 80.0),
-        "tm": (65.0, 85.0),
-        "complexity": (0.0, 2.0),
+        "gc": (0.0, 100.0),
+        "tm": (0.0, 100.0),
+        "complexity": (0.0, 5.0),
+        "hairpin": (0.0, 20.0),
+        "dimer": (0.0, 1.0),
+    }
+    default_ylim = {
+        "gc": (0.0, 40.0),
+        "tm": (0.0, 40.0),
+        "complexity": (0.0, 40.0),
+        "hairpin": (0.0, 40.0),
+        "dimer": (0.0, 40.0),
     }
     default_bin_size = {
-        "gc": 1.0,
+        "gc": 2.0,
         "tm": 1.0,
         "complexity": 0.1,
+        "hairpin": 1.0,
+        "dimer": 0.01,
     }
     xlim_final = {**default_xlim, **(plot_xlim or {})}
-    ylim_final = plot_ylim or {}
+    ylim_final = {**default_ylim, **(plot_ylim or {})}
     bins_final = plot_bins or {}
     bin_size_final = {**default_bin_size, **(plot_bin_size or {})}
     

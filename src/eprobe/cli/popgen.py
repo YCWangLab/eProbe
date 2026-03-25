@@ -1326,8 +1326,9 @@ def build(
     "xlim",
     multiple=True,
     metavar="TAG:MIN,MAX",
-    help="[tags mode] Fix x-axis range for a tag (e.g. --xlim gc:0,1 --xlim tm:30,80). "
-         "Default: auto (P99-clipped). Repeatable per tag.",
+    help="[tags mode] Fix x-axis range for a tag (e.g. --xlim gc:0,100 --xlim tm:0,100). "
+         "Defaults: gc=0-100, tm=0-100, complexity=0-5, hairpin=0-20, dimer=0-1. "
+         "Repeatable per tag.",
 )
 @click.option(
     "--ylim",
@@ -1335,7 +1336,7 @@ def build(
     multiple=True,
     metavar="TAG:MIN,MAX",
     help="[tags mode] Fix y-axis (percent) range for a tag (e.g. --ylim gc:0,50). "
-         "Default: auto. Repeatable per tag.",
+         "Default: 0-40%% for all tags. Repeatable per tag.",
 )
 @click.option(
     "--bins",
