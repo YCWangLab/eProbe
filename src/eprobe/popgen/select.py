@@ -370,11 +370,11 @@ def _compute_biophysical_columns(
     complexity_vals = dict(zip(all_idxs, complexity_list))
     hairpin_vals = dict(zip(all_idxs, hairpin_list))
 
-    # Dimer: build index on all sequences, score each
-    dimer_calc = DimerCalculatorFast(k=7)
-    dimer_calc.build_index(all_seqs)
-    dimer_scores = dimer_calc.calculate_all_scores()
-    dimer_vals = {idx: score for idx, score in zip(all_idxs, dimer_scores)}
+    # Dimer: D(g) = (100/N) * Σc_i(g) using RC k-mer index (k=11)
+    from eprobe.popgen.assess import calculate_dimer_scores_legacy
+    seq_dict = {str(idx): seq for idx, seq in zip(all_idxs, all_seqs)}
+    dimer_legacy = calculate_dimer_scores_legacy(seq_dict, k=11)
+    dimer_vals = {idx: dimer_legacy[str(idx)] for idx in all_idxs}
 
     df = df.copy()
     df['gc'] = df.index.map(gc_vals)
