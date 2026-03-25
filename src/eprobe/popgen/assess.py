@@ -46,8 +46,8 @@ AVAILABLE_TAGS = {
     "gc": "GC content (%)",
     "tm": "Melting temperature (°C)",
     "complexity": "DUST complexity score",
-    "hairpin": "Self-complementarity score",
-    "dimer": "Inter-probe complementarity score (legacy formula: D(g)=(100/N)*Σc_i(g))",
+    "hairpin": "Hairpin MFE score (kcal/mol)",
+    "dimer": "Dimer risk score (k-mer sharing)",
     "entropy": "Shannon entropy",
 }
 
@@ -2509,12 +2509,14 @@ def run_sfs_assessment(
         if probe_plot_result.is_err():
             logger.warning(f"Probe SFS plot failed: {probe_plot_result.unwrap_err()}")
         
-        # Calculate SFS correlation (using 1D SFS)
-        sfs_correlations = {}
+        # Calculate SFS similarity using Total Variation Distance (TVD)
+        # TVD = 0.5 * Σ|p_i - q_i| on normalized segregating bins
+        # Range: 0 (identical) to 0.5 (maximally different)
+        sfs_tvd = {}
         for pop in pop_ids:
             full_1d = parse_dadi_1d_sfs(full_sfs_dir, pop)
             probe_1d = parse_dadi_1d_sfs(probe_sfs_dir, pop)
-            
+
             if full_1d.is_err():
                 logger.warning(f"Could not load full 1D SFS for {pop}: {full_1d.unwrap_err()}")
                 continue
@@ -2524,34 +2526,26 @@ def run_sfs_assessment(
 
             f_sfs = full_1d.unwrap()
             p_sfs = probe_1d.unwrap()
-            
-            # Normalize to proportions
-            f_total = np.sum(f_sfs)
-            p_total = np.sum(p_sfs)
+
+            # Use only segregating bins (exclude monomorphic bin 0, use folded range)
+            n = len(f_sfs) - 1  # projection size
+            f_seg = f_sfs[1:n // 2 + 1]
+            p_seg = p_sfs[1:n // 2 + 1]
+
+            f_total = np.sum(f_seg)
+            p_total = np.sum(p_seg)
             if f_total == 0 or p_total == 0:
-                logger.warning(f"SFS for {pop} is all zeros (full_sum={f_total}, probe_sum={p_total})")
-                continue
-            f_sfs = f_sfs / f_total
-            p_sfs = p_sfs / p_total
-            
-            # Ensure same length
-            min_len = min(len(f_sfs), len(p_sfs))
-            f_sfs = f_sfs[:min_len]
-            p_sfs = p_sfs[:min_len]
-            
-            # Exclude monomorphic bins (first=all ancestral, last=all derived)
-            if min_len > 2:
-                f_sfs = f_sfs[1:-1]
-                p_sfs = p_sfs[1:-1]
-            
-            if np.std(f_sfs) == 0 or np.std(p_sfs) == 0:
-                logger.warning(f"SFS for {pop} has zero variance after normalization")
+                logger.warning(f"SFS for {pop} has no segregating sites")
                 continue
 
-            corr, _ = stats.pearsonr(f_sfs, p_sfs)
-            sfs_correlations[pop] = corr
-        
-        avg_correlation = np.mean(list(sfs_correlations.values())) if sfs_correlations else np.nan
+            # Normalize to proportions
+            f_norm = f_seg / f_total
+            p_norm = p_seg / p_total
+
+            tvd = 0.5 * np.sum(np.abs(f_norm - p_norm))
+            sfs_tvd[pop] = tvd
+
+        avg_tvd = np.mean(list(sfs_tvd.values())) if sfs_tvd else np.nan
         
         # Copy dadi output files to output directory
         dadi_output = Path(str(output_prefix) + "_dadi")
@@ -2574,23 +2568,24 @@ def run_sfs_assessment(
         f.write(f"Full VCF sites: {n_sites_full:,}\n")
         f.write(f"Probe sites: {n_sites_probe:,}\n")
         f.write(f"Probe coverage: {n_sites_probe / n_sites_full * 100:.2f}%\n\n")
-        f.write("SFS Correlations per Population:\n")
+        f.write("SFS Total Variation Distance per Population:\n")
+        f.write("(0 = identical, 0.5 = maximally different)\n")
         f.write("-" * 30 + "\n")
-        for pop, corr in sfs_correlations.items():
-            f.write(f"  {pop}: {corr:.4f}\n")
-        f.write(f"\nAverage correlation: {avg_correlation:.4f}\n\n")
+        for pop, tvd in sfs_tvd.items():
+            f.write(f"  {pop}: {tvd:.4f}\n")
+        f.write(f"\nAverage TVD: {avg_tvd:.4f}\n\n")
         f.write("Interpretation:\n")
         f.write("-" * 30 + "\n")
-        if np.isnan(avg_correlation):
-            f.write("Unable to calculate correlation.\n")
-        elif avg_correlation > 0.95:
-            f.write("Excellent: SFS highly similar across populations.\n")
-        elif avg_correlation > 0.85:
+        if np.isnan(avg_tvd):
+            f.write("Unable to calculate TVD.\n")
+        elif avg_tvd < 0.05:
+            f.write("Excellent: SFS nearly identical, minimal ascertainment bias.\n")
+        elif avg_tvd < 0.15:
             f.write("Good: SFS similar, probe set captures most signal.\n")
-        elif avg_correlation > 0.7:
-            f.write("Moderate: Some deviation, consider more probes.\n")
+        elif avg_tvd < 0.30:
+            f.write("Moderate: Noticeable SFS shift, some ascertainment bias.\n")
         else:
-            f.write("Low: SFS differs substantially.\n")
+            f.write("High: SFS differs substantially, significant ascertainment bias.\n")
     
     logger.info(f"Saved summary to {summary_path}")
     
@@ -2601,8 +2596,8 @@ def run_sfs_assessment(
         "n_sites_full": n_sites_full,
         "n_sites_probe": n_sites_probe,
         "coverage_percent": n_sites_probe / n_sites_full * 100,
-        "sfs_correlations": sfs_correlations,
-        "avg_correlation": float(avg_correlation) if not np.isnan(avg_correlation) else None,
+        "sfs_tvd": sfs_tvd,
+        "avg_tvd": float(avg_tvd) if not np.isnan(avg_tvd) else None,
         "full_plot": str(full_plot_path) if full_plot_result.is_ok() else None,
         "probe_plot": str(probe_plot_path) if probe_plot_result.is_ok() else None,
         "dadi_output": str(dadi_output),

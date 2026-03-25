@@ -1589,18 +1589,18 @@ def assess(
             echo_info(f"    ├─ Full VCF sites: {sfs_stats.get('n_sites_full', 'N/A'):,}")
             echo_info(f"    ├─ Probe sites: {sfs_stats.get('n_sites_probe', 'N/A'):,}")
 
-            # Per-population correlations
-            corrs = sfs_stats.get("sfs_correlations", {})
-            if corrs:
-                echo_info(f"    ├─ SFS correlations:")
-                for pop, corr in corrs.items():
-                    echo_info(f"    │     {pop}: {corr:.4f}")
+            # Per-population TVD
+            tvds = sfs_stats.get("sfs_tvd", {})
+            if tvds:
+                echo_info(f"    ├─ SFS Total Variation Distance (0=identical, 0.5=max):")
+                for pop, tvd in tvds.items():
+                    echo_info(f"    │     {pop}: {tvd:.4f}")
 
-            avg_corr = sfs_stats.get("avg_correlation")
-            if avg_corr is not None:
-                echo_info(f"    └─ Average correlation: {avg_corr:.4f}")
+            avg_tvd = sfs_stats.get("avg_tvd")
+            if avg_tvd is not None:
+                echo_info(f"    └─ Average TVD: {avg_tvd:.4f}")
             else:
-                echo_info(f"    └─ Average correlation: N/A")
+                echo_info(f"    └─ Average TVD: N/A")
     
     if "pca" in stats:
         pca_stats = stats["pca"]
