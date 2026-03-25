@@ -231,33 +231,52 @@ def _generate_tag_plots(results, tags, output_prefix):
     except ImportError:
         logger.warning("matplotlib/seaborn not available, skipping plots")
         return []
-    
+
     colors = ['#83639F', '#EA7827', '#C22f2F', '#449945', '#1F70A9']
     plot_paths = []
-    
+
     for idx, tag in enumerate(tags):
         values = [r[tag] for r in results if r.get(tag) is not None]
         if not values:
             continue
-        
+
         color = colors[idx % len(colors)]
         sns.set(style='darkgrid')
         fig, ax = plt.subplots(figsize=(8, 6))
-        
-        sns.histplot(values, alpha=0.7, stat='percent', edgecolor=color,
-                     color=color, element='step', line_kws={'linewidth': 2}, ax=ax)
-        
+
+        # Tag-specific histogram settings
+        hist_kwargs = {
+            'alpha': 0.7,
+            'stat': 'percent',
+            'edgecolor': color,
+            'color': color,
+            'element': 'step',
+            'line_kws': {'linewidth': 2},
+            'ax': ax,
+        }
+
+        # hairpin: use binwidth=1 for integer-like scores
+        if tag == 'hairpin':
+            hist_kwargs['binwidth'] = 1
+
+        sns.histplot(values, **hist_kwargs)
+
         ax.set_title(f'{tag.upper()} Distribution', fontsize=18)
         ax.set_xlabel(tag, fontsize=14)
         ax.set_ylabel('Percent (%)', fontsize=14)
-        
+
+        # GC: set x-axis ticks at 0, 20, 40, 60, 80, 100
+        if tag == 'gc':
+            ax.set_xticks([0, 20, 40, 60, 80, 100])
+            ax.set_xlim(0, 100)
+
         plt.tight_layout()
         plot_path = Path(str(output_prefix) + f".{tag}_dist.jpg")
         fig.savefig(plot_path, dpi=300)
         plt.close(fig)
-        
+
         plot_paths.append(str(plot_path))
-    
+
     return plot_paths
 
 

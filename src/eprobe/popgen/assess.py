@@ -3053,7 +3053,7 @@ def generate_assessment_plots(
         ax.tick_params(axis='both', labelsize=18)
         ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
         if tag == 'gc':
-            ax.set_xticks(np.arange(xlim[0], xlim[1] + 0.5, 2))
+            ax.set_xticks([0, 20, 40, 60, 80, 100])
         for label in ax.get_xticklabels() + ax.get_yticklabels():
             label.set_fontname(PLOT_FONT)
 
@@ -3752,7 +3752,7 @@ def run_tags_from_dataframe(
                 ax.tick_params(axis='both', labelsize=18)
                 ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
                 if tag == 'gc':
-                    ax.set_xticks(np.arange(xlim[0], xlim[1] + 0.5, 2))
+                    ax.set_xticks([0, 20, 40, 60, 80, 100])
                 for label in ax.get_xticklabels() + ax.get_yticklabels():
                     label.set_fontname(PLOT_FONT)
 
