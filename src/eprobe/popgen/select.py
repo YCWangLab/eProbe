@@ -300,9 +300,9 @@ def _log_biophysical_comparison(
         logger.info(f"  SNPs: {n_input:,} (input) → {n_selected:,} (selected)")
     logger.info("=" * 78)
     header = (f"  {'Metric':<14} {'Input Mean':>12} {'Input Std':>12} "
-              f"{'Sel Mean':>12} {'Sel Std':>12} {'Δ Mean':>10}")
+              f"{'Sel Mean':>12} {'Sel Std':>12} {'Δ Mean':>10} {'Δ Std':>10}")
     logger.info(header)
-    logger.info("-" * 78)
+    logger.info("-" * 88)
     for col in available:
         label = _BIOPHYSICAL_LABELS.get(col, col)
         in_s = input_df[col].dropna()
@@ -311,11 +311,13 @@ def _log_biophysical_comparison(
         in_std = float(in_s.std()) if len(in_s) > 1 else 0.0
         sel_mean = float(sel_s.mean()) if len(sel_s) > 0 else 0.0
         sel_std = float(sel_s.std()) if len(sel_s) > 1 else 0.0
-        d = sel_mean - in_mean
-        sign = '+' if d >= 0 else ''
+        d_mean = sel_mean - in_mean
+        d_std = sel_std - in_std
+        dm_str = f"{d_mean:+.3f}"
+        ds_str = f"{d_std:+.3f}"
         logger.info(f"  {label:<14} {in_mean:>12.3f} {in_std:>12.3f} "
-                    f"{sel_mean:>12.3f} {sel_std:>12.3f} {sign}{d:>9.3f}")
-    logger.info("=" * 78)
+                    f"{sel_mean:>12.3f} {sel_std:>12.3f} {dm_str:>10} {ds_str:>10}")
+    logger.info("=" * 88)
     logger.info("")
 
 
@@ -341,6 +343,7 @@ def _build_biophysical_comparison(
             'sel_mean': sel_mean,
             'sel_std': sel_std,
             'delta_mean': sel_mean - in_mean,
+            'delta_std': sel_std - in_std,
         })
     return comparison
 
@@ -462,13 +465,13 @@ def _write_biophysical_summary(
                 in_s = input_df[col].dropna()
                 sel_s = selected_df[col].dropna()
                 d_mean = float(sel_s.mean()) - float(in_s.mean())
-                sign = '+' if d_mean >= 0 else ''
+                d_std = float(sel_s.std()) - float(in_s.std())
                 f.write(f"{label}:\n")
                 f.write(f"  Input:    Mean={float(in_s.mean()):.3f}  Std={float(in_s.std()):.3f}  "
                         f"Median={float(in_s.median()):.3f}  Min={float(in_s.min()):.3f}  Max={float(in_s.max()):.3f}\n")
                 f.write(f"  Selected: Mean={float(sel_s.mean()):.3f}  Std={float(sel_s.std()):.3f}  "
                         f"Median={float(sel_s.median()):.3f}  Min={float(sel_s.min()):.3f}  Max={float(sel_s.max()):.3f}\n")
-                f.write(f"  \u0394 Mean:   {sign}{d_mean:.3f}\n\n")
+                f.write(f"  Δ Mean: {d_mean:+.3f}    Δ Std: {d_std:+.3f}\n\n")
 
     logger.info(f"Selection summary saved to {summary_path}")
     return summary_path
