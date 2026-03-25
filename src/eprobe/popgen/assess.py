@@ -1005,9 +1005,15 @@ def generate_pca_comparison_plot(
             pca_df['Population'] = pca_df['ID'].map(pop_dict)
             populations = pca_df['Population'].dropna().unique()
             
-            # Color map
+            # Color map — use eProbe palette first, then fall back to tab10
+            _eprobe_colors = ['#83639F', '#EA7827', '#C22F2F', '#449945', '#1F70A9']
             cmap = plt.get_cmap('tab10')
-            colors = {pop: cmap(i % 10) for i, pop in enumerate(sorted(populations))}
+            colors = {}
+            for i, pop in enumerate(sorted(populations)):
+                if i < len(_eprobe_colors):
+                    colors[pop] = _eprobe_colors[i]
+                else:
+                    colors[pop] = cmap(i % 10)
             
             for pop in sorted(populations):
                 subset = pca_df[pca_df['Population'] == pop]
