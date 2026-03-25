@@ -2780,58 +2780,6 @@ def run_filter(
         filtered_df = SNPDataFrame.from_snps(snps)
 
         # Add biophysical columns if biophysical filter was applied
-        if "biophysical" in filters_normalized:
-            logger.info(f"Computing biophysical columns for output... (threads={threads})")
-            from eprobe.biophysics.biophysics import (
-                DimerCalculatorFast,
-                compute_biophysical_parallel,
-            )
-
-            _snp_ids = [snp.id for snp in snps]
-            _seqs = [probe_sequences.get(sid, "") for sid in _snp_ids]
-
-            # Filter valid sequences for parallel computation
-            _valid_mask = [len(seq) > 1 for seq in _seqs]
-            _valid_seqs = [seq for seq, v in zip(_seqs, _valid_mask) if v]
-
-            if _valid_seqs:
-                _gc_v, _tm_v, _cplx_v, _hp_v = compute_biophysical_parallel(
-                    _valid_seqs, threads=threads,
-                )
-                # Map back to full list (None for invalid sequences)
-                _gc, _tm, _complexity, _hairpin = [], [], [], []
-                vi = 0
-                for v in _valid_mask:
-                    if v:
-                        _gc.append(round(_gc_v[vi], 4))
-                        _tm.append(round(_tm_v[vi], 2))
-                        _complexity.append(round(_cplx_v[vi], 4))
-                        _hairpin.append(round(_hp_v[vi], 2))
-                        vi += 1
-                    else:
-                        _gc.append(None)
-                        _tm.append(None)
-                        _complexity.append(None)
-                        _hairpin.append(None)
-            else:
-                _gc = [None] * len(_seqs)
-                _tm = [None] * len(_seqs)
-                _complexity = [None] * len(_seqs)
-                _hairpin = [None] * len(_seqs)
-
-            filtered_df.df["gc"] = _gc
-            filtered_df.df["tm"] = _tm
-            filtered_df.df["complexity"] = _complexity
-            filtered_df.df["hairpin"] = _hairpin
-
-            # Dimer: k-mer frequency score against the full set
-            dimer_calc = DimerCalculatorFast(k=11)
-            dimer_calc.build_index(_seqs)
-            _dimer = [round(dimer_calc.calculate_score(seq), 4) if len(seq) > 1 else None for seq in _seqs]
-            filtered_df.df["dimer"] = _dimer
-
-            logger.info("Biophysical columns added to output")
-
         save_result = filtered_df.to_tsv(output_path)
         if save_result.is_err():
             return Err(f"Failed to save output: {save_result.unwrap_err()}")
