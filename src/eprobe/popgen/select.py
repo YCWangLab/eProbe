@@ -31,6 +31,7 @@ from eprobe.biophysics.biophysics import (
     calculate_dust_fast,
     calculate_hairpin_fast,
     DimerCalculatorFast,
+    compute_biophysical_parallel,
 )
 
 logger = logging.getLogger(__name__)
@@ -311,13 +312,15 @@ def _compute_biophysical_columns(
     df: pd.DataFrame,
     reference_path: Path,
     probe_length: int = 81,
+    threads: int = 1,
 ) -> pd.DataFrame:
     """Compute gc, tm, complexity, hairpin, dimer columns from reference genome.
 
     Generates probe sequences (flanking around each SNP) and calculates
     biophysical metrics, adding them as new columns to *df* (in-place copy).
+    Uses multiprocessing when threads > 1.
     """
-    logger.info(f"Computing biophysical columns from reference (probe_length={probe_length})")
+    logger.info(f"Computing biophysical columns from reference (probe_length={probe_length}, threads={threads})")
     ref_result = read_fasta(reference_path)
     if ref_result.is_err():
         raise RuntimeError(f"Failed to read reference: {ref_result.unwrap_err()}")
@@ -354,24 +357,23 @@ def _compute_biophysical_columns(
 
     logger.info(f"Generated {len(sequences)} probe sequences")
 
-    # Compute metrics
-    gc_vals = {}
-    tm_vals = {}
-    complexity_vals = {}
-    hairpin_vals = {}
+    # Compute metrics in parallel
+    all_idxs = list(sequences.keys())
+    all_seqs = list(sequences.values())
 
-    for idx, seq in sequences.items():
-        gc_vals[idx] = calculate_gc_fast(seq)
-        tm_vals[idx] = calculate_tm_fast(seq)
-        complexity_vals[idx] = calculate_dust_fast(seq)
-        hairpin_vals[idx] = calculate_hairpin_fast(seq)
+    gc_list, tm_list, complexity_list, hairpin_list = compute_biophysical_parallel(
+        all_seqs, threads=threads
+    )
+
+    gc_vals = dict(zip(all_idxs, gc_list))
+    tm_vals = dict(zip(all_idxs, tm_list))
+    complexity_vals = dict(zip(all_idxs, complexity_list))
+    hairpin_vals = dict(zip(all_idxs, hairpin_list))
 
     # Dimer: build index on all sequences, score each
-    all_seqs = list(sequences.values())
-    all_idxs = list(sequences.keys())
     dimer_calc = DimerCalculatorFast(k=7)
     dimer_calc.build_index(all_seqs)
-    dimer_scores = dimer_calc.score_all(all_seqs)
+    dimer_scores = dimer_calc.calculate_all_scores()
     dimer_vals = {idx: score for idx, score in zip(all_idxs, dimer_scores)}
 
     df = df.copy()
@@ -1099,7 +1101,7 @@ def run_select(
                     f"Weighted selection requires biophysical columns {missing_cols}. "
                     f"Provide --reference to compute them automatically."
                 )
-            raw_df = _compute_biophysical_columns(raw_df, reference_path, probe_length)
+            raw_df = _compute_biophysical_columns(raw_df, reference_path, probe_length, threads=threads)
 
     # Filter by chromosomes if specified
     if chromosomes:

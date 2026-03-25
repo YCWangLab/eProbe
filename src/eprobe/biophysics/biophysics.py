@@ -474,6 +474,77 @@ def calculate_dimer_batch_fast(
 
 
 # =============================================================================
+# Parallel Biophysical Computation
+# =============================================================================
+
+def _compute_chunk(args):
+    """Worker function for parallel biophysical computation.
+
+    Computes gc, tm, complexity, hairpin for a chunk of sequences.
+    Must be a module-level function for pickling by ProcessPoolExecutor.
+    """
+    sequences, na_conc, nn_table = args
+    results = []
+    for seq in sequences:
+        gc = calculate_gc_fast(seq)
+        tm = calculate_tm_fast(seq, na_conc=na_conc, nn_table=nn_table)
+        complexity = calculate_dust_fast(seq)
+        hairpin = calculate_hairpin_fast(seq)
+        results.append((gc, tm, complexity, hairpin))
+    return results
+
+
+def compute_biophysical_parallel(
+    sequences: List[str],
+    threads: int = 1,
+    na_conc: float = 50.0,
+    nn_table: str = "R_DNA_NN1",
+) -> Tuple[List[float], List[float], List[float], List[float]]:
+    """Compute gc, tm, complexity, hairpin for sequences using multiprocessing.
+
+    Args:
+        sequences: List of DNA probe sequences.
+        threads: Number of worker processes (1 = serial).
+        na_conc: Na+ concentration in mM for Tm calculation.
+        nn_table: NN parameter table for Tm calculation.
+
+    Returns:
+        Tuple of (gc_list, tm_list, complexity_list, hairpin_list).
+    """
+    if not sequences:
+        return [], [], [], []
+
+    if threads <= 1 or len(sequences) < 100:
+        result = _compute_chunk((sequences, na_conc, nn_table))
+        gc = [r[0] for r in result]
+        tm = [r[1] for r in result]
+        complexity = [r[2] for r in result]
+        hairpin = [r[3] for r in result]
+        return gc, tm, complexity, hairpin
+
+    from concurrent.futures import ProcessPoolExecutor
+
+    # Split into chunks
+    n = len(sequences)
+    chunk_size = max(1, n // threads)
+    chunks = []
+    for i in range(0, n, chunk_size):
+        chunks.append((sequences[i:i + chunk_size], na_conc, nn_table))
+
+    gc_all, tm_all, complexity_all, hairpin_all = [], [], [], []
+
+    with ProcessPoolExecutor(max_workers=min(threads, len(chunks))) as executor:
+        for chunk_result in executor.map(_compute_chunk, chunks):
+            for r in chunk_result:
+                gc_all.append(r[0])
+                tm_all.append(r[1])
+                complexity_all.append(r[2])
+                hairpin_all.append(r[3])
+
+    return gc_all, tm_all, complexity_all, hairpin_all
+
+
+# =============================================================================
 # Smart Dimer Filter - Graph-Based Deduplication
 # =============================================================================
 

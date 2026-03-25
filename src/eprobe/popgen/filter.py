@@ -1141,45 +1141,43 @@ def filter_biophysical(
         sequences = [snp.ref for snp in snps]
     
     # =========================================================================
-    # Stage 1: Fast filters (GC, Tm, DUST) - O(n) per sequence
+    # Stage 1: Fast filters (GC, Tm, DUST) - parallel computation then filter
     # =========================================================================
-    logger.info("Stage 1: Computing GC, Tm, DUST...")
-    
+    logger.info(f"Stage 1: Computing GC, Tm, DUST... (threads={threads})")
+
+    from eprobe.biophysics.biophysics import compute_biophysical_parallel
+
+    gc_all, tm_all, dust_all, hairpin_all = compute_biophysical_parallel(
+        sequences, threads=threads,
+        na_conc=thresholds.na_conc, nn_table=thresholds.nn_table,
+    )
+
     passed_stage1 = []
     passed_stage1_seqs = []
+    passed_stage1_hairpin = []  # reuse hairpin from parallel computation
     gc_scores = []
     tm_scores = []
     dust_scores = []
-    
-    for snp, seq in zip(snps, sequences):
-        try:
-            # GC check
-            gc = calculate_gc_fast(seq)
-            gc_scores.append(gc)
-            if not skip_gc and not (thresholds.gc_min <= gc <= thresholds.gc_max):
-                filter_stats["gc_failed"] += 1
-                continue
-            
-            # Tm check (using user-selected NN table)
-            tm = calculate_tm_fast(seq, na_conc=thresholds.na_conc, nn_table=thresholds.nn_table)
-            tm_scores.append(tm)
-            if not skip_tm and not (thresholds.tm_min <= tm <= thresholds.tm_max):
-                filter_stats["tm_failed"] += 1
-                continue
-            
-            # DUST complexity check
-            dust = calculate_dust_fast(seq)
-            dust_scores.append(dust)
-            if not skip_dust and dust > thresholds.complexity_max:
-                filter_stats["complexity_failed"] += 1
-                continue
-            
-            passed_stage1.append(snp)
-            passed_stage1_seqs.append(seq)
-            
-        except Exception as e:
-            logger.warning(f"Error processing SNP {snp.id}: {e}")
+
+    for snp, seq, gc, tm, dust, hp in zip(snps, sequences, gc_all, tm_all, dust_all, hairpin_all):
+        gc_scores.append(gc)
+        if not skip_gc and not (thresholds.gc_min <= gc <= thresholds.gc_max):
+            filter_stats["gc_failed"] += 1
             continue
+
+        tm_scores.append(tm)
+        if not skip_tm and not (thresholds.tm_min <= tm <= thresholds.tm_max):
+            filter_stats["tm_failed"] += 1
+            continue
+
+        dust_scores.append(dust)
+        if not skip_dust and dust > thresholds.complexity_max:
+            filter_stats["complexity_failed"] += 1
+            continue
+
+        passed_stage1.append(snp)
+        passed_stage1_seqs.append(seq)
+        passed_stage1_hairpin.append(hp)
     
     # Stage 1 statistics
     def _calc_stats(scores):
@@ -1212,10 +1210,9 @@ def filter_biophysical(
     use_hairpin = thresholds.hairpin > 0
     
     if use_hairpin:
-        logger.info("Stage 2: Computing hairpin scores...")
-        
-        hairpin_scores = [calculate_hairpin_fast(seq) 
-                         for seq in passed_stage1_seqs]
+        logger.info("Stage 2: Filtering by hairpin scores (pre-computed)...")
+
+        hairpin_scores = passed_stage1_hairpin
         
         # Resolve threshold via dual-mode interpretation
         hairpin_threshold = _resolve_threshold(thresholds.hairpin, hairpin_scores)
@@ -2784,30 +2781,43 @@ def run_filter(
 
         # Add biophysical columns if biophysical filter was applied
         if "biophysical" in filters_normalized:
-            logger.info("Computing biophysical columns for output...")
+            logger.info(f"Computing biophysical columns for output... (threads={threads})")
             from eprobe.biophysics.biophysics import (
-                calculate_gc_fast,
-                calculate_tm_fast,
-                calculate_dust_fast,
-                calculate_hairpin_fast,
                 DimerCalculatorFast,
+                compute_biophysical_parallel,
             )
 
-            _gc, _tm, _complexity, _hairpin = [], [], [], []
             _snp_ids = [snp.id for snp in snps]
             _seqs = [probe_sequences.get(sid, "") for sid in _snp_ids]
 
-            for seq in _seqs:
-                if len(seq) > 1:
-                    _gc.append(round(calculate_gc_fast(seq), 4))
-                    _tm.append(round(calculate_tm_fast(seq), 2))
-                    _complexity.append(round(calculate_dust_fast(seq), 4))
-                    _hairpin.append(round(calculate_hairpin_fast(seq), 2))
-                else:
-                    _gc.append(None)
-                    _tm.append(None)
-                    _complexity.append(None)
-                    _hairpin.append(None)
+            # Filter valid sequences for parallel computation
+            _valid_mask = [len(seq) > 1 for seq in _seqs]
+            _valid_seqs = [seq for seq, v in zip(_seqs, _valid_mask) if v]
+
+            if _valid_seqs:
+                _gc_v, _tm_v, _cplx_v, _hp_v = compute_biophysical_parallel(
+                    _valid_seqs, threads=threads,
+                )
+                # Map back to full list (None for invalid sequences)
+                _gc, _tm, _complexity, _hairpin = [], [], [], []
+                vi = 0
+                for v in _valid_mask:
+                    if v:
+                        _gc.append(round(_gc_v[vi], 4))
+                        _tm.append(round(_tm_v[vi], 2))
+                        _complexity.append(round(_cplx_v[vi], 4))
+                        _hairpin.append(round(_hp_v[vi], 2))
+                        vi += 1
+                    else:
+                        _gc.append(None)
+                        _tm.append(None)
+                        _complexity.append(None)
+                        _hairpin.append(None)
+            else:
+                _gc = [None] * len(_seqs)
+                _tm = [None] * len(_seqs)
+                _complexity = [None] * len(_seqs)
+                _hairpin = [None] * len(_seqs)
 
             filtered_df.df["gc"] = _gc
             filtered_df.df["tm"] = _tm
@@ -2817,7 +2827,7 @@ def run_filter(
             # Dimer: k-mer frequency score against the full set
             dimer_calc = DimerCalculatorFast(k=11)
             dimer_calc.build_index(_seqs)
-            _dimer = [round(dimer_calc.score(seq), 4) if len(seq) > 1 else None for seq in _seqs]
+            _dimer = [round(dimer_calc.calculate_score(seq), 4) if len(seq) > 1 else None for seq in _seqs]
             filtered_df.df["dimer"] = _dimer
 
             logger.info("Biophysical columns added to output")

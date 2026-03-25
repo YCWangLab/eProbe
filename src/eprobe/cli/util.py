@@ -962,6 +962,11 @@ def rename(
     default=False,
     help="Skip generating distribution plots (tags mode).",
 )
+@click.option(
+    "-t", "--threads",
+    type=int, default=1,
+    help="Number of threads for parallel biophysical computation (default: 1).",
+)
 @click.pass_context
 def assess(
     ctx: click.Context,
@@ -977,6 +982,7 @@ def assess(
     hairpin: float,
     dimer: float,
     no_plots: bool,
+    threads: int,
 ) -> None:
     """
     Biophysical assessment or filtering of probes.
@@ -1032,6 +1038,7 @@ def assess(
         hairpin=hairpin,
         dimer=dimer,
         generate_plots=not no_plots,
+        threads=threads,
         verbose=verbose,
     )
     

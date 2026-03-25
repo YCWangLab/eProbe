@@ -34,6 +34,7 @@ from eprobe.biophysics.biophysics import (
     calculate_dust_fast,
     calculate_hairpin_fast,
     DimerCalculatorFast,
+    compute_biophysical_parallel,
 )
 from eprobe.biophysics.entropy import calculate_entropy
 
@@ -105,36 +106,57 @@ def assess_single_probe(
 def assess_probes(
     sequences: Dict[str, str],
     tags: List[str],
+    threads: int = 1,
 ) -> List[AssessmentResult]:
     """
     Assess all probes for specified metrics.
-    
-    Note: Dimer scores require pool-level information, so they are calculated
-    separately using all sequences before per-probe assessment.
-    
+
+    Uses multiprocessing for gc, tm, complexity, hairpin when threads > 1.
+    Dimer scores require pool-level information and are calculated separately.
+
     Args:
         sequences: Dictionary of probe_id -> sequence
         tags: List of metrics to calculate
-        
+        threads: Number of worker processes
+
     Returns:
         List of AssessmentResult objects
     """
-    results = []
-    
+    probe_ids = list(sequences.keys())
+    seq_list = list(sequences.values())
+
+    # Parallel computation for gc, tm, complexity, hairpin
+    need_parallel = any(t in tags for t in ("gc", "tm", "complexity", "hairpin"))
+    gc_vals, tm_vals, cplx_vals, hp_vals = [], [], [], []
+    if need_parallel and seq_list:
+        gc_vals, tm_vals, cplx_vals, hp_vals = compute_biophysical_parallel(
+            seq_list, threads=threads,
+        )
+
     # Pre-calculate dimer scores (pool-level calculation)
     dimer_scores = {}
     if "dimer" in tags:
         dimer_scores = calculate_dimer_scores_legacy(sequences)
-    
-    for probe_id, sequence in sequences.items():
-        result = assess_single_probe(probe_id, sequence, tags)
-        
-        # Add pre-calculated dimer score if requested
+
+    results = []
+    for i, (probe_id, sequence) in enumerate(zip(probe_ids, seq_list)):
+        result = AssessmentResult(probe_id=probe_id, sequence=sequence)
+
+        if "gc" in tags and gc_vals:
+            result.gc = gc_vals[i]
+        if "tm" in tags and tm_vals:
+            result.tm = tm_vals[i]
+        if "complexity" in tags and cplx_vals:
+            result.complexity = cplx_vals[i]
+        if "hairpin" in tags and hp_vals:
+            result.hairpin = hp_vals[i]
+        if "entropy" in tags:
+            result.entropy = calculate_entropy(sequence)
         if "dimer" in tags:
             result.dimer = dimer_scores.get(probe_id, 0.0)
-        
+
         results.append(result)
-    
+
     return results
 
 
@@ -3289,6 +3311,7 @@ def run_assess(
                 plot_ylim=plot_ylim,
                 plot_bins=plot_bins,
                 probe_length=probe_length,
+                threads=threads,
                 verbose=verbose,
             )
 
@@ -3317,6 +3340,7 @@ def run_tags_assessment(
     plot_bins: Optional[Dict[str, int]] = None,
     plot_bin_size: Optional[Dict[str, float]] = None,
     probe_length: int = 81,
+    threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -3509,7 +3533,7 @@ def run_tags_assessment(
     # Calculate individual probe metrics
     logger.info("Calculating probe metrics...")
     tags_without_dimer = [t for t in tags if t != "dimer"]
-    results = assess_probes(sequences, tags_without_dimer)
+    results = assess_probes(sequences, tags_without_dimer, threads=threads)
     
     # Calculate dimer scores separately (legacy formula: D(g) = (100/N)*Σc_i(g))
     if "dimer" in tags:

@@ -47,6 +47,7 @@ from eprobe.biophysics.biophysics import (
     calculate_hairpin_batch_fast,
     DimerCalculatorFast,
     calculate_dimer_batch_fast,
+    compute_biophysical_parallel,
     calculate_all_stats_fast,
     calculate_percentile_threshold,
     BiophysicalStats,
@@ -96,6 +97,8 @@ __all__ = [
     "calculate_thermo_enthalpy",
     "calculate_gibbs_energy",
     "NNTable",
+    # Parallel computation
+    "compute_biophysical_parallel",
     # Unified fast calculation
     "calculate_all_stats_fast",
     "calculate_percentile_threshold",

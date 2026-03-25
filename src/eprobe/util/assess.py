@@ -24,6 +24,7 @@ from eprobe.biophysics.biophysics import (
     calculate_hairpin_fast,
     DimerCalculatorFast,
     calculate_percentile_threshold,
+    compute_biophysical_parallel,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,21 +69,30 @@ class FilterThresholds:
 def assess_fasta(
     sequences: Dict[str, str],
     tags: List[str],
+    threads: int = 1,
 ) -> List[Dict[str, Any]]:
     """
     Calculate biophysical tags for all sequences.
-    
+
     Args:
         sequences: {probe_id: sequence}
         tags: List of tags to compute
-        
+        threads: Number of worker processes for parallel computation
+
     Returns:
         List of dicts with probe_id and tag values
     """
-    results = []
     seq_ids = list(sequences.keys())
-    seq_list = list(sequences.values())
-    
+    seq_list = [seq.upper() for seq in sequences.values()]
+
+    # Parallel computation for gc, tm, complexity, hairpin
+    need_parallel = any(t in tags for t in ("gc", "tm", "complexity", "hairpin"))
+    gc_vals, tm_vals, cplx_vals, hp_vals = [], [], [], []
+    if need_parallel:
+        gc_vals, tm_vals, cplx_vals, hp_vals = compute_biophysical_parallel(
+            seq_list, threads=threads,
+        )
+
     # Pre-compute dimer scores if needed (requires pool-level index)
     dimer_scores: Dict[str, float] = {}
     if "dimer" in tags and len(seq_list) > 1:
@@ -90,101 +100,84 @@ def assess_fasta(
         calc.build_index(seq_list)
         scores = calc.calculate_all_scores()
         dimer_scores = dict(zip(seq_ids, scores))
-    
-    for sid, seq in sequences.items():
+
+    results = []
+    for i, (sid, seq) in enumerate(zip(seq_ids, seq_list)):
         row: Dict[str, Any] = {"probe_id": sid, "length": len(seq)}
-        seq_upper = seq.upper()
-        
+
         if "gc" in tags:
-            try:
-                row["gc"] = round(calculate_gc_fast(seq_upper), 2)
-            except Exception:
-                row["gc"] = None
-        
+            row["gc"] = round(gc_vals[i], 2) if gc_vals else None
         if "tm" in tags:
-            try:
-                row["tm"] = round(calculate_tm_fast(seq_upper), 2)
-            except Exception:
-                row["tm"] = None
-        
+            row["tm"] = round(tm_vals[i], 2) if tm_vals else None
         if "complexity" in tags:
-            try:
-                row["complexity"] = round(calculate_dust_fast(seq_upper), 4)
-            except Exception:
-                row["complexity"] = None
-        
+            row["complexity"] = round(cplx_vals[i], 4) if cplx_vals else None
         if "hairpin" in tags:
-            try:
-                row["hairpin"] = round(calculate_hairpin_fast(seq_upper), 2)
-            except Exception:
-                row["hairpin"] = None
-        
+            row["hairpin"] = round(hp_vals[i], 2) if hp_vals else None
         if "dimer" in tags:
             row["dimer"] = round(dimer_scores.get(sid, 0.0), 4)
-        
+
         results.append(row)
-    
+
     return results
 
 
 def filter_fasta(
     sequences: Dict[str, str],
     thresholds: FilterThresholds,
+    threads: int = 1,
 ) -> tuple:
     """
     Filter probes by biophysical thresholds.
-    
+
     3-stage filtering:
       Stage 1: GC, Tm, DUST (absolute thresholds)
       Stage 2: Hairpin (percentile-based)
       Stage 3: Dimer (percentile-based)
-    
+
     Returns:
         (passed_dict, failed_dict, filter_stats)
     """
     from collections import OrderedDict
-    
+
     passed: Dict[str, str] = OrderedDict()
     failed: Dict[str, str] = OrderedDict()
     stats = {
         "gc_failed": 0, "tm_failed": 0, "complexity_failed": 0,
         "hairpin_failed": 0, "dimer_failed": 0,
     }
-    
+
+    # Parallel computation of all 4 metrics for all sequences
+    seq_ids = list(sequences.keys())
+    seq_list = [seq.upper() for seq in sequences.values()]
+    gc_all, tm_all, dust_all, hp_all = compute_biophysical_parallel(
+        seq_list, threads=threads,
+    )
+
     # Stage 1: GC, Tm, DUST
     stage1_passed: Dict[str, str] = OrderedDict()
-    for sid, seq in sequences.items():
-        seq_upper = seq.upper()
-        try:
-            gc = calculate_gc_fast(seq_upper)
-            if not (thresholds.gc_min <= gc <= thresholds.gc_max):
-                stats["gc_failed"] += 1
-                failed[sid] = seq
-                continue
-            
-            tm = calculate_tm_fast(seq_upper)
-            if not (thresholds.tm_min <= tm <= thresholds.tm_max):
-                stats["tm_failed"] += 1
-                failed[sid] = seq
-                continue
-            
-            dust = calculate_dust_fast(seq_upper)
-            if dust > thresholds.complexity_max:
-                stats["complexity_failed"] += 1
-                failed[sid] = seq
-                continue
-            
-            stage1_passed[sid] = seq
-        except Exception:
+    stage1_hairpin: Dict[str, float] = {}  # reuse hairpin from parallel computation
+    for sid, seq, gc, tm, dust, hp in zip(seq_ids, list(sequences.values()), gc_all, tm_all, dust_all, hp_all):
+        if not (thresholds.gc_min <= gc <= thresholds.gc_max):
+            stats["gc_failed"] += 1
             failed[sid] = seq
             continue
-    
-    # Stage 2: Hairpin (dual-mode)
+
+        if not (thresholds.tm_min <= tm <= thresholds.tm_max):
+            stats["tm_failed"] += 1
+            failed[sid] = seq
+            continue
+
+        if dust > thresholds.complexity_max:
+            stats["complexity_failed"] += 1
+            failed[sid] = seq
+            continue
+
+        stage1_passed[sid] = seq
+        stage1_hairpin[sid] = hp
+
+    # Stage 2: Hairpin (dual-mode) — reuse pre-computed values
     if stage1_passed and thresholds.hairpin > 0:
-        hairpin_scores = {
-            sid: calculate_hairpin_fast(seq.upper())
-            for sid, seq in stage1_passed.items()
-        }
+        hairpin_scores = stage1_hairpin
         
         threshold = _resolve_threshold_assess(
             thresholds.hairpin, list(hairpin_scores.values())
@@ -281,6 +274,7 @@ def run_assess(
     hairpin: float = 15.0,
     dimer: float = 0.95,
     generate_plots: bool = True,
+    threads: int = 1,
     verbose: bool = False,
 ) -> Result[Dict[str, Any], str]:
     """
@@ -325,7 +319,7 @@ def run_assess(
             return Err(f"Invalid tags: {invalid}. Available: {AVAILABLE_TAGS}")
         
         logger.info(f"Computing tags: {tags}")
-        results = assess_fasta(sequences, tags)
+        results = assess_fasta(sequences, tags, threads=threads)
         
         import pandas as pd
         df = pd.DataFrame(results)
@@ -383,7 +377,7 @@ def run_assess(
             f"DUST≤{complexity_max}"
         )
         
-        passed, failed_seqs, filter_stats = filter_fasta(sequences, thresholds)
+        passed, failed_seqs, filter_stats = filter_fasta(sequences, thresholds, threads=threads)
         
         passed_path = Path(str(output_prefix) + ".filtered.fa")
         write_result = write_fasta(passed, passed_path)
