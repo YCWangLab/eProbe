@@ -1066,6 +1066,13 @@ def select(
     pct = selected / initial * 100 if initial > 0 else 0
     echo_info(f"  Input:    {initial:>10,} SNPs")
     echo_info(f"  Selected: {selected:>10,} SNPs  ({pct:.1f}% retained)")
+    if "priority_info" in stats and stats["priority_info"]:
+        pi = stats["priority_info"]
+        n_pri = pi.get("priority_selected", 0)
+        n_non = pi.get("non_priority_selected", 0)
+        pri_pct = n_pri / selected * 100 if selected > 0 else 0
+        echo_info(f"    ├─ In priority regions:      {n_pri:>8,} ({pri_pct:.1f}%)")
+        echo_info(f"    └─ Outside priority regions:  {n_non:>8,} ({100 - pri_pct:.1f}%)")
     echo_info(f"  Windows covered: {stats['windows']}")
     echo_info(f"  Strategy: {stats['strategy']}")
 
@@ -1074,15 +1081,16 @@ def select(
         bio = stats["biophysical_comparison"]
         echo_info("")
         echo_info(f"  {'Metric':<14} {'Input Mean':>12} {'Input Std':>12} "
-                  f"{'Sel Mean':>12} {'Sel Std':>12} {'Δ Mean':>10}")
-        echo_info(f"  {'-' * 72}")
+                  f"{'Sel Mean':>12} {'Sel Std':>12} {'Δ Mean':>10} {'Δ Std':>10}")
+        echo_info(f"  {'-' * 82}")
         for col_stats in bio:
-            sign = '+' if col_stats['delta_mean'] >= 0 else ''
+            dm_str = f"{col_stats['delta_mean']:+.3f}"
+            ds_str = f"{col_stats.get('delta_std', 0):+.3f}"
             echo_info(f"  {col_stats['label']:<14} "
                       f"{col_stats['input_mean']:>12.3f} {col_stats['input_std']:>12.3f} "
                       f"{col_stats['sel_mean']:>12.3f} {col_stats['sel_std']:>12.3f} "
-                      f"{sign}{col_stats['delta_mean']:>9.3f}")
-        echo_info(f"  {'-' * 72}")
+                      f"{dm_str:>10} {ds_str:>10}")
+        echo_info(f"  {'-' * 82}")
 
     echo_info(f"\n  Output: {stats['output_file']}")
     if "summary_file" in stats:

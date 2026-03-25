@@ -849,8 +849,12 @@ def select_by_priority(
 
     # Count how many selected are in priority regions
     n_priority_selected = sum(1 for s in selected if snp_in_priority_region_fast(s.chrom, s.pos, priority_index))
+    n_non_priority = len(selected) - n_priority_selected
     logger.info(f"Selected {len(selected)} SNPs ({n_priority_selected} from priority regions, "
-                f"{len(selected) - n_priority_selected} from other regions)")
+                f"{n_non_priority} from other regions)")
+
+    # Attach priority counts as attributes on the list for downstream stats
+    priority_info = {"priority_selected": n_priority_selected, "non_priority_selected": n_non_priority}
 
     # Build DataFrame if weighted selection was used
     if use_weighted and snp_df is not None:
@@ -861,9 +865,9 @@ def select_by_priority(
                 selected_df_indices.append(snp_to_idx[key])
         if selected_df_indices:
             selected_df = snp_df.loc[selected_df_indices].copy().reset_index(drop=True)
-            return Ok((selected, selected_df))
+            return Ok((selected, selected_df, priority_info))
 
-    return Ok(selected)
+    return Ok((selected, priority_info))
 
 
 def select_weighted(
@@ -1189,6 +1193,7 @@ def run_select(
         selected = snps
     else:
         # Apply selection strategy
+        priority_info = {}
         if strategy_lower == "uniform":
             result = select_uniform(snps, probe_number, window_size, seed)
         elif strategy_lower == "random":
@@ -1280,9 +1285,10 @@ def run_select(
             # Check if result is tuple (weighted was used) or just list
             if result.is_ok():
                 unwrapped = result.unwrap()
-                if isinstance(unwrapped, tuple):
+                priority_info = {}
+                if isinstance(unwrapped, tuple) and len(unwrapped) == 3:
                     # Weighted selection was used within priority
-                    selected_snps, selected_with_biophysical = unwrapped
+                    selected_snps, selected_with_biophysical, priority_info = unwrapped
                     logger.info(f"After 1-per-window selection: {len(selected_snps)} SNPs")
 
                     # Downsample to --target_count if specified and exceeded
@@ -1302,11 +1308,11 @@ def run_select(
 
                     # Calculate coverage statistics
                     coverage_stats = calculate_coverage_stats(selected, window_size)
-                    
+
                     # Save output
                     output_path = Path(str(output_prefix) + ".selected.tsv")
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-                    
+
                     if keep_biophysical:
                         selected_with_biophysical.to_csv(output_path, sep='\t', index=False)
                     else:
@@ -1314,7 +1320,7 @@ def run_select(
                             columns=BIOPHYSICAL_COLUMNS, errors='ignore'
                         )
                         output_df.to_csv(output_path, sep='\t', index=False)
-                    
+
                     stats = {
                         "initial_count": initial_count,
                         "selected": len(selected),
@@ -1325,12 +1331,13 @@ def run_select(
                         "windows": coverage_stats["windows_covered"],
                         "coverage": coverage_stats,
                         "output_file": str(output_path),
+                        "priority_info": priority_info,
                     }
-                    
+
                     # Add merge details if available
                     if merge_details:
                         stats["merge_details"] = merge_details
-                    
+
                     _log_biophysical_comparison(raw_df, selected_with_biophysical)
                     stats["biophysical_comparison"] = _build_biophysical_comparison(raw_df, selected_with_biophysical)
                     summary_path = _write_biophysical_summary(raw_df, selected_with_biophysical, output_prefix, stats)
@@ -1341,7 +1348,11 @@ def run_select(
 
                     return Ok(stats)
                 else:
-                    selected = unwrapped
+                    # No weighted: (selected_list, priority_info)
+                    if isinstance(unwrapped, tuple) and len(unwrapped) == 2:
+                        selected, priority_info = unwrapped
+                    else:
+                        selected = unwrapped
             else:
                 return Err(result.unwrap_err())
         else:
@@ -1377,11 +1388,15 @@ def run_select(
         "coverage": coverage_stats,
         "output_file": str(output_path),
     }
-    
+
+    # Add priority info if available (priority strategy without weights)
+    if priority_info:
+        stats["priority_info"] = priority_info
+
     # Add merge details if available
     if merge_details:
         stats["merge_details"] = merge_details
-    
+
     # Log biophysical comparison for non-weighted strategies (if biophysical cols available)
     sel_bio_df = pd.DataFrame()
     if any(c in raw_df.columns for c in BIOPHYSICAL_COLUMNS):
