@@ -618,13 +618,13 @@ def generate_combined_heatmap(
     
     # --- Figure and axes ---
     fig, ax = plt.subplots(figsize=(9, 8))
-    
+
     cmap = plt.cm.YlOrRd
     im = ax.imshow(combined, cmap=cmap, vmin=0, vmax=1.0, aspect='auto')
-    
+
     # Build axes attached to the heatmap using make_axes_locatable
     divider = make_axes_locatable(ax)
-    
+
     if pop_color_strip is not None:
         # Population color strip to the right of the heatmap
         ax_pop = divider.append_axes("right", size="2%", pad=0.06)
@@ -634,12 +634,13 @@ def generate_combined_heatmap(
         for spine in ax_pop.spines.values():
             spine.set_linewidth(0.5)
         ax_pop.set_xlabel('Pop', fontsize=7, labelpad=2)
-        cax = divider.append_axes("right", size="3%", pad=0.35)
-    else:
-        cax = divider.append_axes("right", size="3%", pad=0.1)
-    
+
+    # Add colorbar in upper right corner (shrunk to half size)
+    # Position: [left, bottom, width, height] in figure coordinates
+    cax = fig.add_axes([0.82, 0.75, 0.02, 0.12])
     cbar = plt.colorbar(im, cax=cax)
-    cbar.set_label('1-IBS', fontsize=11)
+    cbar.set_label('1-IBS', fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
     
     # Sample labels
     if n <= 50:
@@ -770,6 +771,128 @@ def check_plink_available() -> Result[str, str]:
     if plink_cmd is None:
         return Err("plink not found in PATH. Install with: conda install -c bioconda plink")
     return Ok(plink_cmd)
+
+
+def run_plink_ld_prune(
+    vcf_path: Path,
+    output_prefix: Path,
+    window_size: int = 50,
+    step_size: int = 5,
+    r2_threshold: float = 0.2,
+    threads: int = 1,
+) -> Result[Path, str]:
+    """
+    Perform LD pruning using PLINK and output pruned VCF.
+
+    Args:
+        vcf_path: Input VCF path
+        output_prefix: Output prefix for plink files
+        window_size: Window size in kb for LD calculation
+        step_size: Step size in variants
+        r2_threshold: r² threshold for pruning (variants with r² > threshold are removed)
+        threads: Number of threads
+
+    Returns:
+        Result containing path to pruned VCF
+    """
+    import subprocess
+    import tempfile
+
+    plink_check = check_plink_available()
+    if plink_check.is_err():
+        return Err(plink_check.unwrap_err())
+
+    plink_cmd = plink_check.unwrap()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        bed_prefix = tmpdir / "plink_bed"
+        prune_prefix = tmpdir / "plink_prune"
+
+        # Step 1: Convert VCF to bed format
+        cmd_bed = [
+            plink_cmd,
+            "--allow-extra-chr",
+            "--double-id",
+            "--vcf", str(vcf_path),
+            "--make-bed",
+            "--threads", str(threads),
+            "--out", str(bed_prefix)
+        ]
+
+        # Step 2: LD pruning - calculate which SNPs to keep
+        cmd_prune = [
+            plink_cmd,
+            "--allow-extra-chr",
+            "--bfile", str(bed_prefix),
+            "--indep-pairwise", str(window_size), str(step_size), str(r2_threshold),
+            "--threads", str(threads),
+            "--out", str(prune_prefix)
+        ]
+
+        # Step 3: Extract pruned SNPs to new bed file
+        pruned_bed_prefix = tmpdir / "plink_pruned"
+        cmd_extract = [
+            plink_cmd,
+            "--allow-extra-chr",
+            "--bfile", str(bed_prefix),
+            "--extract", str(prune_prefix) + ".prune.in",
+            "--make-bed",
+            "--threads", str(threads),
+            "--out", str(pruned_bed_prefix)
+        ]
+
+        # Step 4: Convert back to VCF
+        output_vcf = Path(str(output_prefix) + ".ld_pruned.vcf.gz")
+        cmd_vcf = [
+            plink_cmd,
+            "--allow-extra-chr",
+            "--bfile", str(pruned_bed_prefix),
+            "--recode", "vcf-iid", "bgz",
+            "--threads", str(threads),
+            "--out", str(output_prefix) + ".ld_pruned"
+        ]
+
+        try:
+            # Run bed conversion
+            result = subprocess.run(cmd_bed, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                return Err(f"PLINK bed conversion failed: {result.stderr}")
+
+            # Run LD pruning
+            result = subprocess.run(cmd_prune, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                return Err(f"PLINK LD pruning failed: {result.stderr}")
+
+            # Count pruned SNPs
+            prune_in_file = Path(str(prune_prefix) + ".prune.in")
+            if prune_in_file.exists():
+                with open(prune_in_file) as f:
+                    n_kept = sum(1 for _ in f)
+                logger.info(f"LD pruning: kept {n_kept} SNPs (window={window_size}kb, r²<{r2_threshold})")
+
+            # Extract pruned SNPs
+            result = subprocess.run(cmd_extract, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                return Err(f"PLINK extract failed: {result.stderr}")
+
+            # Convert to VCF
+            result = subprocess.run(cmd_vcf, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                return Err(f"PLINK VCF export failed: {result.stderr}")
+
+            # Index the output VCF
+            import shutil
+            if shutil.which("bcftools"):
+                subprocess.run(
+                    ["bcftools", "index", "--threads", str(threads), "-f", str(output_vcf)],
+                    check=False
+                )
+
+            return Ok(output_vcf)
+
+        except Exception as e:
+            return Err(f"LD pruning failed: {e}")
 
 
 def run_plink_ibs_distance(
@@ -1189,9 +1312,20 @@ def run_pca_assessment(
         if sample_sub_result.is_err():
             return Err(f"Failed to subset VCF by samples: {sample_sub_result.unwrap_err()}")
 
-        # === Run PCA on sample-subsetted full VCF ===
-        logger.info("Running PCA on full VCF...")
-        full_pca_result = run_plink_pca(full_vcf_sub, tmpdir / "full", n_pcs=n_pcs, threads=threads)
+        # === LD pruning for full VCF (important for unbiased PCA) ===
+        logger.info("Performing LD pruning on full VCF...")
+        ld_prune_result = run_plink_ld_prune(
+            full_vcf_sub, tmpdir / "full_ld", threads=threads
+        )
+        if ld_prune_result.is_err():
+            logger.warning(f"LD pruning failed, using unpruned VCF: {ld_prune_result.unwrap_err()}")
+            full_vcf_pruned = full_vcf_sub
+        else:
+            full_vcf_pruned = ld_prune_result.unwrap()
+
+        # === Run PCA on LD-pruned full VCF ===
+        logger.info("Running PCA on LD-pruned full VCF...")
+        full_pca_result = run_plink_pca(full_vcf_pruned, tmpdir / "full", n_pcs=n_pcs, threads=threads)
 
         if full_pca_result.is_err():
             return Err(f"PCA on full VCF failed: {full_pca_result.unwrap_err()}")
@@ -2707,8 +2841,7 @@ def run_distance_assessment(
     logger.info(f"SNP TSV: {snp_tsv_path}")
     logger.info(f"VCF: {vcf_path}")
     logger.info(f"Using {threads} thread(s) for PLINK and bcftools")
-    logger.info(f"Using {threads} thread(s) for PLINK and bcftools")
-    
+
     # Check plink and bcftools
     plink_check = check_plink_available()
     if plink_check.is_err():
@@ -2801,9 +2934,20 @@ def run_distance_assessment(
         if sample_sub_result.is_err():
             return Err(f"Failed to subset VCF by samples: {sample_sub_result.unwrap_err()}")
 
-        # === Calculate IBS distance for sample-subsetted full VCF ===
-        logger.info("Calculating IBS distances for full VCF using PLINK...")
-        full_ibs_result = run_plink_ibs_distance(full_vcf_sub, tmpdir / "full", threads=threads)
+        # === LD pruning for full VCF (important for unbiased IBS distance) ===
+        logger.info("Performing LD pruning on full VCF...")
+        ld_prune_result = run_plink_ld_prune(
+            full_vcf_sub, tmpdir / "full_ld", threads=threads
+        )
+        if ld_prune_result.is_err():
+            logger.warning(f"LD pruning failed, using unpruned VCF: {ld_prune_result.unwrap_err()}")
+            full_vcf_pruned = full_vcf_sub
+        else:
+            full_vcf_pruned = ld_prune_result.unwrap()
+
+        # === Calculate IBS distance for LD-pruned full VCF ===
+        logger.info("Calculating IBS distances for LD-pruned full VCF using PLINK...")
+        full_ibs_result = run_plink_ibs_distance(full_vcf_pruned, tmpdir / "full", threads=threads)
 
         if full_ibs_result.is_err():
             return Err(f"Full VCF IBS failed: {full_ibs_result.unwrap_err()}")
@@ -3578,7 +3722,7 @@ def run_tags_assessment(
         "gc": 2.0,
         "tm": 1.0,
         "complexity": 0.1,
-        "hairpin": 1.0,
+        "hairpin": 0.5,
         "dimer": 0.01,
     }
     xlim_final = {**default_xlim, **(plot_xlim or {})}

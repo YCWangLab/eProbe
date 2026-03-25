@@ -255,9 +255,9 @@ def _generate_tag_plots(results, tags, output_prefix):
             'ax': ax,
         }
 
-        # hairpin: use binwidth=1 for integer-like scores
+        # hairpin: use binwidth=0.5 for finer resolution
         if tag == 'hairpin':
-            hist_kwargs['binwidth'] = 1
+            hist_kwargs['binwidth'] = 0.5
 
         sns.histplot(values, **hist_kwargs)
 
