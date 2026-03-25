@@ -221,11 +221,48 @@ def parse_bed_file(bed_path: Path) -> Result[Set[Tuple[str, int, int]], str]:
         return Err(f"Failed to parse BED file: {e}")
 
 
+def build_priority_index(
+    regions: Set[Tuple[str, int, int]]
+) -> Dict[str, List[Tuple[int, int]]]:
+    """Build a chromosome-indexed, sorted interval list for fast overlap queries.
+
+    Returns a dict mapping chrom -> sorted list of (start, end) intervals.
+    """
+    from collections import defaultdict
+    index: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for chrom, start, end in regions:
+        index[chrom].append((start, end))
+    # Sort each chromosome's intervals by start position
+    for chrom in index:
+        index[chrom].sort()
+    return dict(index)
+
+
+def snp_in_priority_region_fast(
+    chrom: str,
+    pos: int,
+    priority_index: Dict[str, List[Tuple[int, int]]],
+) -> bool:
+    """Check if a SNP overlaps any priority region using binary search. O(log M)."""
+    intervals = priority_index.get(chrom)
+    if not intervals:
+        return False
+    import bisect
+    # Find the rightmost interval whose start <= pos
+    idx = bisect.bisect_right(intervals, (pos, float('inf'))) - 1
+    if idx >= 0 and intervals[idx][0] <= pos <= intervals[idx][1]:
+        return True
+    # Also check the next interval in case of overlapping/adjacent regions
+    if idx + 1 < len(intervals) and intervals[idx + 1][0] <= pos <= intervals[idx + 1][1]:
+        return True
+    return False
+
+
 def snp_in_priority_region(
-    snp: SNP, 
+    snp: SNP,
     regions: Set[Tuple[str, int, int]]
 ) -> bool:
-    """Check if SNP falls within any priority region."""
+    """Check if SNP falls within any priority region (legacy linear scan)."""
     for chrom, start, end in regions:
         if snp.chrom == chrom and start <= snp.pos <= end:
             return True
@@ -667,6 +704,9 @@ def select_by_priority(
     logger.info(f"Priority regions: {len(priority_regions)}")
     logger.info(f"Window size: {window_size:,} bp")
 
+    # Build fast interval index for O(log M) lookups instead of O(M)
+    priority_index = build_priority_index(priority_regions)
+
     # Check if we can use weighted selection
     use_weighted = False
     if weights is not None and snp_df is not None:
@@ -695,7 +735,7 @@ def select_by_priority(
         window_idx = calculate_window_index(snp.pos, window_size)
         key = (snp.chrom, window_idx)
 
-        if snp_in_priority_region(snp, priority_regions):
+        if snp_in_priority_region_fast(snp.chrom, snp.pos, priority_index):
             window_snps[key]['priority'].append(i)
             total_priority += 1
         else:
@@ -805,7 +845,7 @@ def select_by_priority(
     selected.sort(key=lambda s: (s.chrom, s.pos))
 
     # Count how many selected are in priority regions
-    n_priority_selected = sum(1 for s in selected if snp_in_priority_region(s, priority_regions))
+    n_priority_selected = sum(1 for s in selected if snp_in_priority_region_fast(s.chrom, s.pos, priority_index))
     logger.info(f"Selected {len(selected)} SNPs ({n_priority_selected} from priority regions, "
                 f"{len(selected) - n_priority_selected} from other regions)")
 
