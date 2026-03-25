@@ -41,6 +41,21 @@ from eprobe.biophysics.entropy import calculate_entropy
 logger = logging.getLogger(__name__)
 
 
+def _get_plot_font() -> str:
+    """Return Helvetica if available, otherwise fall back to DejaVu Sans."""
+    try:
+        from matplotlib.font_manager import findfont, FontProperties
+        path = findfont(FontProperties(family='Helvetica'), fallback_to_default=False)
+        if path:
+            return 'Helvetica'
+    except Exception:
+        pass
+    return 'DejaVu Sans'
+
+
+PLOT_FONT = _get_plot_font()
+
+
 # Available assessment tags
 AVAILABLE_TAGS = {
     "gc": "GC content (%)",
@@ -3057,22 +3072,22 @@ def generate_assessment_plots(
         ylim_fixed = (ylim_overrides or {}).get(tag)
         if ylim_fixed is not None:
             ax.set_ylim(ylim_fixed)
-        ax.set_title('Distribution Plot', fontsize=22, fontname='DejaVu Sans', pad=20)
+        ax.set_title('Distribution Plot', fontsize=22, fontname=PLOT_FONT, pad=20)
         ax.set_xlabel(
             'Estimated stem length (bp)' if tick_positions_custom is not None else 'Values',
-            fontsize=20, fontname='DejaVu Sans', labelpad=10,
+            fontsize=20, fontname=PLOT_FONT, labelpad=10,
         )
-        ax.set_ylabel('Percent (%)', fontsize=18, fontname='DejaVu Sans', labelpad=10)
+        ax.set_ylabel('Percent (%)', fontsize=18, fontname=PLOT_FONT, labelpad=10)
         ax.tick_params(axis='both', labelsize=18)
         ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
         if tick_positions_custom is not None:
             ax.set_xticks(tick_positions_custom)
             ax.set_xticklabels(tick_labels_custom, fontsize=15, rotation=30, ha='right',
-                               fontname='DejaVu Sans')
+                               fontname=PLOT_FONT)
         elif tag == 'gc':
             ax.set_xticks(np.arange(xlim[0], xlim[1] + 0.5, 2))
         for label in ax.get_xticklabels() + ax.get_yticklabels():
-            label.set_fontname('DejaVu Sans')
+            label.set_fontname(PLOT_FONT)
 
         plt.tight_layout()
 
@@ -3781,22 +3796,22 @@ def run_tags_from_dataframe(
                 ylim_fixed = (ylim_overrides or {}).get(tag)
                 if ylim_fixed is not None:
                     ax.set_ylim(ylim_fixed)
-                ax.set_title('Distribution Plot', fontsize=22, fontname='DejaVu Sans', pad=20)
+                ax.set_title('Distribution Plot', fontsize=22, fontname=PLOT_FONT, pad=20)
                 ax.set_xlabel(
                     'Estimated stem length (bp)' if tick_positions_custom is not None else 'Values',
-                    fontsize=20, fontname='DejaVu Sans', labelpad=10,
+                    fontsize=20, fontname=PLOT_FONT, labelpad=10,
                 )
-                ax.set_ylabel('Percent (%)', fontsize=18, fontname='DejaVu Sans', labelpad=10)
+                ax.set_ylabel('Percent (%)', fontsize=18, fontname=PLOT_FONT, labelpad=10)
                 ax.tick_params(axis='both', labelsize=18)
                 ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
                 if tick_positions_custom is not None:
                     ax.set_xticks(tick_positions_custom)
                     ax.set_xticklabels(tick_labels_custom, fontsize=15, rotation=30, ha='right',
-                                       fontname='DejaVu Sans')
+                                       fontname=PLOT_FONT)
                 elif tag == 'gc':
                     ax.set_xticks(np.arange(xlim[0], xlim[1] + 0.5, 2))
                 for label in ax.get_xticklabels() + ax.get_yticklabels():
-                    label.set_fontname('DejaVu Sans')
+                    label.set_fontname(PLOT_FONT)
 
                 plt.tight_layout()
 
