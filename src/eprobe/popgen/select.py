@@ -1092,8 +1092,12 @@ def run_select(
     # Keep the raw DataFrame for weighted selection
     raw_df = snp_df_obj.df.copy()
 
-    # For weighted/priority strategies: compute biophysical columns if missing
-    if strategy.lower() in ("weighted", "priority"):
+    # For weighted strategy (or priority with weights): compute biophysical columns if missing
+    needs_biophysical = (
+        strategy.lower() == "weighted"
+        or (strategy.lower() == "priority" and weights is not None)
+    )
+    if needs_biophysical:
         missing_cols = [c for c in BIOPHYSICAL_COLUMNS if c not in raw_df.columns]
         if missing_cols:
             if reference_path is None:
