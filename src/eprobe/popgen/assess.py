@@ -2057,7 +2057,14 @@ def generate_multipop_sfs_heatmap(
     # Log-transform for better dynamic range (standard SFS visualization)
     plot_sfs_1d = {}
     for pop, arr in sfs_1d.items():
-        log_arr = np.log10(1.0 + arr)
+        # Mirror folded 1D SFS: for projection n, bin i mirrors to bin n-i.
+        # Folded SFS only has data in bins 0..n/2; fill bins n/2+1..n.
+        full = arr.copy()
+        n = len(full) - 1  # projection size
+        for i in range(n // 2 + 1, n + 1):
+            if full[i] == 0:
+                full[i] = arr[n - i]
+        log_arr = np.log10(1.0 + full)
         masked = np.ma.array(log_arr)
         masked[0] = np.ma.masked   # mask zero-count bin (non-segregating)
         plot_sfs_1d[pop] = masked
@@ -2173,9 +2180,28 @@ def generate_multipop_sfs_heatmap(
                 ax.set_yticks([])
                 ax.tick_params(left=False)
 
-            # X-axis: hide all ticks
-            ax.set_xticks([])
-            ax.tick_params(bottom=False)
+            # X-axis: only show ticks on bottom row
+            if i == n_pops - 1:
+                if i == j and pop_row in plot_sfs_1d:
+                    # Diagonal on bottom row: single-column heatmap, no x ticks needed
+                    ax.set_xticks([])
+                    ax.tick_params(bottom=False)
+                elif i > j:
+                    pop_min, pop_max = pop_col, pop_row
+                    key = (pop_min, pop_max)
+                    if key in plot_sfs_2d:
+                        sfs_data = plot_sfs_2d[key].T
+                        ax.set_xticks(range(sfs_data.shape[1]))
+                        ax.set_xticklabels(range(sfs_data.shape[1]), fontsize=7)
+                    else:
+                        ax.set_xticks([])
+                        ax.tick_params(bottom=False)
+                else:
+                    ax.set_xticks([])
+                    ax.tick_params(bottom=False)
+            else:
+                ax.set_xticks([])
+                ax.tick_params(bottom=False)
 
             # Black border on all visible cells
             for spine in ax.spines.values():
@@ -2202,14 +2228,6 @@ def generate_multipop_sfs_heatmap(
     )
     cbar.set_label('log\u2081\u2080(count + 1)', fontsize=9)
     cbar.ax.tick_params(labelsize=8)
-
-    # Add gray legend patch for masked (monomorphic/fixed) cells, near colorbar
-    import matplotlib.patches as mpatches
-    gray_patch = mpatches.Patch(facecolor='lightgray', edgecolor='gray',
-                                label='Monomorphic (count = 0)')
-    fig.legend(handles=[gray_patch], loc='right',
-               bbox_to_anchor=(0.98, 0.48), fontsize=8,
-               frameon=True, framealpha=0.9)
 
     # Add title
     fig.suptitle(title, fontsize=13, fontweight='bold', y=0.98)
@@ -3055,8 +3073,8 @@ def _check_mode_outputs_exist(output_prefix: Path, mode: str) -> bool:
     """Check whether key output files for a given assessment mode already exist."""
     checks = {
         "distance": [".distance_summary.txt", ".ibs_heatmap.png"],
-        "sfs": [".sfs_summary.txt"],
-        "pca": [".pca_summary.txt"],
+        "sfs": [".sfs_summary.txt", ".sfs_full.png", ".sfs_probe.png"],
+        "pca": [".pca_summary.txt", ".pca_PC1_PC2.png"],
         "tags": [".tags_summary.txt"],
     }
     required = checks.get(mode, [])

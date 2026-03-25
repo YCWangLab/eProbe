@@ -2779,8 +2779,49 @@ def run_filter(
         # Save output
         output_path = Path(str(output_prefix) + ".filtered.tsv")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         filtered_df = SNPDataFrame.from_snps(snps)
+
+        # Add biophysical columns if biophysical filter was applied
+        if "biophysical" in filters_normalized:
+            logger.info("Computing biophysical columns for output...")
+            from eprobe.biophysics.biophysics import (
+                calculate_gc_fast,
+                calculate_tm_fast,
+                calculate_dust_fast,
+                calculate_hairpin_fast,
+                DimerCalculatorFast,
+            )
+
+            _gc, _tm, _complexity, _hairpin = [], [], [], []
+            _snp_ids = [snp.id for snp in snps]
+            _seqs = [probe_sequences.get(sid, "") for sid in _snp_ids]
+
+            for seq in _seqs:
+                if len(seq) > 1:
+                    _gc.append(round(calculate_gc_fast(seq), 4))
+                    _tm.append(round(calculate_tm_fast(seq), 2))
+                    _complexity.append(round(calculate_dust_fast(seq), 4))
+                    _hairpin.append(round(calculate_hairpin_fast(seq), 2))
+                else:
+                    _gc.append(None)
+                    _tm.append(None)
+                    _complexity.append(None)
+                    _hairpin.append(None)
+
+            filtered_df.df["gc"] = _gc
+            filtered_df.df["tm"] = _tm
+            filtered_df.df["complexity"] = _complexity
+            filtered_df.df["hairpin"] = _hairpin
+
+            # Dimer: k-mer frequency score against the full set
+            dimer_calc = DimerCalculatorFast(k=11)
+            dimer_calc.build_index(_seqs)
+            _dimer = [round(dimer_calc.score(seq), 4) if len(seq) > 1 else None for seq in _seqs]
+            filtered_df.df["dimer"] = _dimer
+
+            logger.info("Biophysical columns added to output")
+
         save_result = filtered_df.to_tsv(output_path)
         if save_result.is_err():
             return Err(f"Failed to save output: {save_result.unwrap_err()}")
