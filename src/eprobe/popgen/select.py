@@ -1139,6 +1139,23 @@ def run_select(
     # Keep the raw DataFrame for weighted selection
     raw_df = snp_df_obj.df.copy()
 
+    # If a merged SNP set was supplied (e.g. --merge_mode intersection), restrict
+    # raw_df to only those SNPs. Without this, select_weighted operates on ALL rows
+    # of the first input file, ignoring the intersection/union constraint entirely —
+    # SNPs that were removed by biophysical filtering can re-enter the selection.
+    if merged_snps is not None:
+        merged_ids = {
+            f"{snp.chrom}:{snp.pos}_{snp.ref}_{snp.alt}" for snp in merged_snps
+        }
+        snp_id_col = (
+            raw_df["chr"].astype(str) + ":"
+            + raw_df["pos"].astype(str) + "_"
+            + raw_df["ref"].astype(str) + "_"
+            + raw_df["alt"].astype(str)
+        )
+        raw_df = raw_df[snp_id_col.isin(merged_ids)].reset_index(drop=True)
+        logger.info(f"Filtered raw_df to {len(raw_df)} rows matching merged SNP IDs")
+
     # For weighted strategy (or priority with weights): compute biophysical columns if missing
     needs_biophysical = (
         strategy.lower() == "weighted"
