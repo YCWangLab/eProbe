@@ -410,11 +410,11 @@ def extract(
 @click.option(
     "--hairpin",
     type=float,
-    default=50.0,
-    help="Hairpin filter threshold (default: 50.0, allows stems up to 7bp). "
-         ">=1: absolute score threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
-         "Uses exponential k-mer continuity scoring: 4^(n-1) bonus, normalized by log4(L). "
-         "Stem levels: 4bp~0.34, 5bp~1.35, 6bp~5.42, 7bp~21.67, 8bp~86.68. Set -1 to disable.",
+    default=15.0,
+    help="Hairpin filter threshold in |MFE| kcal/mol (default: 15.0). "
+         "Calculated via ViennaRNA Zuker MFE with DNA parameters (Mathews 2004). "
+         ">=1: absolute |MFE| threshold; <1: percentile (e.g. 0.95 keeps 95%%). "
+         "Set -1 to disable.",
 )
 @click.option(
     "--dimer",
