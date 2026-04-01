@@ -930,12 +930,12 @@ def select_weighted(
     
     df = snp_df.copy()
     
-    # === WINDOW-BASED RANK SCORING ===
+    # === WINDOW-BASED MIN/MAX DISTANCE SCORING ===
     # Compute |value - target| as raw distance for each metric.
-    # Within each window, convert distances to ranks and normalise to [0,1].
-    # This ensures every metric contributes equally regardless of its natural
-    # scale (e.g. GC% vs complexity) — only the relative ordering within a
-    # window matters.
+    # Within each window, normalise distances via min/max to [0,1] then
+    # convert to a score: score = 1 - normalised_distance.
+    # This preserves the proportional distance differences between SNPs
+    # (unlike rank-based scoring which only keeps ordinal information).
     
     dist_cols = []
     for col, tgt in zip(BIOPHYSICAL_COLUMNS, targets):
@@ -953,20 +953,20 @@ def select_weighted(
     if total_windows == 0:
         return Ok([])
     
-    # Rank distances within each window (ascending: smallest distance = rank 1 = best).
-    # Normalise ranks to [0,1]: rank_score = 1 - (rank - 1) / (n - 1).
-    # When a window has only 1 SNP, rank_score = 1.0 for all metrics.
+    # Min/max normalise distances within each window, then convert to score.
+    # score = 1 - (dist - min) / (max - min).  When max == min (all equal),
+    # every SNP scores 1.0 (perfect).  Single-SNP windows also score 1.0.
     score_cols = [f'{col}_score' for col in BIOPHYSICAL_COLUMNS]
     for dcol, scol in zip(dist_cols, score_cols):
-        # rank with method='average' handles ties symmetrically
-        df[scol] = df.groupby('window_key')[dcol].rank(method='average', ascending=True)
-        window_counts = df.groupby('window_key')[dcol].transform('count')
-        df[scol] = 1.0 - (df[scol] - 1.0) / (window_counts - 1.0).replace(0, np.nan).fillna(1.0)
+        win_min = df.groupby('window_key')[dcol].transform('min')
+        win_max = df.groupby('window_key')[dcol].transform('max')
+        span = (win_max - win_min).replace(0, np.nan)
+        df[scol] = 1.0 - (df[dcol] - win_min) / span.fillna(1.0)
     
     # Drop distance columns
     df.drop(columns=dist_cols, inplace=True)
     
-    # Weighted composite score from rank scores
+    # Weighted composite score (weights are relative, not required to sum to 1)
     df['weighted_score'] = sum(
         w * df[sc] for w, sc in zip(weights, score_cols)
     )
