@@ -1496,8 +1496,8 @@ def target(
 @click.option(
     "--tm",
     type=str,
-    default="65,85",
-    help="Melting temperature range (min,max, default: 65,85). Set -1 to disable.",
+    default="60,80",
+    help="Melting temperature range (min,max, default: 60,80). Set -1 to disable.",
 )
 @click.option(
     "--complexity",

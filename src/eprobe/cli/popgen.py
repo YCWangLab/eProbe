@@ -398,8 +398,8 @@ def extract(
 @click.option(
     "--tm",
     type=str,
-    default="65,85",
-    help="Melting temperature range (min,max Celsius, default: 65,85). Set -1 to disable.",
+    default="60,80",
+    help="Melting temperature range (min,max Celsius, default: 60,80). Set -1 to disable.",
 )
 @click.option(
     "--complexity",
