@@ -1132,7 +1132,7 @@ def select(
     "--offset",
     default=0,
     type=int,
-    help="Position offset from center (-/+ for left/right shift).",
+    help="SNP position offset within probe: negative shifts SNP toward 5' end, positive toward 3' end (default: 0).",
 )
 @click.option(
     "--tiling_offset",
