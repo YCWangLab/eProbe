@@ -1072,6 +1072,7 @@ def run_select(
     threads: int = 1,
     reference_path: Optional[Path] = None,
     probe_length: int = 81,
+    mutation_type: Optional[str] = None,
     verbose: bool = False,
     **kwargs,  # Accept extra kwargs for CLI compatibility
 ) -> Result[Dict[str, Any], str]:
@@ -1133,6 +1134,16 @@ def run_select(
         
         snp_df_obj = snp_df_result.unwrap()
         snps = snp_df_obj.to_snps()
+
+    # Filter by mutation type before anything else
+    if mutation_type in ("ts", "tv"):
+        before = len(snps)
+        snps = [s for s in snps if getattr(s, "mutation_type", None) == mutation_type]
+        logger.info(f"Mutation type filter '{mutation_type}': {before} → {len(snps)} SNPs")
+        # Also restrict raw_df immediately so it stays in sync
+        if "type" in snp_df_obj.df.columns:
+            snp_df_obj = type(snp_df_obj)(snp_df_obj.df[snp_df_obj.df["type"] == mutation_type].reset_index(drop=True))
+
     initial_count = len(snps)
     logger.info(f"Loaded {initial_count} SNPs")
     
@@ -1203,7 +1214,8 @@ def run_select(
     
     # Variable to hold DataFrame with biophysical columns (for weighted selection)
     selected_with_biophysical: Optional[pd.DataFrame] = None
-    
+    priority_info: Dict[str, Any] = {}
+
     # Check if we already have fewer SNPs than target
     if len(snps) <= probe_number:
         logger.warning(f"Input count ({len(snps)}) <= target ({probe_number}), keeping all")

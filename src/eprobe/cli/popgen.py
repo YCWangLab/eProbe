@@ -890,6 +890,12 @@ def filter(
     type=int,
     help="Probe length for biophysical computation (default: 81). Only used with --reference.",
 )
+@click.option(
+    "--mutation_type",
+    type=click.Choice(["ts", "tv", "both"]),
+    default="both",
+    help="Filter by mutation type before selection: ts (transitions), tv (transversions), both (default).",
+)
 @click.pass_context
 def select(
     ctx: click.Context,
@@ -907,6 +913,7 @@ def select(
     keep_biophysical: bool,
     reference: Optional[Path],
     probe_length: int,
+    mutation_type: str,
 ) -> None:
     """
     Select optimal SNPs using window-based sampling.
@@ -1024,6 +1031,9 @@ def select(
     if target_count:
         echo_info(f"Target count: {target_count}")
     
+    if mutation_type != "both":
+        echo_info(f"Mutation type filter: {mutation_type} only")
+
     result = run_select(
         input_path=input_path,
         output_prefix=output,
@@ -1040,6 +1050,7 @@ def select(
         threads=threads,
         reference_path=reference,
         probe_length=probe_length,
+        mutation_type=mutation_type if mutation_type != "both" else None,
         verbose=verbose,
     )
     
