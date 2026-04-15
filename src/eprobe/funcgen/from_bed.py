@@ -13,9 +13,10 @@ Legacy equivalent: Get_probe_from_bed.py + Get_allele_from_vcf.py + Get_probe_fr
 
 import logging
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pysam
 
@@ -105,6 +106,88 @@ def parse_bed_file(bed_path: Path) -> Result[List[BedRegion], str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-region worker (used by parallel haplotype mode)
+# ---------------------------------------------------------------------------
+
+def _process_one_region_haplo(
+    region: BedRegion,
+    reference_path: Path,
+    vcf_path: Path,
+    temp_dir: Path,
+    phase: bool,
+    min_freq: float,
+    variant_only: bool,
+    probe_length: int,
+    step_size: int,
+    aligner: str,
+) -> Tuple[str, List[Probe], bool, int]:
+    """Process a single region in haplotype mode.
+
+    Returns:
+        (status, probes, has_multi_haplo, n_haplo)
+        status: "ok", "err", or "ref_only"
+    """
+    rid = region.name or f"{region.chrom}:{region.start}-{region.end}"
+
+    # Step 1: Phase if requested
+    if phase:
+        phase_result = phase_vcf_region(
+            vcf_path, region.chrom, region.start, region.end,
+            temp_dir, rid,
+        )
+        if phase_result.is_err():
+            # No variants → use reference only
+            if not variant_only:
+                ref_fasta = pysam.FastaFile(str(reference_path))
+                ref_seq = ref_fasta.fetch(region.chrom, region.start, region.end)
+                ref_fasta.close()
+                probes = tile_sequence(
+                    rid, ref_seq, probe_length, step_size,
+                    source_chrom=region.chrom,
+                    source_offset=region.start,
+                )
+                return ("ref_only", probes, False, 0)
+            return ("ref_only", [], False, 0)
+        vcf_to_use = phase_result.unwrap()
+    else:
+        vcf_to_use = vcf_path
+
+    # Step 2: Extract haplotypes
+    haplo_result = extract_haplotypes(
+        phased_vcf_path=vcf_to_use,
+        reference_fasta_path=reference_path,
+        chrom=region.chrom,
+        start=region.start,
+        end=region.end,
+        min_freq=min_freq,
+        region_id=rid,
+    )
+
+    if haplo_result.is_err():
+        return ("err", [], False, 0)
+
+    haplo_set = haplo_result.unwrap()
+    has_multi = len(haplo_set.alleles) > 1
+
+    # Step 3: Generate haplotype-aware probes
+    probe_result = generate_haplotype_probes(
+        region_id=rid,
+        alleles=haplo_set.alleles,
+        probe_length=probe_length,
+        step_size=step_size,
+        variant_only=variant_only,
+        source_chrom=region.chrom,
+        source_offset=region.start,
+        aligner=aligner,
+    )
+
+    if probe_result.is_err():
+        return ("err", [], False, 0)
+
+    return ("ok", probe_result.unwrap(), has_multi, len(haplo_set.alleles))
+
+
+# ---------------------------------------------------------------------------
 # Core region processing (shared with from_gff)
 # ---------------------------------------------------------------------------
 
@@ -183,82 +266,52 @@ def process_regions(
         temp_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            for region in regions:
-                rid = region.name or f"{region.chrom}:{region.start}-{region.end}"
+            n_workers = min(threads, len(regions))
+            if n_workers > 1:
+                logger.info(f"Processing {len(regions)} regions with {n_workers} workers")
+                futures = {}
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    for region in regions:
+                        rid = region.name or f"{region.chrom}:{region.start}-{region.end}"
+                        fut = executor.submit(
+                            _process_one_region_haplo,
+                            region, reference_path, vcf_path, temp_dir,
+                            phase, min_freq, variant_only,
+                            probe_length, step_size, aligner,
+                        )
+                        futures[fut] = rid
 
-                # Step 1: Phase if requested
-                if phase:
-                    phase_result = phase_vcf_region(
-                        vcf_path, region.chrom, region.start, region.end,
-                        temp_dir, rid,
-                    )
-                    if phase_result.is_err():
-                        # No variants → use reference only
-                        logger.info(f"  {rid}: no variants, using reference")
-                        if not variant_only:
-                            ref_fasta = pysam.FastaFile(str(reference_path))
-                            ref_seq = ref_fasta.fetch(region.chrom, region.start, region.end)
-                            ref_fasta.close()
-                            probes = tile_sequence(
-                                rid, ref_seq, probe_length, step_size,
-                                source_chrom=region.chrom,
-                                source_offset=region.start,
-                            )
+                    for fut in as_completed(futures):
+                        rid = futures[fut]
+                        try:
+                            status, probes, has_multi, n_haplo = fut.result()
+                        except Exception as exc:
+                            logger.warning(f"  {rid}: worker exception: {exc}")
+                            n_regions_err += 1
+                            continue
+                        if status == "err":
+                            n_regions_err += 1
+                        else:
                             all_probes.extend(probes)
                             n_regions_ok += 1
-                        continue
-                    vcf_to_use = phase_result.unwrap()
-                else:
-                    vcf_to_use = vcf_path
-
-                # Step 2: Extract haplotypes
-                haplo_result = extract_haplotypes(
-                    phased_vcf_path=vcf_to_use,
-                    reference_fasta_path=reference_path,
-                    chrom=region.chrom,
-                    start=region.start,
-                    end=region.end,
-                    min_freq=min_freq,
-                    region_id=rid,
-                )
-
-                if haplo_result.is_err():
-                    logger.warning(f"  {rid}: haplotype extraction failed: {haplo_result.unwrap_err()}")
-                    n_regions_err += 1
-                    continue
-
-                haplo_set = haplo_result.unwrap()
-
-                if len(haplo_set.alleles) > 1:
-                    n_haplo_regions += 1
-                    logger.info(
-                        f"  {rid}: {len(haplo_set.alleles)} haplotypes, "
-                        f"{haplo_set.n_variants} variants "
-                        f"({', '.join(f'{k}={haplo_set.frequencies[k]:.2%}' for k in haplo_set.alleles)})"
+                            if has_multi:
+                                n_haplo_regions += 1
+            else:
+                # Single-threaded: process regions sequentially
+                for region in regions:
+                    rid = region.name or f"{region.chrom}:{region.start}-{region.end}"
+                    status, probes, has_multi, n_haplo = _process_one_region_haplo(
+                        region, reference_path, vcf_path, temp_dir,
+                        phase, min_freq, variant_only,
+                        probe_length, step_size, aligner,
                     )
-                else:
-                    logger.debug(f"  {rid}: 1 haplotype (monomorphic)")
-
-                # Step 3: Generate haplotype-aware probes
-                probe_result = generate_haplotype_probes(
-                    region_id=rid,
-                    alleles=haplo_set.alleles,
-                    probe_length=probe_length,
-                    step_size=step_size,
-                    variant_only=variant_only,
-                    source_chrom=region.chrom,
-                    source_offset=region.start,
-                    aligner=aligner,
-                )
-
-                if probe_result.is_err():
-                    logger.warning(f"  {rid}: probe generation failed: {probe_result.unwrap_err()}")
-                    n_regions_err += 1
-                    continue
-
-                probes = probe_result.unwrap()
-                all_probes.extend(probes)
-                n_regions_ok += 1
+                    if status == "err":
+                        n_regions_err += 1
+                    else:
+                        all_probes.extend(probes)
+                        n_regions_ok += 1
+                        if has_multi:
+                            n_haplo_regions += 1
 
         finally:
             # Cleanup temp directory
