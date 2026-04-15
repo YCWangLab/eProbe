@@ -184,7 +184,8 @@ def _process_one_region_haplo(
     if probe_result.is_err():
         return ("err", [], False, 0)
 
-    return ("ok", probe_result.unwrap(), has_multi, len(haplo_set.alleles))
+    probes, _stats = probe_result.unwrap()
+    return ("ok", probes, has_multi, len(haplo_set.alleles))
 
 
 # ---------------------------------------------------------------------------
