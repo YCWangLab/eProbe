@@ -13,7 +13,7 @@ Legacy equivalent: Get_probe_from_bed.py + Get_allele_from_vcf.py + Get_probe_fr
 
 import logging
 import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -270,7 +270,7 @@ def process_regions(
             if n_workers > 1:
                 logger.info(f"Processing {len(regions)} regions with {n_workers} workers")
                 futures = {}
-                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                with ThreadPoolExecutor(max_workers=n_workers) as executor:
                     for region in regions:
                         rid = region.name or f"{region.chrom}:{region.start}-{region.end}"
                         fut = executor.submit(
