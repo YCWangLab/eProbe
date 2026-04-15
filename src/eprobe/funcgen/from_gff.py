@@ -291,8 +291,7 @@ def run_from_gff(
         Ok(stats dict) on success, Err(message) on failure
 
     Output files:
-        {output_prefix}.probes.fa   - Probe sequences
-        {output_prefix}.probes.tsv  - Probe metadata
+        {output_prefix}.probes.fasta - Probe sequences
     """
     if verbose:
         logger.setLevel(logging.DEBUG)

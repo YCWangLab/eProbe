@@ -371,7 +371,7 @@ def process_regions(
         return Err("No probes generated")
 
     # --- Save FASTA output ---
-    fasta_output = Path(str(output_prefix) + ".probes.fa")
+    fasta_output = Path(str(output_prefix) + ".probes.fasta")
     fasta_output.parent.mkdir(parents=True, exist_ok=True)
 
     probe_seqs = {p.id: p.sequence for p in all_probes}
@@ -380,24 +380,6 @@ def process_regions(
         return Err(f"Failed to write FASTA: {wr.unwrap_err()}")
 
     logger.info(f"Saved probes to {fasta_output}")
-
-    # --- Save TSV metadata ---
-    tsv_output = Path(str(output_prefix) + ".probes.tsv")
-    with open(tsv_output, "w") as f:
-        f.write("probe_id\tsequence\tchrom\tstart\tend\tregion\tlength\n")
-        for p in all_probes:
-            # Extract region name from probe ID (before _P or _H)
-            region_name = p.id.rsplit("_P", 1)[0]
-            # Strip allele suffix if present
-            for suffix in ("_H1", "_H2", "_H3", "_H4", "_H5"):
-                if region_name.endswith(suffix):
-                    region_name = region_name[: -len(suffix)]
-                    break
-            f.write(
-                f"{p.id}\t{p.sequence}\t{p.source_chrom}\t"
-                f"{p.source_start}\t{p.source_end}\t{region_name}\t"
-                f"{len(p.sequence)}\n"
-            )
 
     stats = {
         "region_count": n_regions_ok,
@@ -409,7 +391,6 @@ def process_regions(
         "haplotyping": vcf_path is not None,
         "variant_only": variant_only,
         "fasta_file": str(fasta_output),
-        "tsv_file": str(tsv_output),
     }
 
     return Ok(stats)
@@ -454,7 +435,7 @@ def run_from_bed(
         Ok(stats dict) on success, Err(message) on failure
 
     Output files:
-        {output_prefix}.probes.fa   - Probe sequences
+        {output_prefix}.probes.fasta - Probe sequences
         {output_prefix}.probes.tsv  - Probe metadata
     """
     if verbose:

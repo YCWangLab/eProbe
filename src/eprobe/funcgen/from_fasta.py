@@ -126,7 +126,7 @@ def run_from_fasta(
         Ok(stats dict) on success, Err(message) on failure
 
     Output files:
-        {output_prefix}.probes.fa   - Probe sequences in FASTA format
+        {output_prefix}.probes.fasta - Probe sequences in FASTA format
         {output_prefix}.probes.tsv  - Probe metadata table
     """
     if verbose:
@@ -214,7 +214,7 @@ def run_from_fasta(
         return Err("No probes generated (sequences may be too short or all filtered)")
 
     # --- Save FASTA output ---
-    fasta_output = Path(str(output_prefix) + ".probes.fa")
+    fasta_output = Path(str(output_prefix) + ".probes.fasta")
     fasta_output.parent.mkdir(parents=True, exist_ok=True)
 
     probe_seqs = {p.id: p.sequence for p in all_probes}
@@ -223,17 +223,6 @@ def run_from_fasta(
         return Err(f"Failed to write FASTA: {wr.unwrap_err()}")
 
     logger.info(f"Saved probes to {fasta_output}")
-
-    # --- Save TSV metadata ---
-    tsv_output = Path(str(output_prefix) + ".probes.tsv")
-    with open(tsv_output, "w") as f:
-        f.write("probe_id\tsequence\tregion\tchrom\tstart\tend\tlength\n")
-        for p in all_probes:
-            f.write(
-                f"{p.id}\t{p.sequence}\t{p.source_chrom}\t"
-                f"{p.source_chrom}\t{p.source_start}\t{p.source_end}\t"
-                f"{len(p.sequence)}\n"
-            )
 
     stats = {
         "gene_count": n_genes,
@@ -244,7 +233,6 @@ def run_from_fasta(
         "haplotyping": haplotyping,
         "variant_only": variant_only,
         "fasta_file": str(fasta_output),
-        "tsv_file": str(tsv_output),
         "n_variant_windows_total": total_variant_windows,
         "n_invariant_windows_total": total_invariant_windows,
         "n_variant_probes_total": total_variant_probes,

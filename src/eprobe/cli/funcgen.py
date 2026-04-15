@@ -134,8 +134,7 @@ def from_fasta(
 
     \b
     Output files:
-      {output}.probes.fa    - Probe sequences in FASTA format
-      {output}.probes.tsv   - Probe metadata table
+      {output}.probes.fasta - Probe sequences in FASTA format
     """
     from eprobe.funcgen.from_fasta import run_from_fasta
 
@@ -284,8 +283,7 @@ def from_bed(
 
     \b
     Output files:
-      {output}.probes.fa    - Probe sequences
-      {output}.probes.tsv   - Probe metadata
+      {output}.probes.fasta - Probe sequences
     """
     from eprobe.funcgen.from_bed import run_from_bed
 
@@ -454,8 +452,7 @@ def from_gff(
 
     \b
     Output files:
-      {output}.probes.fa    - Probe sequences
-      {output}.probes.tsv   - Probe metadata
+      {output}.probes.fasta - Probe sequences
     """
     from eprobe.funcgen.from_gff import run_from_gff
 
