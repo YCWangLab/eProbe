@@ -41,6 +41,18 @@ from eprobe.core.result import Err, Ok, Result
 logger = logging.getLogger(__name__)
 
 
+def find_phase_common() -> Optional[str]:
+    """Find the shapeit5 phase_common executable.
+
+    Returns the command name if found, None otherwise.
+    Searches for both 'phase_common' and 'SHAPEIT5_phase_common'.
+    """
+    for name in ("phase_common", "SHAPEIT5_phase_common"):
+        if shutil.which(name):
+            return name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -167,9 +179,12 @@ def phase_vcf_region(
     try:
         region_str = f"{chrom}:{start}-{end}"
 
-        # shapeit5 phase_common
+        # shapeit5 phase_common (supports both phase_common and SHAPEIT5_phase_common)
+        phase_cmd = find_phase_common()
+        if phase_cmd is None:
+            return Err("phase_common / SHAPEIT5_phase_common not found in PATH")
         subprocess.run(
-            f"phase_common --input {vcf_path} "
+            f"{phase_cmd} --input {vcf_path} "
             f"--output-format bcf --output {output_bcf} "
             f"--region {region_str} --thread 1",
             shell=True, check=True, capture_output=True, text=True,

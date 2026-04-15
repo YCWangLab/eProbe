@@ -25,6 +25,7 @@ from eprobe.core.result import Err, Ok, Result
 from eprobe.funcgen.haplotype import (
     HaplotypeSet,
     extract_haplotypes,
+    find_phase_common,
     generate_haplotype_probes,
     phase_vcf_region,
     tile_sequence,
@@ -159,9 +160,9 @@ def process_regions(
 
     # Early check: if phasing requested, verify external tools exist
     if phase:
-        if not shutil.which("phase_common"):
+        if find_phase_common() is None:
             return Err(
-                "phase_common (shapeit5) not found in PATH. "
+                "phase_common / SHAPEIT5_phase_common not found in PATH. "
                 "Install shapeit5 ('conda install -c bioconda shapeit5') "
                 "or use --no_phase if VCF is already phased."
             )
