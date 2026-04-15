@@ -635,7 +635,8 @@ def _probes_equal_length(
     seq_len = len(next(iter(alleles.values())))
 
     if seq_len < probe_length:
-        return Ok([])
+        return Ok(([], {"n_variant_windows": 0, "n_invariant_windows": 0,
+                        "n_variant_probes": 0, "n_invariant_probes": 0}))
 
     positions = list(range(0, seq_len - probe_length + 1, step_size))
     last_start = seq_len - probe_length
