@@ -136,7 +136,12 @@ def _process_one_region_haplo(
             temp_dir, rid,
         )
         if phase_result.is_err():
-            # No variants → use reference only
+            err_msg = phase_result.unwrap_err()
+            # No variants in region → fall back to reference sequence
+            if err_msg.startswith("no_variants:"):
+                logger.debug(f"  {rid}: no variants in VCF, using reference")
+            else:
+                logger.warning(f"  {rid}: {err_msg}")
             if not variant_only:
                 ref_fasta = pysam.FastaFile(str(reference_path))
                 ref_seq = ref_fasta.fetch(region.chrom, region.start, region.end)

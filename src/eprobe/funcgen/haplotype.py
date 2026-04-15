@@ -155,6 +155,7 @@ def phase_vcf_region(
     Phase a VCF region using shapeit5 phase_common.
 
     Runs shapeit5 on a single region, converts output to VCF.gz + tabix index.
+    If no variants exist in the region, returns Err("no_variants:...").
 
     Args:
         vcf_path: Input VCF file (bgzipped + tabix indexed)
@@ -179,22 +180,41 @@ def phase_vcf_region(
     try:
         region_str = f"{chrom}:{start}-{end}"
 
+        # Pre-check: are there any variants in this region?
+        check_cmd = subprocess.run(
+            f"bcftools view -H {vcf_path} -r {region_str} 2>/dev/null | head -1",
+            shell=True, capture_output=True, text=True,
+        )
+        if not check_cmd.stdout.strip():
+            logger.debug(f"No variants in {region_name} ({region_str})")
+            return Err(f"no_variants:{region_name}")
+
+        # Extract region into a clean VCF to avoid header warnings
+        # (e.g. "MQ should be declared as Type=Float") breaking phase_common
+        region_vcf_gz = output_dir / f"{region_name}.input.vcf.gz"
+        subprocess.run(
+            f"bcftools view {vcf_path} -r {region_str} -Oz -o {region_vcf_gz} 2>/dev/null",
+            shell=True, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            f"tabix -f {region_vcf_gz}",
+            shell=True, check=True, capture_output=True, text=True,
+        )
+
         # shapeit5 phase_common (supports both phase_common and SHAPEIT5_phase_common)
         phase_cmd = find_phase_common()
         if phase_cmd is None:
             return Err("phase_common / SHAPEIT5_phase_common not found in PATH")
 
-        # Run phase_common without check=True: some VCF header warnings
-        # (e.g. "MQ should be declared as Type=Float") cause non-zero exit
-        # even though the output is valid.
+        # Run phase_common on the clean region VCF
         result = subprocess.run(
-            f"{phase_cmd} --input {vcf_path} "
+            f"{phase_cmd} --input {region_vcf_gz} "
             f"--output-format bcf --output {output_bcf} "
             f"--region {region_str} --thread 1",
             shell=True, capture_output=True, text=True,
         )
         if not output_bcf.exists() or output_bcf.stat().st_size == 0:
-            stderr_msg = result.stderr.strip() if result.stderr else "no variants in region"
+            stderr_msg = result.stderr.strip() if result.stderr else "unknown error"
             logger.warning(f"Phasing failed for {region_name} ({region_str}): {stderr_msg}")
             return Err(f"Phasing failed for {region_name}")
         if result.returncode != 0 and result.stderr:
