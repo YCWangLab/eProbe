@@ -183,12 +183,25 @@ def phase_vcf_region(
         phase_cmd = find_phase_common()
         if phase_cmd is None:
             return Err("phase_common / SHAPEIT5_phase_common not found in PATH")
-        subprocess.run(
+
+        # Run phase_common without check=True: some VCF header warnings
+        # (e.g. "MQ should be declared as Type=Float") cause non-zero exit
+        # even though the output is valid.
+        result = subprocess.run(
             f"{phase_cmd} --input {vcf_path} "
             f"--output-format bcf --output {output_bcf} "
             f"--region {region_str} --thread 1",
-            shell=True, check=True, capture_output=True, text=True,
+            shell=True, capture_output=True, text=True,
         )
+        if not output_bcf.exists() or output_bcf.stat().st_size == 0:
+            stderr_msg = result.stderr.strip() if result.stderr else "no variants in region"
+            logger.warning(f"Phasing failed for {region_name} ({region_str}): {stderr_msg}")
+            return Err(f"Phasing failed for {region_name}")
+        if result.returncode != 0 and result.stderr:
+            # Log non-fatal warnings (e.g. MQ type mismatch) at debug level
+            for line in result.stderr.strip().splitlines():
+                logger.debug(f"phase_common warning [{region_name}]: {line}")
+
         # BCF → VCF → VCF.gz + tabix
         subprocess.run(
             f"bcftools view {output_bcf} -Ov -o {output_vcf}",
@@ -206,9 +219,11 @@ def phase_vcf_region(
         return Ok(output_vcf_gz)
 
     except subprocess.CalledProcessError as e:
+        # Only BCF→VCF conversion failures reach here now
+        stderr_msg = e.stderr.strip() if e.stderr else "unknown error"
         logger.warning(
-            f"Phasing failed for {region_name} ({chrom}:{start}-{end}): "
-            f"{e.stderr or 'possibly no variants in region'}"
+            f"Phasing post-processing failed for {region_name} ({chrom}:{start}-{end}): "
+            f"{stderr_msg}"
         )
         return Err(f"Phasing failed for {region_name}")
 
