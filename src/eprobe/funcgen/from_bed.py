@@ -157,6 +157,18 @@ def process_regions(
     if not regions:
         return Err("No regions to process")
 
+    # Early check: if phasing requested, verify external tools exist
+    if phase:
+        if not shutil.which("phase_common"):
+            return Err(
+                "phase_common (shapeit5) not found in PATH. "
+                "Install shapeit5 ('conda install -c bioconda shapeit5') "
+                "or use --no_phase if VCF is already phased."
+            )
+        for tool in ("bcftools", "bgzip", "tabix"):
+            if not shutil.which(tool):
+                return Err(f"'{tool}' not found in PATH. Required for --phase.")
+
     all_probes: List[Probe] = []
     n_regions_ok = 0
     n_regions_err = 0
