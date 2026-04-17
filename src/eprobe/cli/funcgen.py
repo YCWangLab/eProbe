@@ -587,9 +587,11 @@ def assess(
         raise SystemExit(1)
 
     stats = result.unwrap()
-    echo_success(f"Assessed {stats['probe_count']} probes")
+    tag_stats = stats.get("tags", {})
+    probe_count = tag_stats.get("probe_count", "?")
+    echo_success(f"Assessed {probe_count} probes")
 
     # Print summary
     echo_info("Summary statistics:")
-    for tag, values in stats.get("summary", {}).items():
+    for tag, values in tag_stats.get("summary", {}).items():
         echo_info(f"  {tag}: mean={values['mean']:.2f}, std={values['std']:.2f}")
