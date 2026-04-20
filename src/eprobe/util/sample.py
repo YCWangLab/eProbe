@@ -20,6 +20,19 @@ from eprobe.core.fasta import read_fasta, write_fasta
 logger = logging.getLogger(__name__)
 
 
+def _resolve_output_fasta(output_prefix: Path) -> Path:
+    """Resolve FASTA output path from user -o argument.
+
+    If the user provides a FASTA filename (e.g. *.fa, *.fasta, *.fna),
+    write to that exact path. Otherwise, keep legacy prefix behavior by
+    appending .sampled.fa.
+    """
+    suffixes = {s.lower() for s in output_prefix.suffixes}
+    if {".fa", ".fasta", ".fna"} & suffixes:
+        return output_prefix
+    return Path(str(output_prefix) + ".sampled.fa")
+
+
 def random_sample(
     sequences: Dict[str, str],
     n: int,
@@ -171,7 +184,7 @@ def run_sample(
         
         sampled = random_sample(sequences, n, seed)
         
-        fasta_path = Path(str(output_prefix) + ".sampled.fa")
+        fasta_path = _resolve_output_fasta(output_prefix)
         write_result = write_fasta(sampled, fasta_path)
         if write_result.is_err():
             return Err(f"Write failed: {write_result.unwrap_err()}")
@@ -241,7 +254,7 @@ def run_sample(
             selected = random_sample(selected, n, seed)
         
         # Write selected probes
-        fasta_path = Path(str(output_prefix) + ".sampled.fa")
+        fasta_path = _resolve_output_fasta(output_prefix)
         write_result = write_fasta(selected, fasta_path)
         if write_result.is_err():
             return Err(f"Write failed: {write_result.unwrap_err()}")

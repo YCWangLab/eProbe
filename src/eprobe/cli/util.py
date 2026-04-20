@@ -1160,7 +1160,8 @@ def sample(
     
     \b
     Outputs:
-      {output}.sampled.fa          - Selected probes
+            {output}.sampled.fa          - Selected probes (when -o is a prefix)
+            {output}                     - Selected probes (when -o ends with .fa/.fasta/.fna)
       {output}.cluster_report.tsv  - Family details (cluster mode)
       {output}.sample_summary.txt  - Statistics (cluster mode)
     
