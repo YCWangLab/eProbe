@@ -1,2 +1,0 @@
-[console_scripts]
-eprobe = eprobe.cli.main:cli

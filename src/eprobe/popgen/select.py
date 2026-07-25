@@ -14,7 +14,7 @@ import logging
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple, Set, Union
+from typing import Optional, Dict, Any, List, Mapping, Tuple, Set, Union
 from dataclasses import dataclass, field
 from collections import defaultdict
 from enum import Enum
@@ -507,41 +507,59 @@ def calculate_snp_score(
     Returns:
         Weighted score (higher = better)
     """
-    if weights is None or len(weights) != 5:
-        weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+    if weights is None or len(weights) != len(BIOPHYSICAL_COLUMNS):
+        weights = [1.0] * len(BIOPHYSICAL_COLUMNS)
     if targets is None:
         targets = list(DEFAULT_TARGETS)
-    
-    tags = getattr(snp, 'tags', None)
-    
-    if tags and isinstance(tags, dict):
-        gc = tags.get('gc', targets[0])
-        tm = tags.get('tm', targets[1])
-        complexity = tags.get('complexity', targets[2])
-        hairpin = tags.get('hairpin', targets[3])
-        dimer = tags.get('dimer', targets[4])
-    else:
-        gc = targets[0]
-        tm = targets[1]
-        complexity = targets[2]
-        hairpin = targets[3]
-        dimer = targets[4]
-    
+
+    tags = getattr(snp, "tags", None)
+    values = tags if isinstance(tags, dict) else {}
+    return calculate_biophysical_score(values, weights, targets)
+
+
+def calculate_biophysical_score(
+    values: Mapping[str, float],
+    weights: List[float],
+    targets: Optional[List[float]] = None,
+) -> float:
+    """Calculate a weighted score from biophysical metric values."""
+    if len(weights) != len(BIOPHYSICAL_COLUMNS):
+        raise ValueError(
+            f"Expected {len(BIOPHYSICAL_COLUMNS)} biophysical weights, got {len(weights)}"
+        )
+    if targets is None:
+        targets = list(DEFAULT_TARGETS)
+    if len(targets) != len(BIOPHYSICAL_COLUMNS):
+        raise ValueError(
+            f"Expected {len(BIOPHYSICAL_COLUMNS)} biophysical targets, got {len(targets)}"
+        )
+
+    gc, tm, complexity, hairpin, dimer = (
+        float(values.get(column, target))
+        for column, target in zip(BIOPHYSICAL_COLUMNS, targets)
+    )
+
     gc_score = max(0, 1.0 - abs(gc - targets[0]) / _NORMALIZE_RANGE[0])
     tm_score = max(0, 1.0 - abs(tm - targets[1]) / _NORMALIZE_RANGE[1])
     complexity_score = max(0, 1.0 - abs(complexity - targets[2]) / _NORMALIZE_RANGE[2])
-    hairpin_score = max(0, 1.0 - hairpin / 50.0) if targets[3] == 0 else max(0, 1.0 - abs(hairpin - targets[3]) / 50.0)
-    dimer_score = max(0, 1.0 - dimer) if targets[4] == 0 else max(0, 1.0 - abs(dimer - targets[4]))
-    
-    total_score = (
-        weights[0] * gc_score +
-        weights[1] * tm_score +
-        weights[2] * complexity_score +
-        weights[3] * hairpin_score +
-        weights[4] * dimer_score
+    hairpin_score = (
+        max(0, 1.0 - hairpin / 50.0)
+        if targets[3] == 0
+        else max(0, 1.0 - abs(hairpin - targets[3]) / 50.0)
     )
-    
-    return total_score
+    dimer_score = (
+        max(0, 1.0 - dimer)
+        if targets[4] == 0
+        else max(0, 1.0 - abs(dimer - targets[4]))
+    )
+
+    return sum(
+        weight * score
+        for weight, score in zip(
+            weights,
+            [gc_score, tm_score, complexity_score, hairpin_score, dimer_score],
+        )
+    )
 
 
 def select_uniform(
@@ -695,7 +713,8 @@ def select_by_priority(
         targets: Target values [gc, tm, complexity, hairpin, dimer]. Default: [50,70,0,0,0]
 
     Returns:
-        Result containing selected SNP list (or tuple with DataFrame if weighted)
+        Result containing selected SNPs, plus their DataFrame when weighted
+        selection is enabled.
     """
     if not snps:
         return Ok([])
@@ -720,12 +739,33 @@ def select_by_priority(
         else:
             logger.warning(f"Cannot use weighted selection: missing columns {missing_cols}")
 
-    # Build SNP index for DataFrame lookup if needed
-    snp_to_idx = {}
+    # Match SNPs to their biophysical rows by their complete variant identity.
+    # A genomic position can contain more than one alternate allele.
+    snp_to_idx: Dict[Tuple[str, int, str, str], int] = {}
     if snp_df is not None:
         for idx, row in snp_df.iterrows():
-            key = (str(row['chr']), int(row['pos']))
+            key = (str(row["chr"]), int(row["pos"]), str(row["ref"]), str(row["alt"]))
             snp_to_idx[key] = idx
+
+    def snp_key(snp: SNP) -> Tuple[str, int, str, str]:
+        return (snp.chrom, snp.pos, snp.ref, snp.alt)
+
+    scores_by_index: Dict[int, float] = {}
+    if use_weighted and snp_df is not None:
+        missing_rows = [snp_key(snp) for snp in snps if snp_key(snp) not in snp_to_idx]
+        if missing_rows:
+            return Err(
+                "Biophysical data is missing for one or more SNPs selected for priority "
+                f"selection (first missing variant: {missing_rows[0]})."
+            )
+        scores_by_index = {
+            index: calculate_biophysical_score(
+                snp_df.loc[snp_to_idx[snp_key(snp)]],
+                weights,
+                targets,
+            )
+            for index, snp in enumerate(snps)
+        }
 
     # Group SNPs by window and mark priority status
     # window_key -> {'priority': [snp_indices], 'other': [snp_indices]}
@@ -795,18 +835,14 @@ def select_by_priority(
                             # Select best from other based on weights
                             other_scores = []
                             for idx in other_indices:
-                                snp = snps[idx]
-                                score = calculate_biophysical_score(snp, weights, targets)
-                                other_scores.append((idx, score))
+                                other_scores.append((idx, scores_by_index[idx]))
                             other_scores.sort(key=lambda x: -x[1])
                             selected_indices.extend([x[0] for x in other_scores[:remaining]])
                 else:
                     # More priority SNPs than needed - select best by score
                     priority_scores = []
                     for idx in candidates:
-                        snp = snps[idx]
-                        score = calculate_biophysical_score(snp, weights, targets)
-                        priority_scores.append((idx, score))
+                        priority_scores.append((idx, scores_by_index[idx]))
                     priority_scores.sort(key=lambda x: -x[1])
                     selected_indices.extend([x[0] for x in priority_scores[:n_select]])
             else:
@@ -830,9 +866,7 @@ def select_by_priority(
                 else:
                     other_scores = []
                     for idx in other_indices:
-                        snp = snps[idx]
-                        score = calculate_biophysical_score(snp, weights, targets)
-                        other_scores.append((idx, score))
+                        other_scores.append((idx, scores_by_index[idx]))
                     other_scores.sort(key=lambda x: -x[1])
                     selected_indices.extend([x[0] for x in other_scores[:n_select]])
             else:
@@ -847,27 +881,13 @@ def select_by_priority(
     # Sort by chromosome and position
     selected.sort(key=lambda s: (s.chrom, s.pos))
 
-    # Count how many selected are in priority regions
-    n_priority_selected = sum(1 for s in selected if snp_in_priority_region_fast(s.chrom, s.pos, priority_index))
-    n_non_priority = len(selected) - n_priority_selected
-    logger.info(f"Selected {len(selected)} SNPs ({n_priority_selected} from priority regions, "
-                f"{n_non_priority} from other regions)")
-
-    # Attach priority counts as attributes on the list for downstream stats
-    priority_info = {"priority_selected": n_priority_selected, "non_priority_selected": n_non_priority}
-
     # Build DataFrame if weighted selection was used
     if use_weighted and snp_df is not None:
-        selected_df_indices = []
-        for snp in selected:
-            key = (snp.chrom, snp.pos)
-            if key in snp_to_idx:
-                selected_df_indices.append(snp_to_idx[key])
-        if selected_df_indices:
-            selected_df = snp_df.loc[selected_df_indices].copy().reset_index(drop=True)
-            return Ok((selected, selected_df, priority_info))
+        selected_df_indices = [snp_to_idx[snp_key(snp)] for snp in selected]
+        selected_df = snp_df.loc[selected_df_indices].copy().reset_index(drop=True)
+        return Ok((selected, selected_df))
 
-    return Ok((selected, priority_info))
+    return Ok(selected)
 
 
 def select_weighted(
@@ -1311,13 +1331,13 @@ def run_select(
                 weights=weights, snp_df=raw_df, targets=targets
             )
             
-            # Check if result is tuple (weighted was used) or just list
+            # Weighted priority returns (snps, df); unweighted returns snps.
             if result.is_ok():
                 unwrapped = result.unwrap()
-                priority_info = {}
-                if isinstance(unwrapped, tuple) and len(unwrapped) == 3:
-                    # Weighted selection was used within priority
-                    selected_snps, selected_with_biophysical, priority_info = unwrapped
+                priority_info: dict = {}
+                if isinstance(unwrapped, tuple) and len(unwrapped) == 2:
+                    # Weighted selection: build priority stats and save now
+                    selected_snps, selected_with_biophysical = unwrapped
                     logger.info(f"After 1-per-window selection: {len(selected_snps)} SNPs")
 
                     # Downsample to --target_count if specified and exceeded
@@ -1325,15 +1345,24 @@ def run_select(
                         logger.info(f"Downsampling {len(selected_snps)} → {target_count} (--target_count)")
                         selected_with_biophysical = selected_with_biophysical.sample(
                             n=target_count, random_state=seed
-                        ).sort_values(['chr', 'pos'])
+                        ).sort_values(["chr", "pos"])
                         selected_snps = [
-                            SNP(chrom=row['chr'], pos=int(row['pos']),
-                                ref=row['ref'], alt=row['alt'],
-                                mutation_type=row['type'])
+                            SNP(chrom=row["chr"], pos=int(row["pos"]),
+                                ref=row["ref"], alt=row["alt"],
+                                mutation_type=row["type"])
                             for _, row in selected_with_biophysical.iterrows()
                         ]
 
                     selected = selected_snps
+                    _pri_idx = build_priority_index(priority_regions)
+                    _n_pri = sum(
+                        snp_in_priority_region_fast(s.chrom, s.pos, _pri_idx)
+                        for s in selected
+                    )
+                    priority_info = {
+                        "priority_selected": _n_pri,
+                        "non_priority_selected": len(selected) - _n_pri,
+                    }
 
                     # Calculate coverage statistics
                     coverage_stats = calculate_coverage_stats(selected, window_size)
@@ -1363,7 +1392,6 @@ def run_select(
                         "priority_info": priority_info,
                     }
 
-                    # Add merge details if available
                     if merge_details:
                         stats["merge_details"] = merge_details
 
@@ -1377,11 +1405,17 @@ def run_select(
 
                     return Ok(stats)
                 else:
-                    # No weighted: (selected_list, priority_info)
-                    if isinstance(unwrapped, tuple) and len(unwrapped) == 2:
-                        selected, priority_info = unwrapped
-                    else:
-                        selected = unwrapped
+                    # Unweighted priority: unwrapped is a plain list of SNPs
+                    selected = unwrapped
+                    _pri_idx = build_priority_index(priority_regions)
+                    _n_pri = sum(
+                        snp_in_priority_region_fast(s.chrom, s.pos, _pri_idx)
+                        for s in selected
+                    )
+                    priority_info = {
+                        "priority_selected": _n_pri,
+                        "non_priority_selected": len(selected) - _n_pri,
+                    }
             else:
                 return Err(result.unwrap_err())
         else:

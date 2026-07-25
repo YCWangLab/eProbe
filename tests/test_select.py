@@ -403,6 +403,46 @@ def test_select_priority_with_weights():
     print("  ✓ Biophysical columns preserved in output DataFrame")
 
 
+def test_priority_weighted_selection_uses_biophysical_scores():
+    """Priority weighting must select the SNP with the best biophysical profile."""
+    snps = [
+        SNP.from_vcf_record(chrom="chr1", pos=100, ref="A", alt="G"),
+        SNP.from_vcf_record(chrom="chr1", pos=200, ref="A", alt="G"),
+        SNP.from_vcf_record(chrom="chr1", pos=300, ref="A", alt="G"),
+    ]
+    import pandas as pd
+
+    snp_df = pd.DataFrame({
+        "chr":        ["chr1", "chr1", "chr1"],
+        "pos":        [100,    200,    300],
+        "ref":        ["A",    "A",    "A"],
+        "alt":        ["G",    "G",    "G"],
+        "type":       ["ts",   "ts",   "ts"],
+        # pos=100 has ideal biophysics; pos=200 and pos=300 are extreme
+        "gc":         [50.0,   10.0,   90.0],
+        "tm":         [70.0,   20.0,  100.0],
+        "complexity": [0.0,     5.0,    5.0],
+        "hairpin":    [0.0,    50.0,   50.0],
+        "dimer":      [0.0,     1.0,    1.0],
+    })
+
+    result = select_by_priority(
+        snps,
+        target_count=1,
+        priority_regions={("chr1", 1, 1_000)},
+        window_size=1_000,
+        weights=[1.0] * 5,
+        snp_df=snp_df,
+    )
+
+    assert result.is_ok()
+    selected_snps, selected_df = result.unwrap()
+    assert [snp.pos for snp in selected_snps] == [100], (
+        f"Expected the best-scoring SNP (pos=100) to be selected, got {[s.pos for s in selected_snps]}"
+    )
+    assert selected_df["pos"].tolist() == [100]
+
+
 def test_select_chromosomes():
     """Test chromosome filtering."""
     print("Testing select_chromosomes...")

@@ -458,6 +458,13 @@ def from_gff(
 
     verbose = ctx.obj.get("verbose", False)
 
+    if phase and vcf is None:
+        echo_error("--phase requires --vcf (a bgzipped, tabix-indexed VCF file).")
+        raise SystemExit(1)
+    if gene_list and gene_id:
+        echo_error("--gene_list and --gene_id are mutually exclusive.")
+        raise SystemExit(1)
+
     # Parse gene IDs
     gene_ids = None
     if gene_list:

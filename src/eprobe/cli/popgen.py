@@ -87,12 +87,6 @@ def popgen(ctx: click.Context) -> None:
     help="Maximum SNPs allowed in flanking region (default: 3).",
 )
 @click.option(
-    "--min_cluster_snp",
-    default=1,
-    type=int,
-    help="Minimum SNPs required in flanking region (default: 1).",
-)
-@click.option(
     "--keep_bed",
     type=click.Path(exists=True, path_type=Path),
     help="BED file of regions to keep SNPs in.",
@@ -116,7 +110,6 @@ def extract(
     threads: int,
     cluster_flank: int,
     max_cluster_snp: int,
-    min_cluster_snp: int,
     keep_bed: Optional[Path],
     remove_bed: Optional[Path],
     cluster_filter: bool,
